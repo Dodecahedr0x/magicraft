@@ -12,6 +12,7 @@
 // | `VITE_PROGRAM_ID` | magicraft program id | the IDL `address` |
 // | `VITE_VRF_QUEUE` | VRF oracle queue for `request_seed` | local `DEFAULT_EPHEMERAL_TEST_QUEUE` |
 // | `VITE_ER_VALIDATOR` | ER validator identity pinned in `delegate_player` | local ER identity |
+// | `VITE_WALLET_CHAIN` | Wallet Standard chain id (read by `wallet.ts`) | from `VITE_BASE_RPC` |
 //
 // Production builds (`import.meta.env.PROD`) have no defaults for the cluster-specific vars:
 // `VITE_BASE_RPC`, `VITE_ER_RPC`, `VITE_PROGRAM_ID`, `VITE_ER_VALIDATOR` and
