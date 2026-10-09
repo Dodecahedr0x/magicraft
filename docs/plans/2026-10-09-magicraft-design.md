@@ -22,7 +22,8 @@ Fully onchain, browser-playable Minecraft-like survival game on MagicBlock Ephem
 
 ### Base layer, delegated to ER
 
-**`Player`** PDA `["player", authority]` — holds SOL, is the `sponsor` for all ephemeral accounts the
+**`Player`** PDA `["player", authority]` — `authority`, `bump`, `open_chunks` (count of open chunks
+it sponsors; UI warnings only). Holds SOL, is the `sponsor` for all ephemeral accounts the
 player creates. Created + funded + delegated in one wallet tx (`init_player` + `deposit` +
 `delegate_player`; `deposit` is only for this initial funding, it needs an undelegated Player).
 Top-ups while delegated use the npm SDK's `lamportsDelegatedTransferIx` (e-SPL program): one base tx
@@ -31,9 +32,11 @@ lamports + base fee; fresh 32-byte salt per call). A plain base transfer to the 
 **not** a top-up (the ER never sees it).
 Settlement is **delta-based**: each commit applies the Player's ER lamport change since the last
 sync to its base balance (rent spent on the ER lowers base at the first commit; refunds from closed
-accounts flow back on the next commit). Withdraw = close the player's sponsored chunks, commit +
-undelegate, then transfer out on base layer. Chunks still open at undelegation survive on the ER
-with their rent stranded until the Player is delegated again.
+accounts flow back on the next commit). Withdraw = commit + undelegate, then transfer out on base
+layer; it is **never blocked**. Only unedited chunks are reclaimable (`close_chunk`), so rent of
+edited chunks stays locked by design. Chunks still open at undelegation survive on the ER; an
+unedited one can be closed (rent back) only after the Player is delegated again. Before a withdraw
+the client shows `open_chunks` and offers to close the player's unedited chunks first.
 
 ### Ephemeral (ER-only)
 
@@ -47,8 +50,8 @@ A CPI can grow an account by at most 10 240 bytes, so any account larger than th
 
 | Account | Seeds | Contents |
 |---|---|---|
-| `World` | `["world", creator, nonce]` | name, creator, `seed: [u8;32]` (zero until VRF), `params: WorldParams`, `time_of_day`, `spawn: (x,y,z)`, day-crank task id, chunk count |
-| `Chunk` | `["chunk", world, cx, cz]` | payer, `edited`, `gen_stage`, blocks `16×16×64` u8 (16 KB), mob slots (8), fluid queue (ring of 64), tick-crank task id/state |
+| `World` (≤ 10 240 B) | `["world", creator, nonce]` | name, creator, nonce, bump, `seed: [u8;32]`, `seed_set`, `params: WorldParams`, `time_of_day`, `spawn: (x,y,z)`, day-crank task id, `last_tick`, chunk count |
+| `Chunk` | `["chunk", world, cx, cz]` | payer, bump, `edited`, `gen_stage`, blocks `16×16×64` u8 (16 KB), mob slots (8), fluid queue (ring of 64), tick-crank task id, `last_tick` |
 | `ChunkPresence` | `["presence", chunk]` | growable vec of `{player, pos, last_seen, pending_damage}` (~40 B each), no cap |
 | `PlayerState` | `["pstate", world, player]` | pos, vel, `fall_start_y`, health, food, 36-slot inventory `{item:u16,count:u8,durability:u16}`, cooldowns, last move slot/time |
 
@@ -93,30 +96,36 @@ txs set `ComputeBudgetProgram.setComputeUnitLimit(1_400_000)` (honoured on the E
 200k per ix). The budget is per tx, so stages that don't fit together go in separate txs.
 
 Steps, sent back to back by the client:
-1. `create_chunk(cx, cz)` — create `Chunk` at 10 240 bytes + empty `ChunkPresence`.
-2. `grow_chunk(cx, cz)` — resize `Chunk` to full size (same tx as 1), then biome, heightmap,
-   column fill if it fits the budget (otherwise a separate stage-1 ix/tx). `gen_stage = 1`.
-3. `populate_chunk` — caves, ores, trees, cactus, ice, animals. Sets `gen_stage = DONE`.
+1. `create_chunk(cx, cz)` — create `Chunk` at 10 240 bytes (`gen_stage = 0`) + empty
+   `ChunkPresence`; `open_chunks += 1`.
+2. `grow_chunk(cx, cz)` — requires `gen_stage == 0` and data length 10 240 (so a repeat is
+   rejected, never double-resized); resize `Chunk` to full size (same tx as 1), then biome,
+   heightmap, column fill if it fits the budget (otherwise a separate stage-1 ix/tx).
+   `gen_stage = 1`. Authorized for the chunk's payer (wallet or session key).
+3. `populate_chunk` — requires `gen_stage == 1`; caves, ores, trees, cactus, ice, animals. Sets
+   `gen_stage = DONE`.
 
-Edits rejected until `DONE`. Creation allowed only adjacent to an existing chunk or the player's
-current chunk. Payer = creator's `Player` PDA.
+Every other ix that takes a chunk (moves, edits, ticks, mobs) rejects it (`ChunkNotReady`; ticks
+no-op) unless it is at full size and `DONE`.
+
+Creation allowed only adjacent to an existing chunk or the player's current chunk. Payer =
+creator's `Player` PDA.
 
 `close_chunk`: payer only, if `!edited`, no mobs, presence empty. Cancels the chunk's tick crank,
-closes `Chunk` + `ChunkPresence`, refunds rent. Regeneration later yields identical terrain. The
-payer's `Player` must still be delegated (closing fails otherwise), which is why chunks are closed
-before a withdraw.
+closes `Chunk` + `ChunkPresence`, refunds rent, `open_chunks -= 1`. Regeneration later yields
+identical terrain. The payer's `Player` must be delegated (the refund goes to it on the ER).
 
 ## Cranks
 
 Scheduled with the Magic program's `ScheduleTask` (bincode `MagicBlockInstruction`, CPI to
-`MAGIC_PROGRAM_ID`, crate `magicblock-magic-program-api` 0.14) and stopped with `CancelTask`. Rules
-established by the spikes (`docs/notes/spikes.md`, Task 4):
+`MAGIC_PROGRAM_ID`, crate `magicblock-magic-program-api` 0.14) and stopped with `CancelTask`.
 
-- **Authority.** Account 0 of the CPI is the task authority; it signs via `invoke_signed`. Only the
-  same authority can replace or cancel a task. Chunk tick cranks use the chunk's payer `Player` PDA
-  (`ChunkHeader.payer`), so whichever player's tx re-arms the crank, the authority stays the same;
-  the day crank uses the world creator's `Player` PDA. (A crank re-armed by a different authority is
-  silently rejected by the scheduler.)
+Rules established by the spikes (`docs/notes/spikes.md`, Tasks 4 and 6):
+
+- **Authority.** Account 0 of the CPI is the task authority; it signs via `invoke_signed`. Any
+  program PDA works: a delegated `Player`, and also an ephemeral, non-delegated, 0-lamport PDA
+  (tested with the chunk). Only the same authority can replace or cancel a task (a different
+  authority reusing a live id is silently rejected); who sends the outer tx doesn't matter.
 - **Task ids are global per validator**, not per authority. Derive them collision-free from the
   account they serve (e.g. the first 8 bytes of `hash("tick" ‖ chunk PDA)` / `hash("day" ‖ world
   PDA)`, masked positive and non-zero) and store them in the account. A schedule tx succeeding does
@@ -128,14 +137,26 @@ established by the spikes (`docs/notes/spikes.md`, Task 4):
   signer allowed inside a cranked ix is the crank-executor PDA (`["crank-executor", authority]` of
   `Crank1111…`). `tick_day` / `tick_chunk` take no user signer.
 - **Failures kill tasks silently.** A failing cranked ix is retried (backoff 100 ms … 5 s, missed
-  ticks caught up on recovery) but after ~26 s of continuous failure the task is dropped. Tick
-  handlers therefore avoid erroring (no-op on bad state), record `last_tick`, and a **watchdog**
-  (the day crank and `move_player`) re-arms chunk cranks whose `last_tick` has stalled.
-- Cost: currently none (ER fees 0); scheduling ≈ 12.6k CU, cancel ≈ 4.5k CU.
+  ticks caught up on recovery) but after ~26 s of continuous failure the task is dropped.
+- Cost: currently none (ER fees 0); scheduling ≈ 10.6–12.6k CU, cancel ≈ 4.5k CU.
+
+Design decisions (post-spike):
+
+- **Chunk tick crank authority = the `Chunk` PDA** (signs with its own seeds); **day crank
+  authority = the `World` PDA**. Neither needs a delegated `Player` in the arming tx, so any
+  player's move/edit can re-arm any chunk's crank.
+- **Never-failing ticks + watchdog.** `tick_chunk` / `tick_day` no-op instead of erroring on bad
+  state and record `last_tick`. `move_player` (and block edits) re-arm the current chunk's crank
+  when work exists and its `last_tick` has stalled, and re-arm the day crank when
+  `World.last_tick` has stalled. (A cranked ix has a fixed account list, so `tick_day` can't
+  watch chunks.)
+- **`close_chunk` cancels the chunk's crank** before closing.
+- **`World` ≤ 10 240 bytes**, so it is created in one ix.
+- **`Player.open_chunks`** is for UI warnings only; withdraw is never blocked.
 
 Crank types:
 
-- **World day crank** — scheduled at world creation; advances `time_of_day`; doubles as watchdog.
+- **World day crank** — scheduled at world creation; advances `time_of_day`.
 - **Chunk tick crank** — accounts `[world, chunk, presence, N/S/E/W chunks + presences]` (missing
   neighbor = self placeholder; `create_chunk` reschedules (replaces) existing neighbors' cranks with
   the new account list). Each tick: process up to ~32 fluid-queue entries; step mobs; spawn zombies.
@@ -211,9 +232,10 @@ world → `join_world` → play (auto-create chunks within render radius ~3) →
 One `#[error_code(offset = 6100)] enum MagicraftError` (Anchor 1.0 allows a single error enum per
 program; 6000–6003 are taken by `session_keys::SessionError`, which is compiled in but not in our
 IDL, so the client maps 6000 `ValidityTooLong`, 6001 `InvalidToken`, 6002 `NoToken`,
-6003 `InvalidAuthority` itself). Specific codes: `Unauthorized`, `MoveTooFast`, `Collision`, `OutOfReach`, `Cooldown`, `ChunkNotReady`,
-`InsufficientSponsorFunds`, `NotAdjacent`, `SeedPending`, `InvalidParams`, `NotDead`, … Client maps:
-rejected move → snap back; funds → top-up prompt; cooldown → silent retry; session expiry (`InvalidToken`/`NoToken`) → renew.
+6003 `InvalidAuthority` itself). Specific codes: `Unauthorized`, `MoveTooFast`, `Collision`,
+`OutOfReach`, `Cooldown`, `ChunkNotReady`, `InsufficientSponsorFunds`, `NotAdjacent`, `SeedPending`,
+`InvalidParams`, `NotDead`, … Client maps: rejected move → snap back; funds → top-up prompt;
+cooldown → silent retry; session expiry (`InvalidToken`/`NoToken`) → renew.
 
 ## Testing
 
@@ -228,7 +250,7 @@ rejected move → snap back; funds → top-up prompt; cooldown → silent retry;
 
 ## Resolved by spikes
 
-Details and evidence: [`docs/notes/spikes.md`](../notes/spikes.md) (Tasks 2–5).
+Details and evidence: [`docs/notes/spikes.md`](../notes/spikes.md) (Tasks 2–6).
 
 1. **Ephemeral account size.** Creation inside a CPI is capped at 10 240 bytes of growth; create at
    ≤ 10 240 then resize in a second top-level ix (same tx is fine). Use `EphemeralAccount` directly;
@@ -237,7 +259,8 @@ Details and evidence: [`docs/notes/spikes.md`](../notes/spikes.md) (Tasks 2–5)
    splitting stays the fallback (measure in Task 17).
 3. **Cranks on ephemeral accounts.** Work. Task ids are global per validator; same authority + same
    id replaces (no cancel needed to reschedule); cranked ixs must be permissionless; failing tasks
-   are dropped after ~26 s; a Player PDA can be the task authority; executions cost nothing today.
+   are dropped after ~26 s; a delegated Player PDA or an ephemeral non-delegated PDA (the chunk)
+   can be the task authority; executions cost nothing today.
 4. **Player economics.** Top-up via `lamportsDelegatedTransferIx`; settlement is delta-based on
    commit; open chunks strand rent across undelegation.
 5. **VRF in the ER.** Works on the ephemeral queue with the Player PDA as payer (manual
@@ -255,8 +278,9 @@ Details and evidence: [`docs/notes/spikes.md`](../notes/spikes.md) (Tasks 2–5)
 3. **Silently dropped cranks.** ~26 s of failures, or a task-id collision, drops a crank with no
    on-chain signal. Mitigation: never-failing tick handlers, collision-free ids, `last_tick` +
    watchdog re-arm.
-4. **Stranded chunk rent.** Chunks must be closed before their `Player` is undelegated, or their rent
-   stays on the ER until re-delegation. The withdraw flow must close (or warn about) them first.
+4. **Locked chunk rent.** Rent of edited chunks is never reclaimable (by design); unedited chunks
+   still open when the `Player` is undelegated keep their rent on the ER until re-delegation.
+   Withdraw is never blocked; the client warns (`open_chunks`) and offers to close unedited ones.
 5. **Write contention** on hot chunks (movers + crank on same accounts).
 6. **Durability.** Ephemeral accounts live only in the ER; worlds are as durable as the ER state.
 7. **Cluster prerequisites.** e-SPL global rent PDA must be funded on the target cluster (top-ups);
