@@ -210,10 +210,13 @@ pub fn craft(
     let fuel = r.fuel as u32 * n;
     if fuel > 0 {
         let coal = tmp.count(Item::Coal).min(fuel);
-        if !tmp.take(Item::Planks, fuel - coal) {
+        let planks = fuel - coal;
+        if planks > 0 && !tmp.take(Item::Planks, planks) {
             return Err(CraftError::MissingFuel);
         }
-        tmp.take(Item::Coal, coal);
+        if coal > 0 {
+            tmp.take(Item::Coal, coal);
+        }
     }
     if tmp.add(r.output.0, r.output.1 as u32 * n) != 0 {
         return Err(CraftError::NoSpace);
@@ -300,8 +303,10 @@ mod tests {
                 assert_eq!(it.max_durability(), 0, "tool input in {i}");
             }
             assert_eq!(r.fuel > 0, r.station == Station::Furnace, "{i}");
-            // Any count up to the max never overflows the output count math.
-            assert!(n as u32 * MAX_CRAFT_COUNT as u32 <= u16::MAX as u32);
+            // Output, input and fuel amounts for the max count stay far inside `u32`
+            // (`add`/`take` amounts) and the 36 × 64 inventory capacity bound is what limits.
+            assert!(n as u64 * MAX_CRAFT_COUNT as u64 <= u32::MAX as u64);
+            assert!(r.fuel as u64 * MAX_CRAFT_COUNT as u64 <= u32::MAX as u64);
             let mut key: Vec<_> = r.inputs.iter().map(|&(it, k)| (it as u16, k)).collect();
             key.sort();
             // Recipes are picked by id (no grid shapes), so equal inputs are harmless, but
@@ -586,10 +591,14 @@ mod tests {
     #[test]
     fn fuzz_craft_never_panics() {
         let mut st = 42u64;
+        let mut ok = 0;
         for _ in 0..2000 {
             let mut b = [0u8; Inventory::SIZE];
             for i in 0..36 {
                 let r = splitmix_next(&mut st);
+                if r % 4 < 2 {
+                    continue; // leave ~half the slots empty so crafts can succeed
+                }
                 let it = Item::ALL[r as usize % Item::ALL.len()];
                 b[i * 6..i * 6 + 2].copy_from_slice(&(it as u16).to_le_bytes());
                 b[i * 6 + 2] = (r >> 32) as u8;
@@ -602,11 +611,45 @@ mod tests {
                 table: r & 1 != 0,
                 furnace: r & 2 != 0,
             };
-            let res = craft(&mut inv, (r >> 8) as u16 % 30, (r >> 24) as u8 % 70, near);
-            if res.is_err() {
-                assert_eq!(inv, before);
+            let id = (r >> 8) as u16 % 30;
+            // Mostly small counts (likely to succeed), sometimes anything incl. invalid.
+            let count = if r >> 63 == 0 {
+                (r >> 24) as u8 % 4
+            } else {
+                (r >> 24) as u8 % 70
+            };
+            match craft(&mut inv, id, count, near) {
+                Err(_) => assert_eq!(inv, before),
+                Ok(()) => {
+                    ok += 1;
+                    // Conservation: exactly inputs + fuel out, exactly the output in.
+                    let rc = recipe(id).unwrap();
+                    let n = count as i64;
+                    let fuel = rc.fuel as i64 * n;
+                    let coal_used = (before.count(Item::Coal) as i64).min(fuel);
+                    for &it in Item::ALL {
+                        let mut d = 0i64;
+                        for &(x, k) in rc.inputs {
+                            if x == it {
+                                d -= k as i64 * n;
+                            }
+                        }
+                        if it == Item::Coal {
+                            d -= coal_used;
+                        }
+                        if it == Item::Planks {
+                            d -= fuel - coal_used;
+                        }
+                        if it == rc.output.0 {
+                            d += rc.output.1 as i64 * n;
+                        }
+                        let got = inv.count(it) as i64 - before.count(it) as i64;
+                        assert_eq!(got, d, "{it:?} recipe {id} x{count}");
+                    }
+                }
             }
             assert!(is_normalized(&inv));
         }
+        assert!(ok >= 100, "only {ok} successful crafts");
     }
 }

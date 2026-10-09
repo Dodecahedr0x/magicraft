@@ -25,7 +25,9 @@
 //!   [`Inventory::SIZE`] bytes) and compare the leftover.
 //! - `break_block` / `attack_mob`: [`Inventory::add`] the drops (leftover is lost or the ix
 //!   fails — program policy), then [`Inventory::damage_tool`] on the held slot.
-//! - `place_block`: [`Inventory::remove_at`]`(slot, 1)` and place the returned item's block.
+//! - `place_block`: first check that the slot's item is placeable
+//!   ([`Item::as_block`] is `Some`; tools, materials, food and drops are not), then
+//!   [`Inventory::remove_at`]`(slot, 1)` and place that block.
 //! - `eat(slot)`: [`eat`]. `respawn`: [`Inventory::clear`].
 //!
 //! # Cost (hand count of SBF ops ≈ CU; not measured on SBF yet)
@@ -244,6 +246,17 @@ impl Inventory {
         left
     }
 
+    /// Adds all `n` of `item`, or nothing: returns `false` (inventory unchanged) if they
+    /// don't all fit. Costs a 216-byte copy on top of [`Inventory::add`].
+    pub fn try_add(&mut self, item: Item, n: u32) -> bool {
+        let mut tmp = *self;
+        if tmp.add(item, n) != 0 {
+            return false;
+        }
+        *self = tmp;
+        true
+    }
+
     /// Removes `n` items from slot `i`; returns the item removed. Atomic: on error nothing
     /// changes. A tool slot is removed whole (`n` must be 1).
     pub fn remove_at(&mut self, i: usize, n: u8) -> Result<Item, InvError> {
@@ -393,6 +406,21 @@ pub(crate) mod tests {
         let mut inv = Inventory::new();
         assert_eq!(inv.add(Item::Dirt, u32::MAX), u32::MAX - 36 * 64);
         assert!(is_normalized(&inv));
+    }
+
+    #[test]
+    fn try_add_is_atomic() {
+        let mut inv = Inventory::new();
+        assert!(inv.try_add(Item::Dirt, 35 * 64 - 1));
+        assert!(inv.try_add(Item::IronAxe, 1));
+        let before = inv;
+        assert!(!inv.try_add(Item::Dirt, 2));
+        assert!(!inv.try_add(Item::IronAxe, 1));
+        assert!(!inv.try_add(Item::Dirt, u32::MAX));
+        assert_eq!(inv, before);
+        assert!(inv.try_add(Item::Dirt, 1));
+        assert!(inv.try_add(Item::Stone, 0));
+        assert_eq!(inv.count(Item::Dirt), 35 * 64);
     }
 
     #[test]
