@@ -1,11 +1,13 @@
 //! Pure, deterministic Magicraft game logic shared by the onchain program and tests.
 
 pub mod blocks;
+pub mod caves;
 pub mod consts;
 pub mod coords;
 pub mod hash;
 pub mod items;
 pub mod noise;
+pub mod populate;
 pub mod terrain;
 
 /// Version of the core game rules.

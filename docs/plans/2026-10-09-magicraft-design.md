@@ -89,6 +89,12 @@ Deterministic integer math on `hash(world.seed, …)`; independent of chunk crea
 - **Ores:** fixed per-chunk cluster counts (≈8 coal y<50, 4 iron y<32, 1 diamond y<12).
 - **Trees / cactus:** neighborhood replay, may cross chunk borders.
 - **Passive animals:** 0–3 spawned in grass biomes during populate.
+- **Stage 2 details** (`crates/core/src/caves.rs`, `populate.rs`): worm spheres are clamped to
+  their chunk's 3×3 neighborhood, so 3×3 replay equals a single-buffer world carve. Caves
+  carve only `1 ≤ y < surface` and never next to water or ice (exact across borders via lazily
+  computed neighbor heights). Trees/canopies write only above stage-1 surfaces (logs over
+  air/leaves, leaves over air → order-free). Measured ≈ 2.8× stage-1 cost on average, ≈ 4.6×
+  worst (≈ 300k / ≈ 550k CU est.), so `populate_chunk` fits its own 1.4M-CU tx.
 
 Generation is compute-heavy: anything computed per block costs ≥ ~7 CU per byte (measured:
 16 384 computed bytes ≈ 115k CU above baseline; bulk fills/copies are nearly free), so generation
