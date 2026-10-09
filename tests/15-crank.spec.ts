@@ -31,7 +31,7 @@ import {
   pstatePda,
   surface,
 } from "./helpers/play";
-import { Col, Terrain, V3, walkTree } from "./helpers/scout";
+import { Col, fedByWater, Terrain, V3, walkTree } from "./helpers/scout";
 import {
   breakIx,
   chunkMobs,
@@ -53,9 +53,6 @@ import {
 const R = 2; // reference area: chunks −R..=R
 const ZOMBIE = 4;
 const isWater = (b: number) => b >= 23 && b <= 30;
-const isFlowing = (b: number) => b >= 24 && b <= 30;
-/** fluid "support": neither Air nor flowing water (unknown = support). */
-const isSupport = (b: number) => b !== 0 && !isFlowing(b);
 const REACH = 4.7; // planning reach, blocks (program: 5 + 0.5 slack)
 const EYE = 1.62;
 const key = (cx: number, cz: number) => `${cx},${cz}`;
@@ -86,17 +83,8 @@ function findWater(t: Terrain, spawn: V3) {
           if (d > REACH) continue;
           const b = t.block(x, y, z);
           if (b === 255 || !isSolid(b) || b === 8 || b === 9) continue;
-          const fed =
-            isWater(t.block(x, y + 1, z)) ||
-            N4.some(([dx, dz]) => {
-              const n = t.block(x + dx, y, z + dz);
-              return (
-                isWater(n) &&
-                n <= 29 &&
-                isSupport(t.block(x + dx, y - 1, z + dz))
-              );
-            });
-          if (fed) return { W: c, Q: [x, y, z] as V3, path: tree.path(c)! };
+          if (fedByWater(t, [x, y, z]))
+            return { W: c, Q: [x, y, z] as V3, path: tree.path(c)! };
         }
   }
   return null;

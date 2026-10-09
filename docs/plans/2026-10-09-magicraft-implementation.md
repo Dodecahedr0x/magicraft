@@ -326,6 +326,19 @@ Commit `feat(program): chunk tick crank`.
 
 Full path: wallet → player → delegate → session → create world → VRF → chunk (0,0) → join → move around creating 8 chunks → top up (`lamportsDelegatedTransferIx`) → break/craft/place → water flow → night zombie damage → death → respawn → close the player's unedited chunks → withdraw (assert base balance reflects ER spend). Commit `test: end-to-end gameplay`.
 
+**Done (Task 21):** `pnpm test:e2e` (= `TEST_SPEC=tests/99-e2e.spec.ts scripts/test.sh`; the
+Anchor test script honours `TEST_SPEC`). Every gameplay tx is signed and paid by a 0-lamport
+session key; the wallet signs only base txs and `withdraw`. The route (tour of ≥ 8 chunks, a
+block water flows into, 3 logs, a work spot with ≥ 22 soft blocks) is scouted over reference
+blocks; the water break comes before the logs (scout route order). Death: zombies if they get
+there first, else a pillar sized from the current health (+2 margin) and a step off. ~90 s.
+The night is spent in a fresh chunk; reclaiming is best effort (cave zombies block most visited
+chunks — design follow-up in `spikes.md`).
+New helpers: `createSession`/`sessionAccounts` (session), `topUp` (player), `creationChain`,
+`liveBlocks`, session-signed `createAndGrow` (chunk), `scoutTour`, `fedByWater`,
+`scoutWork(..., {fed})` (scout), `mobsIn` (actions), `TxStats` (stats). Numbers:
+`docs/notes/spikes.md`.
+
 ---
 
 ## Phase 3 — Browser client (`app/`)

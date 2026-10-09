@@ -2,6 +2,10 @@
 // local ER, plus small polling utilities.
 import { BN, web3 } from "@anchor-lang/core";
 import {
+  deriveRentPda,
+  lamportsDelegatedTransferIx,
+} from "@magicblock-labs/ephemeral-rollups-sdk";
+import {
   airdrop,
   baseConn,
   erConn,
@@ -92,3 +96,42 @@ export async function setupPlayer(opts: { depositSol: number }) {
 }
 
 export type TestPlayer = Awaited<ReturnType<typeof setupPlayer>>;
+
+/** Tops up a delegated Player from its wallet with the e-SPL
+ *  `lamportsDelegatedTransferIx` (base-layer tx; the ER credits the Player
+ *  within ~1 s). The e-SPL global rent PDA sponsors the single-use lamports
+ *  PDA's delegation; it is pre-funded on MagicBlock clusters, so it is funded
+ *  here (1 SOL) only when low. Returns the number of base txs sent. */
+export async function topUp(p: TestPlayer, lamports: number): Promise<number> {
+  let txs = 0;
+  const [rentPda] = deriveRentPda();
+  const rent = (await baseConn.getAccountInfo(rentPda, "confirmed"))?.lamports;
+  if ((rent ?? 0) < 0.1 * LAMPORTS) {
+    await p.base.provider.sendAndConfirm!(
+      new web3.Transaction().add(
+        web3.SystemProgram.transfer({
+          fromPubkey: p.authority.publicKey,
+          toPubkey: rentPda,
+          lamports: LAMPORTS,
+        })
+      ),
+      [],
+      { skipPreflight: true }
+    );
+    txs++;
+  }
+  const salt = crypto.getRandomValues(new Uint8Array(32));
+  await p.base.provider.sendAndConfirm!(
+    new web3.Transaction().add(
+      lamportsDelegatedTransferIx(
+        p.authority.publicKey,
+        p.player,
+        BigInt(lamports),
+        salt
+      )
+    ),
+    [],
+    { skipPreflight: true }
+  );
+  return txs + 1;
+}

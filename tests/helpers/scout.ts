@@ -19,6 +19,9 @@ export const B = {
 } as const;
 const SOFT = new Set<number>([B.GRASS, B.DIRT, B.SAND, B.GRAVEL]);
 const isWater = (b: number) => b >= 23 && b <= 30;
+const isFlowing = (b: number) => b >= 24 && b <= 30;
+/** fluid "support": neither Air nor flowing water (unknown = support). */
+const isSupport = (b: number) => b !== 0 && !isFlowing(b);
 
 /** Reach used for planning (blocks): the program allows params.reach (5) +
  *  0.5 slack, measured eye → block center. */
@@ -104,6 +107,46 @@ export function walkTree(t: Terrain, start: Col) {
     return p ? (p.split(",").map(Number) as Col) : null;
   };
   return { order, path, parent, has: (c: Col) => prev.has(key(...c)) };
+}
+
+/** Water flows into block `p` once it is broken: water above it, or a
+ *  horizontal water neighbour of level ≤ 6 standing on support. */
+export function fedByWater(t: Terrain, p: V3): boolean {
+  const [x, y, z] = p;
+  return (
+    isWater(t.block(x, y + 1, z)) ||
+    N4.some(([dx, dz]) => {
+      const n = t.block(x + dx, y, z + dz);
+      return isWater(n) && n <= 29 && isSupport(t.block(x + dx, y - 1, z + dz));
+    })
+  );
+}
+
+/** A walk from column `start` that enters at least `minChunks` distinct
+ *  chunks (counting the start's): repeatedly the shortest walk to the nearest
+ *  column of a chunk not visited yet (greedy). Waypoints `[x, feetY, z]` and
+ *  the chunks ("cx,cz") in visiting order, or why not. */
+export function scoutTour(
+  t: Terrain,
+  start: Col,
+  minChunks: number
+): { path: V3[]; chunks: string[] } | string {
+  const ck = (c: Col) => `${Math.floor(c[0] / 16)},${Math.floor(c[1] / 16)}`;
+  const chunks = [ck(start)];
+  const path: V3[] = [];
+  let at = start;
+  while (chunks.length < minChunks) {
+    const tree = walkTree(t, at);
+    const next = tree.order.find((c) => !chunks.includes(ck(c)));
+    if (!next) return `tour stuck after ${chunks.length} chunks`;
+    path.push(...tree.path(next)!);
+    for (const p of tree.path(next)!) {
+      const k = ck([p[0], p[2]]);
+      if (!chunks.includes(k)) chunks.push(k);
+    }
+    at = next;
+  }
+  return { path, chunks };
 }
 
 /** Eye of a player standing on column c at feet y. */
@@ -216,7 +259,13 @@ export function scoutHunt(
 /** Plans the work route from column `start` (the second player walks from the
  *  spawn), or explains why not (`string`). Mutates `t` (the planned breaks are
  *  applied, so later walks see them). */
-export function scoutWork(t: Terrain, start: Col, spawn: V3): Plan | string {
+export function scoutWork(
+  t: Terrain,
+  start: Col,
+  spawn: V3,
+  /** `fed`: the water block must be one water flows into ([`fedByWater`]). */
+  o: { fed?: boolean } = {}
+): Plan | string {
   const sp: Col = [spawn[0], spawn[2]];
   // 1. A breakable block with water on a face, within reach of a walkable column.
   const fromP = walkTree(t, start);
@@ -228,6 +277,7 @@ export function scoutWork(t: Terrain, start: Col, spawn: V3): Plan | string {
       if (!isSolid(b) || b === B.BEDROCK || b === B.LOG || b === 255)
         return false;
       if (p[0] === c[0] && p[2] === c[1]) return false; // not under our feet
+      if (o.fed) return fedByWater(t, p);
       return FACES.some(([a, b2, cc]) =>
         isWater(t.block(p[0] + a, p[1] + b2, p[2] + cc))
       );

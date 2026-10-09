@@ -5,6 +5,7 @@ import * as path from "path";
 import { web3 } from "@anchor-lang/core";
 import { erConn, erProgram, sendEr } from "./env";
 import { TestPlayer } from "./player";
+import { SessionAuth, sessionAccounts } from "./session";
 import { ephemeralRent } from "./world";
 
 export const CHUNK_INITIAL_LEN = 10_240;
@@ -176,22 +177,85 @@ export async function closeChunkIx(
 }
 
 /** The client's generation tx 1: ComputeBudget 1.4M + create_chunk + grow_chunk
- *  (the neighbor slots are derived; an existing `DONE` neighbor is the foothold). */
+ *  (the neighbor slots are derived; an existing `DONE` neighbor is the foothold).
+ *  Signed by the wallet, or by a session key (`session`, which also pays). */
 export async function createAndGrow(
   p: TestPlayer,
   world: web3.PublicKey,
   cx: number,
   cz: number,
-  units = 1_400_000
+  units = 1_400_000,
+  session?: SessionAuth
 ): Promise<string> {
   return sendEr(
     [
       computeBudgetIx(units),
-      await createChunkIx(p, world, cx, cz),
+      await createChunkIx(
+        p,
+        world,
+        cx,
+        cz,
+        session ? sessionAccounts(session) : {}
+      ),
       await growChunkIx(p.player, world, cx, cz),
     ],
-    [p.authority]
+    [session ? session.kp : p.authority]
   );
+}
+
+/** The chunks to create (in order) so that chunk `target` ("cx,cz") can be
+ *  created next to the `existing` ones: the shortest edge-adjacent chain from
+ *  an existing chunk (or from (0,0) when none exists), within `|cx|, |cz| ≤
+ *  bound`. Ends with `target`; empty if it exists. */
+export function creationChain(
+  existing: Set<string>,
+  target: string,
+  bound = Infinity
+): string[] {
+  if (existing.has(target)) return [];
+  const roots = existing.size ? [...existing] : ["0,0"];
+  if (!existing.size && target === "0,0") return ["0,0"];
+  const prev = new Map<string, string | null>(roots.map((k) => [k, null]));
+  const q = [...roots];
+  for (let i = 0; i < q.length; i++) {
+    const [cx, cz] = q[i].split(",").map(Number);
+    for (const [dx, dz] of NBR_OFF) {
+      const [nx, nz] = [cx + dx, cz + dz];
+      const k = `${nx},${nz}`;
+      if (Math.abs(nx) > bound || Math.abs(nz) > bound || prev.has(k)) continue;
+      prev.set(k, q[i]);
+      if (k === target) {
+        const chain: string[] = [];
+        for (let c: string | null = k; c && !existing.has(c); c = prev.get(c)!)
+          chain.unshift(c);
+        return chain;
+      }
+      q.push(k);
+    }
+  }
+  throw new Error(`chunk ${target} is not reachable within ${bound}`);
+}
+
+/** Current block bytes of the given chunks ("cx,cz" keys) on the ER (missing
+ *  or not fully generated ones are left out). */
+export async function liveBlocks(
+  world: web3.PublicKey,
+  keys: Iterable<string>
+): Promise<Map<string, Buffer>> {
+  const ks = [...keys];
+  const infos = await erConn.getMultipleAccountsInfo(
+    ks.map((k) =>
+      chunkPda(world, ...(k.split(",").map(Number) as [number, number]))
+    ),
+    "confirmed"
+  );
+  const out = new Map<string, Buffer>();
+  ks.forEach((k, i) => {
+    const d = infos[i]?.data;
+    if (d && d.length === CHUNK_FULL_LEN && d[82] === GEN_DONE)
+      out.set(k, Buffer.from(d.subarray(CHUNK_BLOCKS_OFFSET)));
+  });
+  return out;
 }
 
 /** Permissionless: sets the world spawn from the populated chunk (0,0). */

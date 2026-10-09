@@ -111,3 +111,36 @@ export function revokeSessionIx(
     data: disc("revoke_session_v2"),
   });
 }
+
+/** A session key (0 lamports) and its token for a Player's wallet. */
+export type SessionAuth = { kp: web3.Keypair; token: web3.PublicKey };
+
+/** Creates a session token on the base layer for `authority` (wallet-signed, wallet
+ *  pays the token rent) with a fresh 0-lamport session key, valid `validSecs`. */
+export async function createSession(
+  conn: web3.Connection,
+  programId: web3.PublicKey,
+  authority: web3.Keypair,
+  validSecs = 3600
+): Promise<SessionAuth> {
+  const kp = web3.Keypair.generate();
+  const tx = new web3.Transaction().add(
+    createSessionIx({
+      programId,
+      signer: kp.publicKey,
+      authority: authority.publicKey,
+      validUntil: Math.floor(Date.now() / 1000) + validSecs,
+    })
+  );
+  await web3.sendAndConfirmTransaction(conn, tx, [authority, kp]);
+  return {
+    kp,
+    token: sessionTokenPda(programId, kp.publicKey, authority.publicKey),
+  };
+}
+
+/** The `signer` / `sessionToken` accounts of a session-authed ix builder. */
+export const sessionAccounts = (s: SessionAuth) => ({
+  signer: s.kp.publicKey,
+  sessionToken: s.token,
+});

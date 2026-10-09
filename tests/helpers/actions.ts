@@ -2,7 +2,7 @@
 // PlayerState inventory / chunk fluid-queue decoding.
 import { web3 } from "@anchor-lang/core";
 import { TestPlayer } from "./player";
-import { chunkPda, presencePda } from "./chunk";
+import { chunkData, chunkPda, presencePda } from "./chunk";
 import { pstatePda } from "./play";
 
 export type V3 = [number, number, number];
@@ -265,3 +265,24 @@ export const uniq = () =>
   web3.ComputeBudgetProgram.setComputeUnitLimit({
     units: 400_000 + (uniqN++ % 100_000),
   });
+
+export const ZOMBIE = 4;
+
+/** Live mobs of kind `kind` in the chunks `keys` ("cx,cz"), with their chunk,
+ *  slot index and FP feet position. */
+export async function mobsIn(
+  world: web3.PublicKey,
+  keys: Iterable<string>,
+  kind: number
+) {
+  const out: { chunk: string; idx: number; pos: V3; hp: number }[] = [];
+  for (const k of keys) {
+    const [cx, cz] = k.split(",").map(Number);
+    const d = await chunkData(chunkPda(world, cx, cz));
+    if (!d) continue;
+    chunkMobs(d).forEach((m, idx) => {
+      if (m.kind === kind) out.push({ chunk: k, idx, pos: m.pos, hp: m.hp });
+    });
+  }
+  return out;
+}

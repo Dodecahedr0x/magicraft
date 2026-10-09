@@ -2,11 +2,7 @@
 // ER clones the delegated Player.
 import { expect } from "chai";
 import { BN, web3 } from "@anchor-lang/core";
-import {
-  DELEGATION_PROGRAM_ID,
-  deriveRentPda,
-  lamportsDelegatedTransferIx,
-} from "@magicblock-labs/ephemeral-rollups-sdk";
+import { DELEGATION_PROGRAM_ID } from "@magicblock-labs/ephemeral-rollups-sdk";
 import {
   airdrop,
   baseConn,
@@ -21,6 +17,7 @@ import {
   playerPda,
   setupPlayer,
   TestPlayer,
+  topUp as sendTopUp,
   until,
   waitForEr,
 } from "./helpers/player";
@@ -124,35 +121,7 @@ describe("player lifecycle: top-up and withdraw", () => {
   });
 
   it("tops up the delegated Player with lamportsDelegatedTransferIx (ER credited within ~1 s)", async () => {
-    // The e-SPL global rent PDA sponsors the single-use lamports PDA's
-    // delegation; it is pre-funded on MagicBlock clusters, fund it locally.
-    const [rentPda] = deriveRentPda();
-    if ((await lamports(baseConn, rentPda)) < 0.1 * LAMPORTS) {
-      await p.base.provider.sendAndConfirm!(
-        new web3.Transaction().add(
-          web3.SystemProgram.transfer({
-            fromPubkey: p.authority.publicKey,
-            toPubkey: rentPda,
-            lamports: LAMPORTS,
-          })
-        ),
-        [],
-        { skipPreflight: true }
-      );
-    }
-    const salt = crypto.getRandomValues(new Uint8Array(32));
-    await p.base.provider.sendAndConfirm!(
-      new web3.Transaction().add(
-        lamportsDelegatedTransferIx(
-          p.authority.publicKey,
-          p.player,
-          BigInt(topUp),
-          salt
-        )
-      ),
-      [],
-      { skipPreflight: true }
-    );
+    await sendTopUp(p, topUp);
     const t0 = Date.now();
     const credited = await until(
       async () => (await lamports(erConn, p.player)) === erBal + topUp,

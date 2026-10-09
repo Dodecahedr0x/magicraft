@@ -4,6 +4,7 @@ import { createHash, randomBytes } from "crypto";
 import { BN, web3 } from "@anchor-lang/core";
 import { ER_TEST_QUEUE, erConn, erProgram, sendEr, TxError } from "./env";
 import { setupPlayer, TestPlayer, until } from "./player";
+import { SessionAuth, sessionAccounts } from "./session";
 
 export const WORLD_LEN = 265;
 /** Ephemeral rent: (data_len + 60) * 32 lamports. */
@@ -146,17 +147,25 @@ export async function waitSeed(world: web3.PublicKey, timeoutMs = 10_000) {
 /** A seeded world created (and its seed paid) by `p` (default: a fresh Player
  *  with `depositSol`, default 0.05 SOL). */
 export async function setupWorld(
-  o: { player?: TestPlayer; depositSol?: number; params?: WorldParamsArg } = {}
+  o: {
+    player?: TestPlayer;
+    depositSol?: number;
+    params?: WorldParamsArg;
+    /** Sign both txs with this session key instead of the wallet. */
+    session?: SessionAuth;
+  } = {}
 ) {
   const p =
     o.player ?? (await setupPlayer({ depositSol: o.depositSol ?? 0.05 }));
   const nonce = freshNonce();
   const world = worldPda(p.authority.publicKey, nonce);
-  await sendEr(
-    [await createWorldIx(p, { nonce, params: o.params })],
-    [p.authority]
+  const auth = o.session ? sessionAccounts(o.session) : {};
+  const signers = [o.session ? o.session.kp : p.authority];
+  const createSig = await sendEr(
+    [await createWorldIx(p, { nonce, params: o.params, ...auth })],
+    signers
   );
-  await sendEr([await requestSeedIx(p, world)], [p.authority]);
+  const seedSig = await sendEr([await requestSeedIx(p, world, auth)], signers);
   const w = await waitSeed(world);
   if (!w) throw new Error(`world ${world.toBase58()}: VRF seed never arrived`);
   return {
@@ -164,6 +173,8 @@ export async function setupWorld(
     world,
     nonce,
     seed: Buffer.from(w.acc.seed as number[]),
+    /** create_world and request_seed tx signatures. */
+    sigs: [createSig, seedSig],
   };
 }
 

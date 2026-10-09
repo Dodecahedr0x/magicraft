@@ -846,3 +846,47 @@ Decisions:
 - `debug_cancel_tick` exists only in `localnet` builds (`#[cfg(feature = "localnet")]`).
 - 12-chunk picks a world whose first animal chunk along +x is within 6 chunks (reference
   generator, ≤ 20 worlds) and compares mob kinds per slot, not positions.
+
+## 2026-10-09: End-to-end journey (Task 21)
+
+Test: `tests/99-e2e.spec.ts` (`pnpm test:e2e`, ~90 s of test time). World: 150 s day, zombie cap 4,
+mob tick 333 ms; worlds are retried until the scout finds a ≥ 8-chunk tour, a block water flows
+into, 3 logs, ≥ 22 soft blocks at a work spot, and a fresh land chunk next to the route for the
+night (1-4 worlds). Typical run: tour ~60 steps / 8 chunks (12 s), route done at day ~40 s,
+night at 75 s, first zombie hit within ~5-40 s (20 → 17), pillar ~22 blocks → dead, respawn,
+close, withdraw; base settled exactly `baseAtSync + (erBeforeWithdraw − erAtSync)` in every
+run, and `open_chunks` matched. ~200 session-key ER txs (+ ~8 expected failures), 1 wallet ER
+tx (withdraw), 3-4 base txs. Every chunk create / close moved the Player's ER balance by
+exactly 554 240.
+
+**Zombies make most visited chunks unreclaimable.** By day, zombies spawn in caves
+(non-sky-exposed floors) within 8-24 blocks of a present player in any ticking chunk; they never
+burn there and never despawn, and `close_chunk` refuses chunks with zombies. One run: 22 zombies
+in 7 of 9 chunks, 18 of them below the surface; close outcomes over 5 runs: 0-2 of 8-9 chunks
+reclaimed, `ChunkHasMobs` on 2-8. Cave zombies also fill a chunk's cap (4), so a lingering
+player's chunk may get no surface zombie at night (first full-suite run: a zombie 2 blocks away,
+underground, no hit in 70 s). The spec therefore idles until night (no heartbeat: the presence
+goes stale, cranks idle) and spends the night in a freshly created chunk. Design follow-up:
+despawn far / unreachable zombies, or let `close_chunk` drop zombies with no fresh presence
+nearby.
+
+**Session-key CU** (whole ix; three runs; one run's numbers sit ~3-5k above another's for the
+same ix, from bump searches over the random keys, so compare within a run):
+
+| Ix | CU |
+|---|---|
+| `create_world` / `request_seed` | 16.7k-22.7k / 32.8k-37.4k |
+| `create_chunk` (relinks armed neighbors) / `grow_chunk` / `populate_chunk` | 42k-103k / 161k-169k / 88k-290k |
+| `set_spawn` | 17.7k-89k (one 89k sample) |
+| `join_world` | 18.8k-21.8k |
+| `move_player` (130-165 per run) | 20.6k-53.5k, median 24k-29k |
+| `break_block` (log / soft / next to water) | 15.1k-18.8k / 14.1k-23.3k / 19.1k-24.4k |
+| `place_block` | 13.9k-20.9k |
+| `craft` (hand / table), `select_slot`, `respawn` | 10.9k-15.4k / 12.9k-17.4k, 6.0k-10.5k, 8.9k-13.4k |
+| `close_chunk` | 51k-91k |
+| `withdraw` (wallet) | 28.1k |
+| `tick_chunk` (fluid + mobs / zombie + player) | 12.3k-28.2k / 9.1k-48.0k |
+
+Harness: `scripts/local-er.sh` now waits for base slot ≥ 20 before starting the ER; starting it
+in the first slots failed the ER's fee-vault setup tx deterministically on a loaded machine
+("Magic fee vault setup failed": `Unsupported program id`).
