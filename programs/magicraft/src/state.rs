@@ -47,7 +47,8 @@
 //! | 191 | `last_tick_ms` | i64 (chain ms of the last `tick_day`) |
 //! | 199 | `chunk_count` | u32 |
 //! | 203 | `clock` | [`TimeAnchor`]: `anchor_slot` u64 @203, `anchor_ms` i64 @211, `ms_per_slot` u32 @219, `base_ms_per_slot` u32 @223, `sync_slot` u64 @227, `sync_ms` i64 @235 |
-//! | 243 | `_reserved` | [u8; 22] |
+//! | 243 | `day_ticks` | u32 (wrapping count of `tick_day` executions; diagnostics) |
+//! | 247 | `_reserved` | [u8; 18] |
 //!
 //! # `PlayerState` (ephemeral), PDA `["pstate", world, player]`, 432 bytes
 //! | off | field | type |
@@ -387,6 +388,9 @@ impl TimeAnchor {
     }
 }
 
+/// Largest day advance per `tick_day`, ms (see [`World::advance_day`]).
+pub const DAY_MAX_STEP_MS: i64 = STALE_MS;
+
 /// A world. Ephemeral, ≤ 10 240 bytes so `create_world` needs one ix.
 #[account]
 #[derive(InitSpace)]
@@ -407,7 +411,9 @@ pub struct World {
     pub last_tick_ms: i64,
     pub chunk_count: u32,
     pub clock: TimeAnchor,
-    pub _reserved: [u8; 22],
+    /// Wrapping count of `tick_day` executions (diagnostics: crank liveness / rate).
+    pub day_ticks: u32,
+    pub _reserved: [u8; 18],
 }
 
 // `create_world` creates the World in one CPI (≤ 10 240 bytes).
@@ -418,6 +424,35 @@ impl World {
     /// returns chain ms.
     pub fn tick_clock(&mut self, clock: &Clock) -> i64 {
         self.clock.reanchor(clock.slot, clock.unix_timestamp)
+    }
+
+    /// `callback_seed`: stores the VRF output once (`SeedAlreadySet` afterwards, so a
+    /// second fulfilment cannot re-roll the world).
+    pub fn set_seed(&mut self, randomness: [u8; 32]) -> Result<()> {
+        require!(!self.seed_set, MagicraftError::SeedAlreadySet);
+        self.seed = randomness;
+        self.seed_set = true;
+        Ok(())
+    }
+
+    /// `tick_day`: advances `time_of_day_ms` by the chain time since the last tick (at
+    /// most [`DAY_MAX_STEP_MS`], so a stalled crank pauses the day instead of jumping it;
+    /// the first tick only records `last_tick_ms`), modulo the day length. Total: never
+    /// panics or fails, whatever the stored state.
+    pub fn advance_day(&mut self, now_ms: i64) {
+        let day_ms = self.params.day_length_secs as u64 * 1000;
+        if day_ms == 0 {
+            self.time_of_day_ms = 0;
+        } else if self.last_tick_ms > 0 {
+            let step = now_ms
+                .saturating_sub(self.last_tick_ms)
+                .clamp(0, DAY_MAX_STEP_MS) as u64;
+            self.time_of_day_ms = (self.time_of_day_ms % day_ms + step) % day_ms;
+        } else {
+            self.time_of_day_ms %= day_ms;
+        }
+        self.last_tick_ms = self.last_tick_ms.max(now_ms);
+        self.day_ticks = self.day_ticks.wrapping_add(1);
     }
 
     /// Read-only chain time for gameplay ixs (never writes the World).
@@ -996,7 +1031,8 @@ mod tests {
                 sync_slot: 14,
                 sync_ms: 15,
             },
-            _reserved: [0; 22],
+            day_ticks: 16,
+            _reserved: [0; 18],
         };
         let mut b = World::DISCRIMINATOR.to_vec();
         b.extend(borsh(&w));
@@ -1017,6 +1053,7 @@ mod tests {
         assert_eq!(&b[223..227], &13u32.to_le_bytes());
         assert_eq!(&b[227..235], &14u64.to_le_bytes());
         assert_eq!(&b[235..243], &15i64.to_le_bytes());
+        assert_eq!(&b[243..247], &16u32.to_le_bytes());
     }
 
     #[test]
@@ -1208,6 +1245,69 @@ mod tests {
         assert!(!sponsor_can_pay(need + 499, rent, 500));
         assert!(!sponsor_can_pay(100, rent, 500));
         assert!(!sponsor_can_pay(u64::MAX, u64::MAX, 0));
+    }
+
+    fn test_world() -> World {
+        World {
+            creator: Pubkey::default(),
+            nonce: 0,
+            bump: 0,
+            name: [0; 32],
+            params: phys::WorldParams::default().into(),
+            seed: [0; 32],
+            seed_set: false,
+            spawn: [0; 3],
+            spawn_set: false,
+            time_of_day_ms: 0,
+            day_task_id: 0,
+            last_tick_ms: 0,
+            chunk_count: 0,
+            clock: TimeAnchor::default(),
+            day_ticks: 0,
+            _reserved: [0; 18],
+        }
+    }
+
+    #[test]
+    fn set_seed_only_once() {
+        let mut w = test_world();
+        w.set_seed([7; 32]).unwrap();
+        assert!(w.seed_set);
+        assert_eq!(
+            w.set_seed([9; 32]).unwrap_err(),
+            error!(MagicraftError::SeedAlreadySet)
+        );
+        assert_eq!(w.seed, [7; 32]);
+    }
+
+    #[test]
+    fn advance_day_wraps_clamps_and_is_total() {
+        let mut w = test_world();
+        w.params.day_length_secs = 60;
+        // First tick: only records the time.
+        w.advance_day(1_000_000);
+        assert_eq!((w.time_of_day_ms, w.last_tick_ms), (0, 1_000_000));
+        w.advance_day(1_001_000);
+        assert_eq!(w.time_of_day_ms, 1_000);
+        // Wraps modulo the day.
+        w.time_of_day_ms = 59_500;
+        w.advance_day(1_002_000);
+        assert_eq!(w.time_of_day_ms, 500);
+        // A long stall advances at most DAY_MAX_STEP_MS.
+        w.advance_day(1_002_000 + 3_600_000);
+        assert_eq!(w.time_of_day_ms, 500 + DAY_MAX_STEP_MS as u64);
+        // Time going backwards: no advance, last_tick_ms stays monotonic.
+        let (t, l) = (w.time_of_day_ms, w.last_tick_ms);
+        w.advance_day(5);
+        assert_eq!((w.time_of_day_ms, w.last_tick_ms), (t, l));
+        // Garbage state never panics.
+        w.time_of_day_ms = u64::MAX;
+        w.last_tick_ms = i64::MIN + 1;
+        w.advance_day(i64::MAX);
+        assert!(w.time_of_day_ms < 60_000);
+        w.params.day_length_secs = 0;
+        w.advance_day(0);
+        assert_eq!(w.time_of_day_ms, 0);
     }
 
     #[test]

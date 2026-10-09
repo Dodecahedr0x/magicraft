@@ -7,6 +7,14 @@
 
 ## 2026-10-09: Local ephemeral rollup harness (Task 2)
 
+> **Task 16 update:** the base layer now defaults to **8799/8800** (`BASE_PORT` in
+> `scripts/local-er.sh`, exported by `scripts/test.sh` together with `PROVIDER_ENDPOINT` /
+> `WS_ENDPOINT`; `tests/helpers/env.ts` defaults to the same), because 8899 is often taken (e.g. by
+> an SSH tunnel). Plain `pnpm test` needs no env vars. `scripts/test.sh` builds with
+> `anchor build -- --features localnet`, which points `request_seed`'s `oracle_queue` constraint
+> (and the IDL address) at `DEFAULT_EPHEMERAL_TEST_QUEUE`; a plain `anchor build` targets
+> `DEFAULT_EPHEMERAL_QUEUE` and its VRF requests fail locally with `ConstraintAddress`.
+
 Source: MagicBlock "Local development" guide
 (https://docs.magicblock.gg/pages/ephemeral-rollups-ers/how-to-guide/local-development.md)
 plus the launcher scripts shipped in the npm package.
@@ -68,7 +76,7 @@ VRF_ORACLE_SKIP_PREFLIGHT=true RPC_URL=http://127.0.0.1:7799 WEBSOCKET_URL=ws://
 
 | Layer | RPC | WS | env override (tests/helpers/env.ts) |
 |---|---|---|---|
-| Base | http://127.0.0.1:8899 | ws://127.0.0.1:8900 | `PROVIDER_ENDPOINT` (falls back to `ANCHOR_PROVIDER_URL`), `WS_ENDPOINT` |
+| Base | http://127.0.0.1:8799 (8899 before Task 16) | ws://127.0.0.1:8800 | `PROVIDER_ENDPOINT` (falls back to `ANCHOR_PROVIDER_URL`), `WS_ENDPOINT` |
 | ER | http://127.0.0.1:7799 | ws://127.0.0.1:7800 | `EPHEMERAL_PROVIDER_ENDPOINT`, `EPHEMERAL_WS_ENDPOINT` |
 
 `airdrop()` works on the base layer only (the ER has no faucet). ER fee payers
@@ -472,3 +480,26 @@ Chunk tick crank authority = the **Chunk PDA** itself; day crank authority = the
 (same kind of account: ephemeral, program-owned, non-delegated). Neither needs a delegated
 `Player` in the arming tx, so any player's move/edit (or the watchdog) can re-arm a chunk crank.
 The fallback (a program-wide `["crank"]` PDA delegated once) is not needed.
+
+## 2026-10-09: Worlds, VRF seed, day crank (Task 16, permanent code)
+
+Test: `tests/11-world.spec.ts`. Measured on the local stack (CU of the whole ix):
+
+| Ix | CU | Notes |
+|---|---|---|
+| `create_world` | 14.6k-16.1k | EphemeralAccount create + Borsh write + day-crank `ScheduleTask` CPI (~7k); varies with the World bump search |
+| `request_seed` | 30.8k | VRF program ~11.7k; rest is Anchor, `program_identity` bump search, session derive |
+| `tick_day` | 4.1k | re-anchor + day advance |
+| `schedule_day_crank` | 7.3k | |
+
+- VRF seed fulfilled in 79-94 ms after `request_seed`.
+- Re-arming the day crank 3× from 0-lamport strangers: 4 ticks / 4 s before and after (replace, not
+  duplicate). Identical ER txs (same signer, blockhash, data) are rejected as "already processed",
+  so repeated re-arms from one signer need distinct txs.
+- **VRF queue capacity:** two `request_seed` ixs in one tx, or two concurrent txs, fail the second
+  with `AccountDataTooSmall` in the VRF program (`Idx: 9488`): the local test queue arrives full of
+  stale devnet requests and has room for about one pending request. So the "second callback hits
+  `SeedAlreadySet`" path could not be produced end to end locally; it is covered by the unit test
+  `state::tests::set_seed_only_once` and the e2e test tolerates the queue rejection. **Production:**
+  a full `DEFAULT_EPHEMERAL_QUEUE` makes `request_seed` fail; the client should retry (the world
+  stays usable for re-requests while `seed_set == false`).

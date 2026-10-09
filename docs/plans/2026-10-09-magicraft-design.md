@@ -224,7 +224,9 @@ once). Validity is checked against the ER clock, max 7 days.
   delegated `Player` PDA via a manual `invoke_signed` with both the `["identity"]` and Player seeds —
   not `invoke_signed_vrf`, which signs with the identity only) → `callback_seed` (`#[vrf_callback]`,
   typed seeded `World`, stores the 32-byte seed only if unset; the callback gets ≈ 260k CU, so no
-  generation there; fulfilled in ~110 ms locally) → chunk (0,0) → `schedule_day_crank`.
+  generation there; fulfilled in ~110 ms locally) → chunk (0,0). `create_world` arms the day crank
+  itself (World PDA = task authority, +~7k CU); `schedule_day_crank` (permissionless, idempotent
+  replace) is the watchdog's re-arm. `request_seed(client_seed)` mixes a client nonce into the caller seed.
 - `join_world` — creates `PlayerState` at spawn, health 20, food 20.
 - `move_player(pos, vel, on_ground)` ~8 Hz — speed bound vs elapsed time, AABB collision vs solid
   blocks, fall damage `max(0, fall_start_y − y − 3)` (water cancels), presence update/migration,

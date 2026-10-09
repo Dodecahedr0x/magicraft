@@ -18,6 +18,8 @@ idl-build = ["anchor-lang/idl-build", "session-keys/idl-build"]
 anchor-debug = ["anchor-lang/anchor-debug"]
 custom-heap = []
 custom-panic = []
+# Local stack: VRF requests go to DEFAULT_EPHEMERAL_TEST_QUEUE (scripts/test.sh builds with it).
+localnet = []
 
 [dependencies]
 anchor-lang = "=1.0.1"
@@ -25,6 +27,7 @@ ephemeral-rollups-sdk = { version = "0.17", features = ["anchor", "vrf"] }
 session-keys = { version = "3", features = ["no-entrypoint"] }
 magicblock-magic-program-api = "0.14"
 bincode = "1"
+solana-sha256-hasher = "3.1"
 bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 magicraft-core = { path = "../../crates/core" }
 

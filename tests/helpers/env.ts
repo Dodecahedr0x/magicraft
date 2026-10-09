@@ -16,8 +16,8 @@ import idl from "../../target/idl/magicraft.json";
 const BASE_RPC =
   process.env.PROVIDER_ENDPOINT ??
   process.env.ANCHOR_PROVIDER_URL ??
-  "http://127.0.0.1:8899";
-const BASE_WS = process.env.WS_ENDPOINT ?? "ws://127.0.0.1:8900";
+  "http://127.0.0.1:8799";
+const BASE_WS = process.env.WS_ENDPOINT ?? "ws://127.0.0.1:8800";
 const ER_RPC =
   process.env.EPHEMERAL_PROVIDER_ENDPOINT ?? "http://127.0.0.1:7799";
 const ER_WS = process.env.EPHEMERAL_WS_ENDPOINT ?? "ws://127.0.0.1:7800";
