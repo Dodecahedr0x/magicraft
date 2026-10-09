@@ -4,6 +4,7 @@ pub mod blocks;
 pub mod caves;
 pub mod consts;
 pub mod coords;
+pub mod fluid;
 pub mod hash;
 pub mod items;
 pub mod noise;
