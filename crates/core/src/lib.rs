@@ -7,6 +7,7 @@ pub mod coords;
 pub mod fluid;
 pub mod hash;
 pub mod items;
+pub mod mobs;
 pub mod noise;
 pub mod physics;
 pub mod populate;
