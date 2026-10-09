@@ -15,3 +15,8 @@ trap 'scripts/local-er.sh down' EXIT
 trap 'exit 130' INT TERM # exit via the EXIT trap
 scripts/local-er.sh up
 anchor test --skip-local-validator --skip-build --skip-deploy "$@"
+# The browser client's chain layer against the same stack (app/src/chain/live.test.ts).
+# Skip with SKIP_APP_LIVE=1.
+if [[ -z "${SKIP_APP_LIVE:-}" ]]; then
+  LIVE=1 pnpm -C app exec vitest run src/chain/live.test.ts
+fi

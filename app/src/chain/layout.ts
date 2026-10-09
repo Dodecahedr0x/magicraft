@@ -14,6 +14,8 @@ export const CHUNK_W = 16;
 export const CHUNK_H = 64;
 export const CHUNK_VOL = CHUNK_W * CHUNK_W * CHUNK_H; // 16 384
 export const SEA_LEVEL = 28;
+/** `physics::GROUND_HALF_W`: half-width of the player's xz footprint, FP. */
+export const GROUND_HALF_W = 78;
 
 export const CHUNK_HEADER_SIZE = 768;
 export const CHUNK_BLOCKS_OFFSET = CHUNK_HEADER_SIZE;
@@ -293,6 +295,20 @@ export function worldChainMs(w: Pick<WorldAccount, "clock">, slot: number): numb
   const c = w.clock;
   if (c.msPerSlot === 0) return null;
   return c.anchorMs + Math.max(0, slot - c.anchorSlot) * c.msPerSlot;
+}
+
+/** `physics::LEAD_MS`: how far a move's `client_ms` may run ahead of chain time (fine
+ *  clock; 1 000 ms when the chain falls back to coarse wall time). */
+export const LEAD_MS = 250;
+
+/** The `client_ms` for the next move: strictly after the last one (`lastMs + minDt`; the
+ *  chain also bounds the distance by the elapsed `client_ms`), ideally just behind the
+ *  chain-time estimate. Null if that would run more than `LEAD_MS − 50` ahead of the
+ *  estimate: wait (one slot) and retry. `lastMs` = `client_ms` of the last confirmed (or
+ *  in-flight, if pipelining) move, or `MoveState.last_ms` after join / respawn / snap-back. */
+export function nextClientMs(chainMs: number, lastMs: number, minDt = 1): number | null {
+  const ms = Math.max(lastMs + minDt, Math.floor(chainMs) - 30);
+  return ms <= chainMs + LEAD_MS - 50 ? ms : null;
 }
 
 /** The day crank is stale (`World::day_crank_stale`): the client sends `schedule_day_crank`. */

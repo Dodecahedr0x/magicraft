@@ -3,10 +3,14 @@
 // `getSignatureStatuses` in one shared loop (not `confirmTransaction`: some failures, e.g.
 // InvalidRealloc, otherwise surface only at blockhash expiry, ~30 s).
 //
-// - Fire-and-forget: `send` never rejects; it resolves to a `SendResult`.
+// - Fire-and-forget: `send` never rejects; it resolves to a `SendResult`. A `timeout`
+//   failure means "not confirmed in time": the tx **may still land** (the caller re-reads
+//   state rather than assuming it failed).
 // - Latest-wins coalescing per `key` (e.g. "move"): at most one tx per key is in flight
 //   (sent, not yet confirmed/failed); while it is, only the newest request waits and older
-//   waiting ones resolve `superseded`. Ordering per key is therefore preserved.
+//   waiting ones resolve `superseded`. Ordering per key is therefore preserved. Keyed
+//   sends use a short confirmation timeout (`laneTimeoutMs`, 2 s) so a lost tx cannot stall
+//   the lane for the full 30 s.
 // - Program errors are mapped to names (IDL 6100+, session 6000–6003, Anchor framework)
 //   and a coarse `kind` the UI acts on (snap back, top-up prompt, silent retry, renew
 //   session). `onError` sees every failure.
@@ -19,9 +23,11 @@ import {
   Transaction,
   type Connection,
   type Keypair,
+  type PublicKey,
   type TransactionInstruction,
   type TransactionError,
 } from "@solana/web3.js";
+import { ChunkNotReadyError } from "./actions";
 import { PROGRAM_ERRORS } from "./program";
 
 export const GEN_COMPUTE_UNITS = 1_400_000;
@@ -36,9 +42,10 @@ export type ErrorKind =
   | "snapback" // rejected move: snap to the onchain PlayerState
   | "topup" // the Player can't sponsor rent: prompt a top-up
   | "retry" // cooldown: retry silently later
-  | "renewSession" // session token missing/invalid: create a new session
-  | "notReady" // chunk not generated yet
-  | "timeout" // not confirmed in time (may still land)
+  | "renewSession" // session token missing/invalid/expired: create a new session
+  | "dead" // the player is dead: show the death screen (respawn)
+  | "notReady" // chunk not generated yet (onchain, or known locally by a builder)
+  | "timeout" // not confirmed in time: MAY STILL LAND
   | "send" // the RPC refused the tx (network, blockhash, …)
   | "other";
 
@@ -81,7 +88,8 @@ export type IxSource = Ixs | (() => Ixs | Promise<Ixs>);
 const SNAPBACK = new Set(["MoveTooFast", "Collision", "NotOnGround", "Flying", "InvalidMoveState", "TimeSkew"]);
 const TOPUP = new Set(["InsufficientSponsorFunds", "InsufficientFunds"]);
 const RETRY = new Set(["Cooldown"]);
-const RENEW = new Set(["InvalidToken", "NoToken"]);
+const RENEW = new Set(["InvalidToken", "NoToken", "InvalidAuthority", "ValidityTooLong"]);
+const DEAD = new Set(["Dead"]);
 const NOT_READY = new Set(["ChunkNotReady"]);
 
 export function errorKind(name: string | undefined): ErrorKind {
@@ -91,15 +99,33 @@ export function errorKind(name: string | undefined): ErrorKind {
   if (RETRY.has(name)) return "retry";
   if (RENEW.has(name)) return "renewSession";
   if (NOT_READY.has(name)) return "notReady";
+  if (DEAD.has(name)) return "dead";
   return "other";
 }
 
-/** Maps a `TransactionError` from `getSignatureStatuses` to a `TxFailure`. */
-export function mapTxError(err: TransactionError | unknown): TxFailure {
+/** Maps a `TransactionError` from `getSignatureStatuses` to a `TxFailure`. With `ours`
+ *  and `ixProgram` (program of the tx's ix `i`), a custom error is decoded with our error
+ *  table only when the failing ix belongs to `ours` (another program's 6001 is not
+ *  `InvalidToken`). */
+export function mapTxError(
+  err: TransactionError | unknown,
+  ours?: PublicKey,
+  ixProgram?: (i: number) => PublicKey | undefined,
+): TxFailure {
   const ie = (err as { InstructionError?: [number, unknown] } | null)?.InstructionError;
   if (Array.isArray(ie)) {
     const [ixIndex, inner] = ie;
     const custom = (inner as { Custom?: number } | null)?.Custom;
+    const prog = ixProgram?.(ixIndex);
+    if (typeof custom === "number" && ours && ixProgram && !prog?.equals(ours)) {
+      return {
+        kind: "other",
+        code: custom,
+        message: `custom error ${custom} from ${prog?.toBase58() ?? "unknown program"} (ix ${ixIndex})`,
+        ixIndex,
+        raw: err,
+      };
+    }
     if (typeof custom === "number") {
       const info = PROGRAM_ERRORS.get(custom);
       const name = info?.name;
@@ -136,6 +162,10 @@ export type SenderOptions = {
   pollMs?: number;
   /** Default confirmation timeout, ms (default 30 000). */
   timeoutMs?: number;
+  /** Confirmation timeout of keyed (coalesced) sends, ms (default 2 000). */
+  laneTimeoutMs?: number;
+  /** Our program: custom errors of other programs' ixs are not decoded as ours. */
+  programId?: PublicKey;
   /** Reuse a fetched blockhash for this long, ms (default 5 000). */
   blockhashTtlMs?: number;
   /** Clock (tests). */
@@ -243,6 +273,8 @@ export class ErSender {
     try {
       ixs = typeof src === "function" ? await src() : src;
     } catch (e) {
+      if (e instanceof ChunkNotReadyError)
+        return this.fail({ kind: "notReady", name: "ChunkNotReady", message: e.message, raw: e }, key);
       return this.fail({ kind: "other", message: `building the tx failed: ${errMsg(e)}`, raw: e }, key);
     }
     const signers = opts.signers ?? [];
@@ -269,10 +301,14 @@ export class ErSender {
       if (/blockhash/i.test(errMsg(e))) this.invalidateBlockhash();
       return this.fail({ kind: "send", message: `send failed: ${errMsg(e)}`, raw: e }, key, sig);
     }
-    const st = await this.wait(sig, opts.timeoutMs ?? this.opts.timeoutMs ?? 30_000);
-    if (!st) return this.fail({ kind: "timeout", message: `tx ${sig} not confirmed in time` }, key, sig);
+    const timeout =
+      opts.timeoutMs ?? (key !== undefined ? (this.opts.laneTimeoutMs ?? 2_000) : (this.opts.timeoutMs ?? 30_000));
+    const st = await this.wait(sig, timeout);
+    if (!st)
+      return this.fail({ kind: "timeout", message: `tx ${sig} not confirmed in ${timeout} ms (may still land)` }, key, sig);
     if (st.err) {
-      const f = mapTxError(st.err);
+      const ixs = tx.instructions;
+      const f = mapTxError(st.err, this.opts.programId, (i) => ixs[i]?.programId);
       if (opts.logs) f.logs = await this.fetchLogs(sig);
       return this.fail(f, key, sig);
     }

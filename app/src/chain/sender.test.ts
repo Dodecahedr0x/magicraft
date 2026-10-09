@@ -8,6 +8,7 @@ import {
   type SignatureStatus,
 } from "@solana/web3.js";
 import { describe, expect, it, vi } from "vitest";
+import { ChunkNotReadyError } from "./actions";
 import { ErSender, GEN_COMPUTE_UNITS, mapTxError, type SenderConnection, type TxFailure } from "./sender";
 
 type Status = Pick<SignatureStatus, "err" | "confirmationStatus">;
@@ -97,7 +98,7 @@ describe("ErSender", () => {
 
   it("maps program, session and runtime errors", async () => {
     const { er, s, errors } = setup();
-    const codes = [6115, 6001, 6002, 6104, 6122, 6103, 6100, 2006, 9999];
+    const codes = [6115, 6001, 6002, 6104, 6122, 6103, 6100, 2006, 9999, 6128, 6003, 6000];
     er.auto = (i) => ({ err: custom(codes[i], 1), confirmationStatus: "processed" });
     const res = [];
     for (const _ of codes) res.push(await s.send([memo(res.length)]));
@@ -112,11 +113,48 @@ describe("ErSender", () => {
       [6100, "Unauthorized", "other"],
       [2006, "ConstraintSeeds", "other"],
       [9999, undefined, "other"],
+      [6128, "Dead", "dead"],
+      [6003, "InvalidAuthority", "renewSession"],
+      [6000, "ValidityTooLong", "renewSession"],
     ]);
     expect(fails[0]!.ixIndex).toBe(1);
     expect(errors).toHaveLength(codes.length);
     expect(mapTxError({ InstructionError: [0, "InvalidRealloc"] })).toMatchObject({ name: "InvalidRealloc", kind: "other" });
     expect(mapTxError("AccountNotFound").name).toBe("AccountNotFound");
+  });
+
+  it("decodes custom errors only for our program's ixs", async () => {
+    const ours = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+    const { er, s } = setup({ programId: ours });
+    er.auto = () => ({ err: custom(6001, 0), confirmationStatus: "processed" });
+    const foreign = await s.send([ComputeBudgetProgram.setComputeUnitLimit({ units: 1 }), memo(1)]);
+    expect(foreign.status === "failed" && [foreign.error.name, foreign.error.kind, foreign.error.code]).toEqual([
+      undefined,
+      "other",
+      6001,
+    ]);
+    er.auto = () => ({ err: custom(6001, 1), confirmationStatus: "processed" });
+    const own = await s.send([ComputeBudgetProgram.setComputeUnitLimit({ units: 2 }), memo(1)]);
+    expect(own.status === "failed" && own.error.name).toBe("InvalidToken");
+  });
+
+  it("a builder's ChunkNotReadyError is reported as notReady", async () => {
+    const { er, s } = setup();
+    const r = await s.send(() => {
+      throw new ChunkNotReadyError(3, -4);
+    }, { key: "move" });
+    expect(r.status === "failed" && r.error.kind).toBe("notReady");
+    expect(er.sent).toHaveLength(0);
+  });
+
+  it("keyed sends time out after laneTimeoutMs (may still land)", async () => {
+    const { er, s } = setup({ laneTimeoutMs: 30, timeoutMs: 60_000 });
+    er.auto = () => "never";
+    const t0 = Date.now();
+    const r = await s.send([memo(1)], { key: "move" });
+    expect(r.status === "failed" && r.error.kind).toBe("timeout");
+    expect(r.status === "failed" && r.error.message).toMatch(/may still land/);
+    expect(Date.now() - t0).toBeLessThan(1000);
   });
 
   it("fetches logs on request", async () => {

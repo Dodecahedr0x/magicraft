@@ -12,6 +12,11 @@
 // | `VITE_PROGRAM_ID` | magicraft program id | the IDL `address` |
 // | `VITE_VRF_QUEUE` | VRF oracle queue for `request_seed` | local `DEFAULT_EPHEMERAL_TEST_QUEUE` |
 // | `VITE_ER_VALIDATOR` | ER validator identity pinned in `delegate_player` | local ER identity |
+//
+// Production builds (`import.meta.env.PROD`) have no defaults for the cluster-specific vars:
+// `VITE_BASE_RPC`, `VITE_ER_RPC`, `VITE_PROGRAM_ID`, `VITE_ER_VALIDATOR` and
+// `VITE_VRF_QUEUE` must be set (a localnet default there would silently target the wrong
+// program / validator / VRF queue).
 import { PublicKey } from "@solana/web3.js";
 import idl from "../idl/magicraft.json";
 
@@ -53,8 +58,25 @@ const str = (env: Env, k: string): string | undefined => {
   return typeof v === "string" && v.trim() !== "" ? v.trim() : undefined;
 };
 
-/** Reads the config from Vite env vars (pass `import.meta.env`); throws on bad keys. */
+/** Vars a production build must set. */
+export const PROD_REQUIRED = [
+  "VITE_BASE_RPC",
+  "VITE_ER_RPC",
+  "VITE_PROGRAM_ID",
+  "VITE_ER_VALIDATOR",
+  "VITE_VRF_QUEUE",
+] as const;
+
+/** Reads the config from Vite env vars (pass `import.meta.env`); throws on bad keys and,
+ *  when `env.PROD` is true, on missing `PROD_REQUIRED` vars. */
 export function loadConfig(env: Env = {}): ClusterConfig {
+  if (env.PROD === true) {
+    const missing = PROD_REQUIRED.filter((k) => !str(env, k));
+    if (missing.length)
+      throw new Error(
+        `config: production build is missing ${missing.join(", ")} (set them in app/.env.production or the build env)`,
+      );
+  }
   const key = (k: string, dflt: PublicKey) => {
     const v = str(env, k);
     if (!v) return dflt;

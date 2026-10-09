@@ -32,7 +32,7 @@ async function main() {
   const ixs = [
     ...(await onboardingIxs(program, cfg, wallet, 1_000_000)),
     createSessionIx({ programId: cfg.programId, signer: Keypair.generate().publicKey, authority: wallet, validUntil: 0 }),
-    topUpIx(wallet, playerPda(cfg.programId, wallet), 1_000_000),
+    await topUpIx(wallet, playerPda(cfg.programId, wallet), 1_000_000),
   ];
   (globalThis as { __magicraftSmoke?: unknown }).__magicraftSmoke = { ok: true, ixs: ixs.length };
   lines.push(`chain layer ok (${ixs.length} ixs built)`);

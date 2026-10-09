@@ -162,6 +162,20 @@ describe("config", () => {
     expect(c.baseWs).toBe("ws://127.0.0.1:8800");
     expect(c.erWs).toBe("ws://127.0.0.1:7800");
   });
+  it("production builds require the cluster vars", () => {
+    expect(() => loadConfig({ PROD: true })).toThrow(/VITE_BASE_RPC, VITE_ER_RPC, VITE_PROGRAM_ID, VITE_ER_VALIDATOR, VITE_VRF_QUEUE/);
+    const k = Keypair.generate().publicKey.toBase58();
+    const c = loadConfig({
+      PROD: true,
+      VITE_BASE_RPC: "https://b.example",
+      VITE_ER_RPC: "https://e.example",
+      VITE_PROGRAM_ID: k,
+      VITE_ER_VALIDATOR: k,
+      VITE_VRF_QUEUE: k,
+    });
+    expect(c.vrfQueue.toBase58()).toBe(k);
+  });
+
   it("reads env overrides and derives websockets", () => {
     const k = Keypair.generate().publicKey.toBase58();
     const c = loadConfig({

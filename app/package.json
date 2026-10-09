@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "sync-idl": "node scripts/sync-idl.mjs",
+    "sync-idl": "node scripts/sync-idl.mjs --write",
     "predev": "node scripts/sync-idl.mjs",
     "dev": "vite",
     "prebuild": "node scripts/sync-idl.mjs",
@@ -23,7 +23,7 @@
     "three": "0.186.1"
   },
   "devDependencies": {
-    "@types/node": "^26.6.4",
+    "@types/node": "26.6.4",
     "@types/three": "0.186.0",
     "typescript": "5.9.3",
     "vite": "8.3.1",

@@ -9,10 +9,6 @@
 //   Player is back on base, `withdraw_base(lamports)` (keeps the rent-exempt minimum).
 import { BN } from "@anchor-lang/core";
 import {
-  deriveRentPda,
-  lamportsDelegatedTransferIx,
-} from "@magicblock-labs/ephemeral-rollups-sdk";
-import {
   PublicKey,
   Transaction,
   type Connection,
@@ -69,21 +65,25 @@ export async function onboardingTx(
   return walletTx(base, authority, await onboardingIxs(program, cfg, authority, lamports));
 }
 
+/** The MagicBlock SDK is only needed for top-ups, so it is loaded on first use (its own
+ *  chunk; it pulls in sizeable crypto / attestation deps). */
+const sdk = () => import("@magicblock-labs/ephemeral-rollups-sdk");
+
 /** Top-up ix for a delegated Player (fresh random 32-byte salt per call: the salt seeds a
  *  single-use lamports PDA). `payer` is any wallet. */
-export function topUpIx(
+export async function topUpIx(
   payer: PublicKey,
   player: PublicKey,
   lamports: number | bigint,
   salt: Uint8Array = crypto.getRandomValues(new Uint8Array(32)),
-): TransactionInstruction {
+): Promise<TransactionInstruction> {
   if (salt.length !== 32) throw new Error("top-up salt must be 32 bytes");
-  return lamportsDelegatedTransferIx(payer, player, BigInt(lamports), salt);
+  return (await sdk()).lamportsDelegatedTransferIx(payer, player, BigInt(lamports), salt);
 }
 
 /** The e-SPL global rent PDA (sponsors the top-up's lamports PDA; pre-funded on MagicBlock
  *  clusters, the local stack needs a manual transfer). */
-export const eSplRentPda = (): PublicKey => deriveRentPda()[0];
+export const eSplRentPda = async (): Promise<PublicKey> => (await sdk()).deriveRentPda()[0];
 
 /** `withdraw` (ER, wallet-signed): commit + undelegate the Player. */
 export async function withdrawIx(program: MagicraftProgram, authority: PublicKey) {

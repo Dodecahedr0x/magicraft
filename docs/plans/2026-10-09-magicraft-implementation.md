@@ -376,6 +376,19 @@ for the RPC path). `ErSender`: per-key lanes (one in flight, newest waiting wins
 poller, error `kind` (snapback / topup / retry / renewSession / notReady / timeout / send).
 Fixture: `app/src/chain/__fixtures__/gen_0_0.bin` (`pnpm -C app fixtures`). Tests in
 `tests/helpers` still have their own copies (CJS ts-mocha vs ESM app); not shared yet.
+Review follow-ups: builders take a `ChunkView` (`exists` / `ready`); `moveIx` ports
+`required_slots` (required ⇒ must be ready, else `ChunkNotReadyError` → sender kind
+`notReady`; other ready slots are passed too), break/place pass only the ready neighbors across
+touched borders. `MoveArgs.prev` = last **confirmed** position tracked locally; `client_ms` must
+strictly increase (`layout.nextClientMs`, `actions.waitClientMs`). Keyed sends time out after
+2 s (`timeout` = may still land); kinds `dead`, and `InvalidAuthority`/`ValidityTooLong` →
+`renewSession`; custom errors are decoded only for our program's ixs. Production builds require
+`VITE_BASE_RPC`, `VITE_ER_RPC`, `VITE_PROGRAM_ID`, `VITE_ER_VALIDATOR`, `VITE_VRF_QUEUE`;
+hidden sourcemaps; `vendor`/`three` chunks, the MagicBlock SDK is lazy-loaded (top-ups only).
+`src/idl` is only rewritten by `pnpm -C app sync-idl` (dev/build/test just warn on a diff).
+`app/src/chain/live.test.ts` (LIVE=1, run by `scripts/test.sh` after the Anchor suite, skip with
+`SKIP_APP_LIVE=1`) drives onboarding → session → world → (0,0) → join → border walk → break →
+border place through the app code.
 
 ### Task 23: Onboarding and world picker UI
 
@@ -410,5 +423,12 @@ Box-model mobs (pig/cow/sheep/zombie) interpolated between account updates; othe
 ### Task 28: Devnet deploy and smoke test
 
 **Files:** `docs/notes/deploy.md`, `app/.env.example`.
+
+**Move pipelining (from Task 22):** the `move` lane sends one tx at a time (next after
+confirmation), so the move rate is capped by the ER round trip (fine locally, < 8 Hz if RTT >
+125 ms). If devnet RTT is high, pipeline: send the next move before the previous confirms with
+`prev` = the last *sent* position and strictly increasing `client_ms`, and on any rejection
+snap back to the onchain `PlayerState` and drop the in-flight chain (order is preserved by the
+single sender / same signer, but a rejected move invalidates every later one).
 
 Deploy program to devnet (build without the localnet VRF-queue feature); configure ER endpoint (devnet ER from docs) and pin its validator identity in `delegate_player`, VRF ephemeral queue, session program. Before playing, re-check the remaining risks from the design doc: Magic-program crank CPIs vs Hydra; the deployed VRF program's fee exemption for `DEFAULT_EPHEMERAL_QUEUE` (a Player-PDA payer needs it; fallback wallet payer); e-SPL global rent PDA funded (top-ups); ER fees still 0 (session keys with 0 lamports). Run the app (`pnpm -C app dev`), complete the onboarding flow with a devnet wallet, create a world, play 5 minutes; record issues. Commit `docs: devnet deploy notes`.

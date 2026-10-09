@@ -11,7 +11,7 @@ import {
   createWorldIx,
   creationChain,
   eatIx,
-  existsIn,
+  viewOf,
   joinWorldIx,
   moveIx,
   moveWindow,
@@ -25,9 +25,11 @@ import {
   sessionAuth,
   setSpawnIx,
   walletAuth,
+  ChunkNotReadyError,
+  requiredSlots,
 } from "./actions";
 import { DEFAULT_EPHEMERAL_QUEUE, DEFAULT_EPHEMERAL_TEST_QUEUE, loadConfig } from "./config";
-import { DEFAULT_WORLD_PARAMS } from "./layout";
+import { DEFAULT_WORLD_PARAMS, nextClientMs, type V3 } from "./layout";
 import { onboardingIxs, topUpIx, withdrawBaseIx, withdrawIx } from "./player";
 import { errorCode, IDL, idlFor, makeProgram, PROGRAM_ERRORS } from "./program";
 import { chunkPda, playerPda, presencePda, pstatePda, worldPda } from "./pdas";
@@ -94,11 +96,11 @@ describe("player builders", () => {
     expect(ixs[1].data.readBigUInt64LE(8)).toBe(50_000_000n);
   });
 
-  it("top-up uses a fresh salt per call", () => {
-    const a = topUpIx(wallet, player, 1_000_000);
-    const b = topUpIx(wallet, player, 1_000_000);
+  it("top-up uses a fresh salt per call", async () => {
+    const a = await topUpIx(wallet, player, 1_000_000);
+    const b = await topUpIx(wallet, player, 1_000_000);
     expect(Buffer.from(a.data).equals(Buffer.from(b.data))).toBe(false);
-    expect(() => topUpIx(wallet, player, 1, new Uint8Array(31))).toThrow();
+    await expect(topUpIx(wallet, player, 1, new Uint8Array(31))).rejects.toThrow();
   });
 
   it("withdraw / withdraw_base", async () => {
@@ -129,7 +131,7 @@ describe("gameplay builders", () => {
   });
 
   it("create_chunk / close_chunk neighbor slots are writable iff they exist", async () => {
-    const exists = existsIn(new Set(["0,0", "2,1"])); // only W = (0,0) of (1,0) exists
+    const exists = viewOf(new Set(["0,0", "2,1"])); // only W = (0,0) of (1,0) exists
     const ix = await createChunkIx(program, auth, world, 1, 0, exists);
     const n = meta(ix, "create_chunk", "chunk_n");
     const s = meta(ix, "create_chunk", "chunk_s");
@@ -147,7 +149,7 @@ describe("gameplay builders", () => {
     expect(meta(c, "create_chunk", "player_state").pubkey.equals(pstatePda(pid, world, player))).toBe(true);
     expect(meta(g, "grow_chunk", "player").pubkey.equals(player)).toBe(true);
 
-    const close = await closeChunkIx(program, auth, world, 1, 0, existsIn(new Set(["1,-1"])));
+    const close = await closeChunkIx(program, auth, world, 1, 0, viewOf(new Set(["1,-1"])));
     expect(meta(close, "close_chunk", "chunk_n").isWritable).toBe(true);
     expect(meta(close, "close_chunk", "chunk_w").isWritable).toBe(false);
   });
@@ -163,19 +165,49 @@ describe("gameplay builders", () => {
     expect(meta(day, "schedule_day_crank", "world").pubkey.equals(world)).toBe(true);
   });
 
+  it("requiredSlots (cases of play.rs required_slots_cover_both_footprints)", () => {
+    const c = (b: number) => b * 256 + 128;
+    expect(requiredSlots([c(8), 0, c(8)], [c(9), 0, c(8)], 0, 0)).toEqual([true, false, false, false]);
+    expect(requiredSlots([c(15), 0, c(8)], [c(16), 0, c(8)], 0, 0)).toEqual([true, true, false, false]);
+    expect(requiredSlots([4096 - 10, 0, c(8)], [c(24), 0, c(8)], 0, 0)).toEqual([true, true, false, false]);
+    expect(requiredSlots([c(15), 0, c(15)], [c(16), 0, c(16)], 0, 0)).toEqual([true, false, false, true]);
+    expect(requiredSlots([c(-1), 0, c(-1)], [c(-1), 0, c(-1)], -1, -1)).toEqual([true, false, false, false]);
+    expect(requiredSlots([-10, 0, c(3)], [-10, 0, c(3)], -1, 0)).toEqual([true, true, false, false]);
+  });
+
+  it("move_player: required slots must be ready, optional ones only if ready", async () => {
+    const c = (b: number) => b * 256 + 128;
+    const diag = { prev: [c(15), 7000, c(15)] as V3, pos: [c(16), 7000, c(16)] as V3, onGround: true, clientMs: 1 };
+    // corner crossing (0,0) → (1,1): (1,0) and (0,1) optional
+    const ready = await moveIx(program, auth, world, { ...diag, view: viewOf(new Set(["0,0", "1,1", "1,0"])) });
+    expect(meta(ready, "move_player", "chunk10").pubkey.equals(chunkPda(pid, world, 1, 0))).toBe(true);
+    expect(isProgramPlaceholder(meta(ready, "move_player", "chunk01"))).toBe(true);
+    // (1,1) exists but is not ready: required → ChunkNotReadyError
+    await expect(
+      moveIx(program, auth, world, { ...diag, view: viewOf(new Set(["0,0", "1,1"]), new Set(["0,0"])) }),
+    ).rejects.toMatchObject({ cx: 1, cz: 1 });
+  });
+
+  it("nextClientMs", () => {
+    expect(nextClientMs(10_000, 5_000)).toBe(9_970); // just behind the estimate
+    expect(nextClientMs(10_000, 9_990)).toBe(9_991); // strictly after the last one
+    expect(nextClientMs(10_000, 9_990, 150)).toBe(10_140); // ahead, within the lead
+    expect(nextClientMs(10_000, 10_100, 150)).toBeNull(); // too far ahead: wait
+  });
+
   it("move_player: 2×2 window, presences on crossing", async () => {
     // move window (port of physics::move_window)
     expect(moveWindow([50, 0, 50], [60, 0, 60])).toEqual([-1, -1]); // body margin crosses 0
     expect(moveWindow([2000, 0, 2000], [2100, 0, 2100])).toEqual([0, 0]);
     expect(moveWindow([0, 0, 0], [9000, 0, 0])).toBeNull();
-    const all = existsIn(new Set(["0,0", "1,0", "1,1"])); // (0,1) missing
+    const all = viewOf(new Set(["0,0", "1,0", "1,1"])); // (0,1) missing
     // walk east across x = 4096 (chunk 0 → 1) at z mid-chunk
     const ix = await moveIx(program, auth, world, {
       prev: [4000, 7000, 2048],
       pos: [4200, 7000, 2048],
       onGround: true,
       clientMs: 1_760_000_000_000,
-      exists: all,
+      view: all,
     });
     expect(meta(ix, "move_player", "chunk00").pubkey.equals(chunkPda(pid, world, 0, 0))).toBe(true);
     expect(meta(ix, "move_player", "chunk10").pubkey.equals(chunkPda(pid, world, 1, 0))).toBe(true);
@@ -189,28 +221,44 @@ describe("gameplay builders", () => {
       pos: [2050, 7000, 2000],
       onGround: true,
       clientMs: 1,
-      exists: all,
+      view: all,
     });
     expect(isProgramPlaceholder(meta(ix2, "move_player", "old_presence"))).toBe(true);
   });
 
-  it("break_block passes existing neighbors only", async () => {
-    const ix = await breakBlockIx(program, auth, world, [-1, 30, 5], existsIn(new Set(["-1,0", "0,0", "-1,-1"])));
+  it("break_block passes only the ready neighbors across touched borders", async () => {
+    const all = viewOf(new Set(["-1,0", "0,0", "-1,-1", "-1,1", "-2,0"]));
+    // lx 15 of chunk -1, lz 5: only E
+    const ix = await breakBlockIx(program, auth, world, [-1, 30, 5], all);
     expect(meta(ix, "break_block", "chunk").pubkey.equals(chunkPda(pid, world, -1, 0))).toBe(true);
     expect(meta(ix, "break_block", "chunk_e").pubkey.equals(chunkPda(pid, world, 0, 0))).toBe(true);
-    expect(meta(ix, "break_block", "chunk_n").pubkey.equals(chunkPda(pid, world, -1, -1))).toBe(true);
-    expect(isProgramPlaceholder(meta(ix, "break_block", "chunk_s"))).toBe(true);
-    expect(isProgramPlaceholder(meta(ix, "break_block", "chunk_w"))).toBe(true);
+    for (const k of ["chunk_n", "chunk_s", "chunk_w"]) expect(isProgramPlaceholder(meta(ix, "break_block", k))).toBe(true);
+    // corner lx 0, lz 0 of chunk -1: W and N
+    const c = await breakBlockIx(program, auth, world, [-16, 30, 0], all);
+    expect(meta(c, "break_block", "chunk_w").pubkey.equals(chunkPda(pid, world, -2, 0))).toBe(true);
+    expect(meta(c, "break_block", "chunk_n").pubkey.equals(chunkPda(pid, world, -1, -1))).toBe(true);
+    expect(isProgramPlaceholder(meta(c, "break_block", "chunk_e"))).toBe(true);
+    expect(isProgramPlaceholder(meta(c, "break_block", "chunk_s"))).toBe(true);
+    // interior: none; a border neighbor that exists but isn't ready: omitted
+    const i = await breakBlockIx(program, auth, world, [-8, 30, 8], all);
+    for (const k of ["chunk_n", "chunk_s", "chunk_e", "chunk_w"]) expect(isProgramPlaceholder(meta(i, "break_block", k))).toBe(true);
+    const nr = await breakBlockIx(program, auth, world, [-1, 30, 5], viewOf(new Set(["-1,0", "0,0"]), new Set(["-1,0"])));
+    expect(isProgramPlaceholder(meta(nr, "break_block", "chunk_e"))).toBe(true);
+    // target not ready
+    await expect(breakBlockIx(program, auth, world, [5, 30, 5], viewOf(new Set(["0,0"]), new Set()))).rejects.toBeInstanceOf(
+      ChunkNotReadyError,
+    );
   });
 
   it("place_block remaining accounts (x-edge, z-edge, diagonal)", async () => {
     const def = IDL.instructions.find((i) => i.name === "place_block")!;
     const fixed = def.accounts.length;
     // interior block: none
-    const a = await placeBlockIx(program, auth, world, [5, 30, 5], 3, existsIn(new Set()));
+    const a = await placeBlockIx(program, auth, world, [5, 30, 5], 3, viewOf(new Set(["0,0", "1,0"])));
     expect(a.keys).toHaveLength(fixed);
+    for (const k of ["chunk_n", "chunk_s", "chunk_e", "chunk_w"]) expect(isProgramPlaceholder(meta(a, "place_block", k))).toBe(true);
     // corner block (lx 15, lz 0) of chunk (0,0): E (1,0) exists, N (0,-1) missing, NE (1,-1) exists
-    const ex = existsIn(new Set(["0,0", "1,0", "1,-1"]));
+    const ex = viewOf(new Set(["0,0", "1,0", "1,-1"]));
     const b = await placeBlockIx(program, auth, world, [15, 30, 0], 3, ex);
     const rest = b.keys.slice(fixed);
     const e = chunkPda(pid, world, 1, 0);
@@ -220,10 +268,15 @@ describe("gameplay builders", () => {
       [e, presencePda(pid, e), n, ne, presencePda(pid, ne)].map((k) => k.toBase58()),
     );
     expect(rest.every((m) => !m.isWritable && !m.isSigner)).toBe(true);
+    // touched-side neighbors as chunk_n/s/e/w: E is ready, N doesn't exist
+    expect(meta(b, "place_block", "chunk_e").pubkey.equals(e)).toBe(true);
+    expect(meta(b, "place_block", "chunk_e").isWritable).toBe(true);
+    for (const k of ["chunk_n", "chunk_s", "chunk_w"]) expect(isProgramPlaceholder(meta(b, "place_block", k))).toBe(true);
     expect(b.data.readInt32LE(8)).toBe(15);
     expect(b.data[20]).toBe(3);
     // negative coords: x = -16 is lx 0 of chunk -1 → W neighbor (-2, z)
-    const c = await placeBlockIx(program, auth, world, [-16, 30, 7], 0, existsIn(new Set()));
+    await expect(placeBlockIx(program, auth, world, [-16, 30, 7], 0, viewOf(new Set()))).rejects.toBeInstanceOf(ChunkNotReadyError);
+    const c = await placeBlockIx(program, auth, world, [-16, 30, 7], 0, viewOf(new Set(["-1,0"])));
     expect(c.keys.slice(fixed).map((m) => m.pubkey.toBase58())).toEqual([chunkPda(pid, world, -2, 0).toBase58()]);
   });
 

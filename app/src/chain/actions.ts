@@ -1,16 +1,23 @@
 // Typed builders for every gameplay ix (ported from tests/helpers/{world,chunk,play,actions,
 // crank}.ts). They only build ixs; send them with `ErSender` (session key signs + pays).
 //
-// Chunk existence: the ER rejects a tx listing a non-existent account as writable, so
-// builders that take neighbor chunks need to know which exist. They take an `Exists`
-// predicate (the client's chunk store; `existsIn(set)` for a `Set<"cx,cz">`), or use
-// `fetchExisting` to ask the ER.
+// Chunk knowledge: the ER rejects a tx listing a non-existent account as writable, and
+// gameplay ixs reject a passed chunk that is not fully generated (`ChunkNotReady`). Builders
+// that take neighbor chunks get a `ChunkView` (`exists` / `ready` per chunk coordinate) from
+// the client's chunk store; `viewOf(existing, ready)` builds one from key sets and
+// `fetchChunkView` asks the ER. A builder that needs a chunk that is not ready throws
+// `ChunkNotReadyError` (the sender reports it as kind `notReady`).
 import { BN } from "@anchor-lang/core";
 import type { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import {
+  chunkReady,
   chunkOfBlock,
   chunkOfFp,
+  GROUND_HALF_W,
   localOfBlock,
+  decodeWorld,
+  nextClientMs,
+  worldChainMs,
   type V3,
   type WorldParams,
 } from "./layout";
@@ -45,8 +52,30 @@ export const walletAuth = (wallet: PublicKey, player: PublicKey): Auth => ({
 
 const authAccounts = (a: Auth) => ({ signer: a.signer, player: a.player, sessionToken: a.sessionToken });
 
-export type Exists = (cx: number, cz: number) => boolean;
-export const existsIn = (set: ReadonlySet<string>): Exists => (cx, cz) => set.has(chunkKey(cx, cz));
+/** What the client knows about chunk `(cx, cz)` of the world. */
+export type ChunkView = {
+  /** The chunk account exists on the ER (any gen stage). */
+  exists(cx: number, cz: number): boolean;
+  /** Full size and `gen_stage == DONE` (implies `exists`). */
+  ready(cx: number, cz: number): boolean;
+};
+
+/** A `ChunkView` from key sets (`"cx,cz"`); `ready` defaults to `existing` (all generated). */
+export const viewOf = (existing: ReadonlySet<string>, ready: ReadonlySet<string> = existing): ChunkView => ({
+  exists: (cx, cz) => existing.has(chunkKey(cx, cz)),
+  ready: (cx, cz) => ready.has(chunkKey(cx, cz)),
+});
+
+/** A builder needed a chunk that is not (known to be) ready. */
+export class ChunkNotReadyError extends Error {
+  constructor(
+    readonly cx: number,
+    readonly cz: number,
+  ) {
+    super(`chunk ${cx},${cz} is not ready`);
+    this.name = "ChunkNotReadyError";
+  }
+}
 
 /** Neighbor offsets N, S, E, W (`chunk_n/s/e/w`, `ChunkHeader::nbr_mask` bit order). */
 export const NBR_OFF: readonly [number, number][] = [
@@ -56,15 +85,15 @@ export const NBR_OFF: readonly [number, number][] = [
   [-1, 0],
 ];
 
-/** Which of `coords` exist on the ER as magicraft chunks (one `getMultipleAccountsInfo`
- *  per 100). */
-export async function fetchExisting(
+/** Which of `coords` exist / are ready on the ER (one `getMultipleAccountsInfo` per 100). */
+export async function fetchChunkView(
   er: Connection,
   programId: PublicKey,
   world: PublicKey,
   coords: [number, number][],
-): Promise<Set<string>> {
-  const out = new Set<string>();
+): Promise<ChunkView & { existing: Set<string>; readySet: Set<string> }> {
+  const existing = new Set<string>();
+  const readySet = new Set<string>();
   for (let i = 0; i < coords.length; i += 100) {
     const part = coords.slice(i, i + 100);
     const infos = await er.getMultipleAccountsInfo(
@@ -72,10 +101,13 @@ export async function fetchExisting(
       "confirmed",
     );
     part.forEach(([cx, cz], j) => {
-      if (infos[j]?.owner.equals(programId)) out.add(chunkKey(cx, cz));
+      const info = infos[j];
+      if (!info?.owner.equals(programId)) return;
+      existing.add(chunkKey(cx, cz));
+      if (chunkReady(info.data)) readySet.add(chunkKey(cx, cz));
     });
   }
-  return out;
+  return { ...viewOf(existing, readySet), existing, readySet };
 }
 
 /** Sets the writability of the neighbor-slot metas of a built ix. */
@@ -86,10 +118,10 @@ function setWritable(ix: TransactionInstruction, slots: { pubkey: PublicKey; wri
 
 /** The 4 neighbor slots of create_chunk / close_chunk: each neighbor's chunk PDA,
  *  writable iff it exists. */
-export function neighborSlots(programId: PublicKey, world: PublicKey, cx: number, cz: number, exists: Exists) {
+export function neighborSlots(programId: PublicKey, world: PublicKey, cx: number, cz: number, view: ChunkView) {
   return NBR_OFF.map(([dx, dz]) => ({
     pubkey: chunkPda(programId, world, cx + dx, cz + dz),
-    writable: exists(cx + dx, cz + dz),
+    writable: view.exists(cx + dx, cz + dz),
   }));
 }
 
@@ -155,12 +187,12 @@ export async function createChunkIx(
   world: PublicKey,
   cx: number,
   cz: number,
-  exists: Exists,
+  view: ChunkView,
   playerState: PublicKey | null = null,
 ) {
   const pid = program.programId;
   const chunk = chunkPda(pid, world, cx, cz);
-  const slots = neighborSlots(pid, world, cx, cz, exists);
+  const slots = neighborSlots(pid, world, cx, cz, view);
   const ix = await program.methods
     .createChunk(cx, cz)
     .accountsPartial({
@@ -200,11 +232,11 @@ export async function createAndGrowIxs(
   world: PublicKey,
   cx: number,
   cz: number,
-  exists: Exists,
+  view: ChunkView,
   playerState: PublicKey | null = null,
 ) {
   return [
-    await createChunkIx(program, auth, world, cx, cz, exists, playerState),
+    await createChunkIx(program, auth, world, cx, cz, view, playerState),
     await growChunkIx(program, auth.player, world, cx, cz),
   ];
 }
@@ -232,11 +264,11 @@ export async function closeChunkIx(
   world: PublicKey,
   cx: number,
   cz: number,
-  exists: Exists,
+  view: ChunkView,
 ) {
   const pid = program.programId;
   const chunk = chunkPda(pid, world, cx, cz);
-  const slots = neighborSlots(pid, world, cx, cz, exists);
+  const slots = neighborSlots(pid, world, cx, cz, view);
   const ix = await program.methods
     .closeChunk(cx, cz)
     .accountsPartial({
@@ -307,8 +339,8 @@ export async function joinWorldIx(program: MagicraftProgram, auth: Auth, world: 
  *  the body half-width margin), or null if the move spans more than 2 chunks on an axis. */
 export function moveWindow(a: readonly number[], b: readonly number[]): [number, number] | null {
   const span = (u: number, v: number) => {
-    const lo = Math.min(u, v) - 78;
-    const hi = Math.max(u, v) + 78 - 1;
+    const lo = Math.min(u, v) - GROUND_HALF_W;
+    const hi = Math.max(u, v) + GROUND_HALF_W - 1;
     const c0 = Math.floor(lo / 4096);
     const c1 = Math.floor(hi / 4096);
     return c1 - c0 > 1 ? null : c0;
@@ -318,24 +350,72 @@ export function moveWindow(a: readonly number[], b: readonly number[]): [number,
   return x === null || z === null ? null : [x, z];
 }
 
+/** `play::required_slots`: window slots (order `(cx0,cz0)`, `(cx0+1,cz0)`, `(cx0,cz0+1)`,
+ *  `(cx0+1,cz0+1)`) overlapped by the xz footprint (± `GROUND_HALF_W`) of `a` or `b`; these
+ *  chunks must be passed (and ready) or the move fails with `ChunkNotReady`. */
+export function requiredSlots(a: readonly number[], b: readonly number[], cx0: number, cz0: number): boolean[] {
+  const m = GROUND_HALF_W;
+  const req = [false, false, false, false];
+  for (const p of [a, b]) {
+    const [x, z] = [p[0], p[2]];
+    for (let cz = Math.floor((z - m) / 4096); cz <= Math.floor((z + m - 1) / 4096); cz++)
+      for (let cx = Math.floor((x - m) / 4096); cx <= Math.floor((x + m - 1) / 4096); cx++) {
+        const [dx, dz] = [cx - cx0, cz - cz0];
+        if (dx >= 0 && dx < 2 && dz >= 0 && dz < 2) req[dz * 2 + dx] = true;
+      }
+  }
+  return req;
+}
+
+/** Polls the World clock + ER slot until `nextClientMs` yields a timestamp (tests, simple
+ *  callers; a game loop should compute `worldChainMs` from its own cached World + slot). */
+export async function waitClientMs(
+  er: Connection,
+  world: PublicKey,
+  lastMs: number,
+  minDt = 1,
+  timeoutMs = 10_000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const [info, slot] = await Promise.all([er.getAccountInfo(world, "confirmed"), er.getSlot("processed")]);
+    if (!info) throw new Error(`world ${world.toBase58()} not found`);
+    const chain = worldChainMs(decodeWorld(info.data), slot);
+    const ms = chain === null ? null : nextClientMs(chain, lastMs, minDt);
+    if (ms !== null) return ms;
+    if (Date.now() > deadline) throw new Error("chain clock unavailable or behind lastMs");
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 export type MoveArgs = {
-  /** Last accepted FP feet position (the onchain `MoveState.pos`). */
+  /** The position the chain checks this move from: the last **confirmed** move's position
+   *  as tracked locally (equal to the onchain `MoveState.pos` once that update arrives;
+   *  after a rejection, snap back to the onchain value). Not the last *sent* position. */
   prev: V3;
   pos: V3;
   vel?: V3;
   onGround: boolean;
-  /** Client timestamp in chain ms (`worldChainMs`, slightly behind the estimate). */
+  /** Client timestamp in chain ms. Must strictly increase from move to move and stay
+   *  within the chain's lead tolerance: use `nextClientMs`. */
   clientMs: number;
-  exists: Exists;
+  view: ChunkView;
 };
 
-/** `move_player(pos, vel, on_ground, client_ms)` with the 2×2 window chunks (passed when
- *  they exist), `presence` of the new chunk and `old_presence` when crossing. */
+/** `move_player(pos, vel, on_ground, client_ms)`. Window chunks: every required slot
+ *  (`requiredSlots`) must be ready (else `ChunkNotReadyError`); other ready slots are
+ *  passed too (read-only; an omitted one reads as stone, which only matters for a sweep
+ *  across a chunk corner). `presence` of the new chunk, `old_presence` when crossing. */
 export async function moveIx(program: MagicraftProgram, auth: Auth, world: PublicKey, m: MoveArgs) {
   const pid = program.programId;
   const [cx0, cz0] = moveWindow(m.prev, m.pos) ?? [chunkOfFp(m.prev[0]), chunkOfFp(m.prev[2])];
-  const slot = (dx: number, dz: number) =>
-    m.exists(cx0 + dx, cz0 + dz) ? chunkPda(pid, world, cx0 + dx, cz0 + dz) : null;
+  const req = requiredSlots(m.prev, m.pos, cx0, cz0);
+  const slot = (dx: number, dz: number) => {
+    const [cx, cz] = [cx0 + dx, cz0 + dz];
+    if (m.view.ready(cx, cz)) return chunkPda(pid, world, cx, cz);
+    if (req[dz * 2 + dx]) throw new ChunkNotReadyError(cx, cz);
+    return null;
+  };
   const [ncx, ncz] = [chunkOfFp(m.pos[0]), chunkOfFp(m.pos[2])];
   const [ocx, ocz] = [chunkOfFp(m.prev[0]), chunkOfFp(m.prev[2])];
   const crossed = ncx !== ocx || ncz !== ocz;
@@ -357,19 +437,19 @@ export async function moveIx(program: MagicraftProgram, auth: Auth, world: Publi
 
 const chunkOfB = (b: V3): [number, number] => [chunkOfBlock(b[0]), chunkOfBlock(b[2])];
 
-/** `break_block(x, y, z)` (world block coords); existing N/S/E/W neighbors are passed so
- *  fluid enqueues can cross the border. */
+/** `break_block(x, y, z)` (world block coords). The target chunk must be ready; ready
+ *  neighbors across the borders the block touches are passed (`borderNeighbors`) so fluid
+ *  enqueues can cross them. */
 export async function breakBlockIx(
   program: MagicraftProgram,
   auth: Auth,
   world: PublicKey,
   b: V3,
-  exists: Exists,
+  view: ChunkView,
 ) {
   const pid = program.programId;
   const [cx, cz] = chunkOfB(b);
-  const nb = (dx: number, dz: number) =>
-    exists(cx + dx, cz + dz) ? chunkPda(pid, world, cx + dx, cz + dz) : null;
+  if (!view.ready(cx, cz)) throw new ChunkNotReadyError(cx, cz);
   return program.methods
     .breakBlock(b[0], b[1], b[2])
     .accountsPartial({
@@ -377,19 +457,32 @@ export async function breakBlockIx(
       world,
       playerState: pstateOf(program, auth, world),
       chunk: chunkPda(pid, world, cx, cz),
-      chunkN: nb(0, -1),
-      chunkS: nb(0, 1),
-      chunkE: nb(1, 0),
-      chunkW: nb(-1, 0),
+      ...borderNeighbors(pid, world, b, view),
     })
     .instruction();
+}
+
+/** `chunkN/S/E/W` for an edit of block `b`: the ready neighbor across each border the
+ *  block touches (E/W when `lx ∈ {0, 15}`, N/S when `lz ∈ {0, 15}`), else null (fewer
+ *  write locks than passing every neighbor). */
+export function borderNeighbors(programId: PublicKey, world: PublicKey, b: V3, view: ChunkView) {
+  const [cx, cz] = chunkOfB(b);
+  const [lx, lz] = [localOfBlock(b[0]), localOfBlock(b[2])];
+  const nb = (touch: boolean, dx: number, dz: number) =>
+    touch && view.ready(cx + dx, cz + dz) ? chunkPda(programId, world, cx + dx, cz + dz) : null;
+  return {
+    chunkN: nb(lz === 0, 0, -1),
+    chunkS: nb(lz === 15, 0, 1),
+    chunkE: nb(lx === 15, 1, 0),
+    chunkW: nb(lx === 0, -1, 0),
+  };
 }
 
 /** The border neighbours `place_block` needs as `remaining_accounts`
  *  (`actions::needed_neighbors`): for a block on a chunk edge, the chunk across each edge
  *  (and the diagonal one at a corner), in the order x-edge, z-edge, diagonal; each an
  *  existing chunk + its presence, else the chunk PDA alone. All read-only. */
-export function placeRemainingAccounts(programId: PublicKey, world: PublicKey, b: V3, exists: Exists) {
+export function placeRemainingAccounts(programId: PublicKey, world: PublicKey, b: V3, view: ChunkView) {
   const [cx, cz] = chunkOfB(b);
   const edge = (l: number) => (l === 0 ? -1 : l === 15 ? 1 : 0);
   const dx = edge(localOfBlock(b[0]));
@@ -401,21 +494,23 @@ export function placeRemainingAccounts(programId: PublicKey, world: PublicKey, b
   const ro = (pubkey: PublicKey) => ({ pubkey, isSigner: false, isWritable: false });
   return need.flatMap(([ox, oz]) => {
     const c = chunkPda(programId, world, cx + ox, cz + oz);
-    return exists(cx + ox, cz + oz) ? [ro(c), ro(presencePda(programId, c))] : [ro(c)];
+    return view.exists(cx + ox, cz + oz) ? [ro(c), ro(presencePda(programId, c))] : [ro(c)];
   });
 }
 
-/** `place_block(x, y, z, slot)`. */
+/** `place_block(x, y, z, slot)`: the target chunk must be ready; ready border neighbors go
+ *  in `chunkN/S/E/W` (fluid), the required neighbor presences in `remaining_accounts`. */
 export async function placeBlockIx(
   program: MagicraftProgram,
   auth: Auth,
   world: PublicKey,
   b: V3,
   slot: number,
-  exists: Exists,
+  view: ChunkView,
 ) {
   const pid = program.programId;
   const [cx, cz] = chunkOfB(b);
+  if (!view.ready(cx, cz)) throw new ChunkNotReadyError(cx, cz);
   const chunk = chunkPda(pid, world, cx, cz);
   return program.methods
     .placeBlock(b[0], b[1], b[2], slot)
@@ -425,12 +520,9 @@ export async function placeBlockIx(
       playerState: pstateOf(program, auth, world),
       chunk,
       presence: presencePda(pid, chunk),
-      chunkN: null,
-      chunkS: null,
-      chunkE: null,
-      chunkW: null,
+      ...borderNeighbors(pid, world, b, view),
     })
-    .remainingAccounts(placeRemainingAccounts(pid, world, b, exists))
+    .remainingAccounts(placeRemainingAccounts(pid, world, b, view))
     .instruction();
 }
 
