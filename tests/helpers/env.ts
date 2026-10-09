@@ -2,7 +2,14 @@
 // Endpoint env vars follow the MagicBlock local-dev docs.
 import * as fs from "fs";
 import * as os from "os";
-import { AnchorProvider, Program, Wallet, web3 } from "@anchor-lang/core";
+import {
+  AnchorError,
+  AnchorProvider,
+  Program,
+  ProgramError,
+  Wallet,
+  web3,
+} from "@anchor-lang/core";
 import type { Magicraft } from "../../target/types/magicraft";
 import idl from "../../target/idl/magicraft.json";
 
@@ -17,10 +24,9 @@ const ER_WS = process.env.EPHEMERAL_WS_ENDPOINT ?? "ws://127.0.0.1:7800";
 const WALLET_PATH =
   process.env.ANCHOR_WALLET ?? `${os.homedir()}/.config/solana/id.json`;
 
-const payer = web3.Keypair.fromSecretKey(
+export const payer = web3.Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(fs.readFileSync(WALLET_PATH, "utf8")))
 );
-const wallet = new Wallet(payer);
 
 export const baseConn = new web3.Connection(BASE_RPC, {
   commitment: "confirmed",
@@ -31,17 +37,117 @@ export const erConn = new web3.Connection(ER_RPC, {
   wsEndpoint: ER_WS,
 });
 
-export const provider = new AnchorProvider(baseConn, wallet, {
-  commitment: "confirmed",
-});
-// The ER does not need preflight simulation; skipping it matches MagicBlock examples.
-export const erProvider = new AnchorProvider(erConn, wallet, {
-  commitment: "confirmed",
-  skipPreflight: true,
-});
+/** Program client that signs and pays with `kp` on the given connection. */
+export function programFor(
+  conn: web3.Connection,
+  kp: web3.Keypair,
+  opts: web3.ConfirmOptions = {}
+): Program<Magicraft> {
+  const p = new AnchorProvider(conn, new Wallet(kp), {
+    commitment: "confirmed",
+    ...opts,
+  });
+  return new Program<Magicraft>(idl as Magicraft, p);
+}
 
-export const program = new Program<Magicraft>(idl as Magicraft, provider);
-export const erProgram = new Program<Magicraft>(idl as Magicraft, erProvider);
+/** ER program client for `kp`. The ER does not need preflight simulation
+ *  (matches MagicBlock examples). */
+export function erProgramFor(kp: web3.Keypair): Program<Magicraft> {
+  return programFor(erConn, kp, { skipPreflight: true });
+}
+
+export const program = programFor(baseConn, payer);
+export const erProgram = erProgramFor(payer);
+export const provider = program.provider as AnchorProvider;
+export const erProvider = erProgram.provider as AnchorProvider;
+
+/** Failed transaction with its logs and, when recognisable, the program error. */
+export class TxError extends Error {
+  constructor(
+    message: string,
+    readonly logs: string[],
+    readonly code?: string, // Anchor error name, e.g. "ConstraintSeeds"
+    readonly number?: number
+  ) {
+    super(message);
+  }
+}
+
+const idlErrors = new Map<number, string>(
+  (
+    (idl as { errors?: { code: number; msg?: string; name: string }[] })
+      .errors ?? []
+  ).map((e) => [e.code, e.msg ?? e.name])
+);
+
+/** Build a TxError from transaction logs (and the raw RPC error, if any). */
+export function parseTxError(logs: string[], err?: unknown): TxError {
+  const anchor = AnchorError.parse(logs);
+  if (anchor) {
+    const { code, number } = anchor.error.errorCode;
+    return new TxError(
+      `${code} (${number}): ${anchor.error.errorMessage}\n${logs.join("\n")}`,
+      logs,
+      code,
+      number
+    );
+  }
+  const raw = err === undefined ? "" : JSON.stringify(err);
+  const prog = ProgramError.parse({ toString: () => raw, logs }, idlErrors);
+  if (prog) {
+    return new TxError(
+      `program error ${prog.code}: ${prog.msg}\n${logs.join("\n")}`,
+      logs,
+      undefined,
+      prog.code
+    );
+  }
+  return new TxError(`transaction failed: ${raw}\n${logs.join("\n")}`, logs);
+}
+
+/** Send a transaction on the ER (first signer pays). Throws TxError on failure. */
+export async function sendEr(
+  txOrIxs: web3.Transaction | web3.TransactionInstruction[],
+  signers: web3.Keypair[]
+): Promise<string> {
+  const tx = Array.isArray(txOrIxs)
+    ? new web3.Transaction().add(...txOrIxs)
+    : txOrIxs;
+  tx.feePayer ??= signers[0].publicKey;
+  const bh = await erConn.getLatestBlockhash();
+  tx.recentBlockhash = bh.blockhash;
+  tx.sign(...signers);
+  const sig = await erConn.sendRawTransaction(tx.serialize(), {
+    skipPreflight: true,
+  });
+  const res = await erConn.confirmTransaction({ signature: sig, ...bh });
+  if (res.value.err) {
+    const info = await erConn.getTransaction(sig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    throw parseTxError(info?.meta?.logMessages ?? [], res.value.err);
+  }
+  return sig;
+}
+
+/** Poll until `pk` exists on `conn` and satisfies `predicate`. */
+export async function waitForAccount(
+  conn: web3.Connection,
+  pk: web3.PublicKey,
+  predicate: (info: web3.AccountInfo<Buffer>) => boolean = () => true,
+  timeoutMs = 10_000
+): Promise<web3.AccountInfo<Buffer>> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const info = await conn.getAccountInfo(pk, "confirmed");
+    if (info && predicate(info)) return info;
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for account ${pk.toBase58()}`);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
 
 /** Airdrop `sol` SOL on the base layer and wait for confirmation. */
 export async function airdrop(pk: web3.PublicKey, sol: number): Promise<void> {

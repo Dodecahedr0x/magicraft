@@ -33,9 +33,13 @@ VRF_ORACLE_SKIP_PREFLIGHT=true RPC_URL=http://127.0.0.1:8899 WEBSOCKET_URL=ws://
 VRF_ORACLE_SKIP_PREFLIGHT=true RPC_URL=http://127.0.0.1:7799 WEBSOCKET_URL=ws://127.0.0.1:7800 vrf-oracle   # ER queue
 ```
 
-- Magicraft is loaded **at genesis** (upgradeable, authority = local wallet), so
-  tests run with `anchor test --skip-local-validator --skip-build --skip-deploy`.
-  Rebuild before `up` (`pnpm test` does `anchor build` first). To hot-swap a
+- **Only `pnpm test` (`scripts/test.sh`) is supported.** It runs `anchor build`,
+  `local-er.sh up`, `anchor test --skip-local-validator --skip-build --skip-deploy`,
+  and always runs `local-er.sh down` (EXIT trap, including Ctrl-C). A bare
+  `anchor test` would start its own plain solana-test-validator without the
+  MagicBlock programs and with no ER.
+- Magicraft is loaded **at genesis** (upgradeable, authority = local wallet), so a
+  running stack keeps the build it was started with. To hot-swap a
   build into a running stack, `anchor deploy` also works because the wallet is
   the upgrade authority.
 - Every `up` resets both ledgers. `down` kills each service's process group.
@@ -48,7 +52,8 @@ VRF_ORACLE_SKIP_PREFLIGHT=true RPC_URL=http://127.0.0.1:7799 WEBSOCKET_URL=ws://
   (RPC 9199, ER 9299) was running on this machine and holding 9900 and
   8000-8018. ER metrics on 9000 also collided; that is only a logged error
   (`--metrics` takes a config struct, not an address, so it was left alone).
-- Readiness: base waits for the magicraft program account (not just `getHealth`,
+- Readiness: oracles count as ready when their log shows `Processing queue`
+  (the ER oracle must list `Sc9MJ...`). Base waits for the magicraft program account (not just `getHealth`,
   which answers before genesis accounts are queryable). One early run saw the
   ER exit right after "Ready for connections!", most likely because it started
   before the base layer was really ready; not reproduced after this change
@@ -60,6 +65,12 @@ VRF_ORACLE_SKIP_PREFLIGHT=true RPC_URL=http://127.0.0.1:7799 WEBSOCKET_URL=ws://
 |---|---|---|---|
 | Base | http://127.0.0.1:8899 | ws://127.0.0.1:8900 | `PROVIDER_ENDPOINT` (falls back to `ANCHOR_PROVIDER_URL`), `WS_ENDPOINT` |
 | ER | http://127.0.0.1:7799 | ws://127.0.0.1:7800 | `EPHEMERAL_PROVIDER_ENDPOINT`, `EPHEMERAL_WS_ENDPOINT` |
+
+`airdrop()` works on the base layer only (the ER has no faucet). ER fee payers
+come from cloning or delegation: the ER clones a base account on first use. In
+the harness test, the base-funded, non-delegated local wallet paid for an ER
+transaction and it executed (it failed only with the expected program error).
+Fee/delegation rules for real gameplay accounts still need checking in Task 4.
 
 Local ER validator identity: `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`
 (pass this as the validator when delegating locally).

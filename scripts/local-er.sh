@@ -14,8 +14,13 @@ DIR="$ROOT/.localnet"
 PROGRAM_ID="4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9"
 PROGRAM_SO="$ROOT/target/deploy/magicraft.so"
 WALLET="${ANCHOR_WALLET:-$HOME/.config/solana/id.json}"
-BASE_RPC="http://127.0.0.1:8899"
-ER_RPC="http://127.0.0.1:7799"
+# Faucet/gossip/dynamic ports are moved off the solana-test-validator defaults
+# (9900, 8000-10000) so another local validator (e.g. a second project's stack) can
+# run alongside.
+BASE_PORT=8899 BASE_WS_PORT=8900 ER_PORT=7799 ER_WS_PORT=7800
+FAUCET_PORT=9909 GOSSIP_PORT=8100 DYNAMIC_PORTS=8101-8200
+BASE_RPC="http://127.0.0.1:$BASE_PORT" BASE_WS="ws://127.0.0.1:$BASE_WS_PORT"
+ER_RPC="http://127.0.0.1:$ER_PORT" ER_WS="ws://127.0.0.1:$ER_WS_PORT"
 SERVICES=(base er vrf vrf-er)
 ER_VRF_QUEUE="Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT" # DEFAULT_EPHEMERAL_TEST_QUEUE
 
@@ -58,7 +63,7 @@ down() {
 }
 
 up() {
-  [[ -f "$PROGRAM_SO" ]] || { echo "missing $PROGRAM_SO; run anchor build" >&2; exit 1; }
+  [[ -f "$PROGRAM_SO" ]] || { echo "missing $PROGRAM_SO; run anchor build" >&2; return 1; }
   down
   trap 'echo "local-er up failed; stopping (logs stay in $DIR)" >&2; down' ERR
   mkdir -p "$DIR"
@@ -67,32 +72,27 @@ up() {
   # Base layer: mb-test-validator = solana-test-validator preloaded with the
   # delegation, VRF, session-keys and other MagicBlock programs/accounts. Magicraft
   # is loaded at genesis as an upgradeable program owned by the local wallet.
-  # Faucet/gossip/dynamic ports moved off the defaults (9900, 8000-10000) so another
-  # local validator (e.g. a second project's stack) can run alongside.
-  start base mb-test-validator --reset --ledger "$DIR/test-ledger" \
-    --faucet-port 9909 --gossip-port 8100 --dynamic-port-range 8101-8200 \
+  start base mb-test-validator --reset --ledger "$DIR/test-ledger" --rpc-port "$BASE_PORT" \
+    --faucet-port "$FAUCET_PORT" --gossip-port "$GOSSIP_PORT" --dynamic-port-range "$DYNAMIC_PORTS" \
     --upgradeable-program "$PROGRAM_ID" "$PROGRAM_SO" "$(solana-keygen pubkey "$WALLET")"
   # getHealth can answer before genesis programs are queryable; wait for ours too.
   wait_ready base "$BASE_RPC" account_exists "$BASE_RPC" "$PROGRAM_ID"
 
   RUST_LOG="${RUST_LOG:-info}" start er ephemeral-validator --no-tui --lifecycle ephemeral --reset \
-    --storage "$DIR/er-storage" --listen 127.0.0.1:7799 \
-    --remotes "$BASE_RPC" --remotes ws://127.0.0.1:8900
+    --storage "$DIR/er-storage" --listen "127.0.0.1:$ER_PORT" \
+    --remotes "$BASE_RPC" --remotes "$BASE_WS"
   wait_ready er "$ER_RPC" rpc "$ER_RPC" getSlot
 
   # VRF oracles (identity paywJ..., preloaded by mb-test-validator). One serves the
   # base-layer queue; the other watches the ER, where the delegated ephemeral queue
   # lives. The ER only lists the queue once it has been cloned, so touch it first.
-  VRF_ORACLE_SKIP_PREFLIGHT=true RPC_URL="$BASE_RPC" WEBSOCKET_URL=ws://127.0.0.1:8900 \
+  VRF_ORACLE_SKIP_PREFLIGHT=true RPC_URL="$BASE_RPC" WEBSOCKET_URL="$BASE_WS" \
     RUST_LOG="${RUST_LOG:-info}" start vrf vrf-oracle
   wait_ready er "$ER_RPC (VRF queue cloned)" account_exists "$ER_RPC" "$ER_VRF_QUEUE"
-  VRF_ORACLE_SKIP_PREFLIGHT=true RPC_URL="$ER_RPC" WEBSOCKET_URL=ws://127.0.0.1:7800 \
+  VRF_ORACLE_SKIP_PREFLIGHT=true RPC_URL="$ER_RPC" WEBSOCKET_URL="$ER_WS" \
     RUST_LOG="${RUST_LOG:-info}" start vrf-er vrf-oracle
-  sleep 2
-  for name in vrf vrf-er; do
-    kill -0 "$(cat "$DIR/$name.pid")" 2>/dev/null || { echo "$name exited; see $DIR/$name.log" >&2; exit 1; }
-    echo "$name oracle running (log: $DIR/$name.log)"
-  done
+  wait_ready vrf "$BASE_RPC (oracle)" grep -q "Processing queue" "$DIR/vrf.log"
+  wait_ready vrf-er "$ER_RPC (oracle)" grep -q "Processing queue: $ER_VRF_QUEUE" "$DIR/vrf-er.log"
 }
 
 case "${1:-}" in
