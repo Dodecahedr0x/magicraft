@@ -2396,6 +2396,11 @@
       "code": 6143,
       "name": "SpawnNotSet",
       "msg": "World spawn is not set yet"
+    },
+    {
+      "code": 6144,
+      "name": "SpawnChunk",
+      "msg": "The spawn chunk (0, 0) cannot be closed"
     }
   ],
   "types": [

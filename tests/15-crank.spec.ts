@@ -730,7 +730,7 @@ describe("chunk tick crank", () => {
       const here = key(chunkOf(mine[0]), chunkOf(mine[2]));
       let k: string | undefined;
       for (const c of existing) {
-        if (c === here) continue;
+        if (c === here || c === "0,0") continue; // (0,0) is never closable
         const [cx, cz] = c.split(",").map(Number);
         const ck = chunkPda(w2, cx, cz);
         const pres = await fetchPresence(presencePda(ck));

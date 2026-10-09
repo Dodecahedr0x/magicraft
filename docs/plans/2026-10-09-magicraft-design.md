@@ -148,7 +148,7 @@ Creation allowed only adjacent to an existing **fully generated** chunk or the p
 chunk (or (0,0) in an empty world). Payer =
 creator's `Player` PDA.
 
-`close_chunk`: payer only, if `!edited` and presence empty. Mobs never block: animals are
+`close_chunk`: payer only, never the spawn chunk (0,0) (`SpawnChunk`), if `!edited` and presence empty. Mobs never block: animals are
 dropped and come back when the chunk is regenerated; zombies are dropped (with nobody present
 they would despawn anyway). **Accepted tradeoff:** a payer can lure a zombie into its own
 unedited chunk, step out (presence empty) and close the chunk, deleting the zombie — the

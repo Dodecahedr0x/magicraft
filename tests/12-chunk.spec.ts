@@ -260,8 +260,11 @@ describe("chunks", () => {
       )
     );
     expect(err?.code, String(err)).to.equal("InvalidChunk");
-    // Reclaim it so the Player's counters below stay simple.
-    await sendEr([await closeChunkIx(p, other.world, 0, 0)], [p.authority]);
+    // The spawn chunk can never be closed (it stays open: counters below include it).
+    const spawnErr = await fails(
+      sendEr([await closeChunkIx(p, other.world, 0, 0)], [p.authority])
+    );
+    expect(spawnErr?.code, String(spawnErr)).to.equal("SpawnChunk");
   });
 
   it("squatted (1,0): populate before grow → WrongGenStage; a stranger grows it (payer sponsors)", async () => {
@@ -300,7 +303,7 @@ describe("chunks", () => {
     const d2 = (await chunkData(c10()))!;
     expect(chunkHeader(d2).genStage).to.equal(GEN_STAGE1);
     expect(firstDiff(blocksOf(d2), ref(1, 0).stage1)).to.equal(-1);
-    expect(await openChunks(p)).to.equal(2);
+    expect(await openChunks(p)).to.equal(3); // + the other world's (0,0)
     expect(await chunkCount(world)).to.equal(2);
   });
 
@@ -311,7 +314,7 @@ describe("chunks", () => {
     expect((await erLamports(p.player)) - before).to.equal(
       (CHUNK_INITIAL_LEN + 60) * 32 + (PRESENCE_EMPTY_LEN + 60) * 32
     );
-    expect(await openChunks(p)).to.equal(2);
+    expect(await openChunks(p)).to.equal(3);
   });
 
   it("populate (1,0): matches magicraft-core; spawn unchanged", async () => {

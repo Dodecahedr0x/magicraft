@@ -621,6 +621,7 @@ describe("e2e: one player's journey", () => {
       const [cx, cz] = k.split(",").map(Number);
       const ck = chunkPda(world, cx, cz);
       const predict = async () => {
+        if (k === "0,0") return "SpawnChunk";
         const d = (await chunkData(ck))!;
         if (chunkHeader(d).edited) return "ChunkEdited";
         if ((await fetchPresence(presencePda(ck))).count)

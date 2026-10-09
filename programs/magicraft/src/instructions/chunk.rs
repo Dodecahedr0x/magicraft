@@ -500,7 +500,8 @@ pub struct CloseChunk<'info> {
 
 /// Closes an unedited chunk and its presence list, refunding all rent to the payer Player
 /// (on the ER; the next commit carries it to base). Payer only (wallet or session key).
-/// Requires `!edited` (`ChunkEdited`) and an empty presence list (`ChunkOccupied`); any
+/// Never the spawn chunk (0, 0) (`SpawnChunk`: every world's players join and respawn
+/// there). Requires `!edited` (`ChunkEdited`) and an empty presence list (`ChunkOccupied`); any
 /// `gen_stage` (a half-generated chunk can be reclaimed). **Mobs do not block** (Task 21b):
 /// animals and zombies are dropped with the chunk — with nobody present, its zombies would
 /// despawn anyway (`core::mobs`, "Despawn"), and the populate of a regenerated chunk spawns
@@ -521,6 +522,7 @@ pub fn close_chunk(mut ctx: Context<CloseChunk>, cx: i32, cz: i32) -> Result<()>
     let (task_id, cbump, keys) = {
         let h = chunk_for(&chunk_ai, &world_key, cx, cz)?;
         require_keys_eq!(h.payer, a.player.key(), MagicraftError::Unauthorized);
+        check_not_spawn(cx, cz)?;
         require!(h.edited == 0, MagicraftError::ChunkEdited);
         (h.task_id.get(), h.bump, CrankKeys::of(&h))
     };
@@ -579,9 +581,23 @@ pub fn close_chunk(mut ctx: Context<CloseChunk>, cx: i32, cz: i32) -> Result<()>
     Ok(())
 }
 
+/// `close_chunk` never closes the spawn chunk (0, 0).
+fn check_not_spawn(cx: i32, cz: i32) -> Result<()> {
+    require!((cx, cz) != (0, 0), MagicraftError::SpawnChunk);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_chunk_is_not_closable() {
+        assert_eq!(check_not_spawn(0, 0).unwrap_err(), error!(MagicraftError::SpawnChunk));
+        for (cx, cz) in [(1, 0), (0, -1), (-1, 0), (0, 1), (5, -7)] {
+            assert!(check_not_spawn(cx, cz).is_ok());
+        }
+    }
 
     #[test]
     fn adjacency_rules() {

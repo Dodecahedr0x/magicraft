@@ -2402,6 +2402,11 @@ export type Magicraft = {
       "code": 6143,
       "name": "spawnNotSet",
       "msg": "World spawn is not set yet"
+    },
+    {
+      "code": 6144,
+      "name": "spawnChunk",
+      "msg": "The spawn chunk (0, 0) cannot be closed"
     }
   ],
   "types": [
