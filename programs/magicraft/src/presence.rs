@@ -7,9 +7,10 @@
 //! - entering a chunk (or re-entering after being pruned) costs the mover one entry;
 //! - leaving a chunk (border crossing) refunds the mover one entry: a crossing nets to 0;
 //! - pruning stale entries (other players' `last_seen_ms` older than [`STALE_MS`] of chain
-//!   time, at most [`MAX_PRUNE`] per call, **never one with `pending_damage > 0`**: that
-//!   damage must reach its owner, so such an entry is removed only by its owner's own move
-//!   — later also by close/respawn paths) refunds **the pruner** (the mover), not the
+//!   time, at most [`MAX_PRUNE`] per call; an entry with `pending_damage > 0` only after
+//!   [`DAMAGED_STALE_MS`], so its owner can't dodge damage by pausing a few seconds, yet an
+//!   abandoned damaged entry can't block `close_chunk` forever) refunds **the pruner**
+//!   (the mover), not the
 //!   entry's original payer. The vault does not track who paid an entry, and this is the
 //!   designed incentive (a player who quits leaves ≤ 1 792 lamports behind, collected by
 //!   whoever moves through that chunk next).
@@ -35,6 +36,8 @@ use crate::state::{
 /// Entries whose `last_seen_ms` is older than this (chain ms) are ignored by mobs and
 /// pruned by movers.
 pub const STALE_MS: i64 = 5_000;
+/// Entries with `pending_damage > 0` are pruned only after this long (chain ms).
+pub const DAMAGED_STALE_MS: i64 = 60_000;
 /// At most this many stale entries are pruned per call (bounds CU).
 pub const MAX_PRUNE: usize = 4;
 /// Rent of one entry, lamports.
@@ -69,7 +72,8 @@ pub fn new_entry(me: &Pubkey, pos: [i32; 3], now: i64) -> PresenceEntry {
 }
 
 /// Pure list step (see the module docs): prunes up to [`MAX_PRUNE`] entries of other
-/// players with `now − last_seen_ms > STALE_MS` and no pending damage (swap-remove), then updates `me`'s entry
+/// players with `now − last_seen_ms > STALE_MS` ([`DAMAGED_STALE_MS`] with pending damage)
+/// (swap-remove), then updates `me`'s entry
 /// (position, `last_seen_ms = now`, takes and zeroes `pending_damage`) or inserts it into a
 /// freed slot; if no slot is free, reports `grow`.
 pub fn upsert(entries: &mut [PresenceEntry], me: &Pubkey, pos: [i32; 3], now: i64) -> Upsert {
@@ -81,8 +85,12 @@ pub fn upsert(entries: &mut [PresenceEntry], me: &Pubkey, pos: [i32; 3], now: i6
         if e.player == *me {
             own = Some(i);
         } else if ns < MAX_PRUNE
-            && e.pending_damage == 0
-            && now.saturating_sub(e.last_seen_ms.get()) > STALE_MS
+            && now.saturating_sub(e.last_seen_ms.get())
+                > if e.pending_damage == 0 {
+                    STALE_MS
+                } else {
+                    DAMAGED_STALE_MS
+                }
         {
             stale[ns] = i;
             ns += 1;
@@ -288,15 +296,21 @@ mod tests {
     }
 
     #[test]
-    fn stale_entries_with_pending_damage_are_kept() {
+    fn damaged_entries_use_the_long_timeout() {
         let me = Pubkey::new_from_array([1; 32]);
+        // At 60 s: the plain entry (> 5 s) goes, the damaged one (not > 60 s) stays.
         let mut l = vec![entry(2, 0, 3), entry(3, 0, 0)];
-        let r = upsert(&mut l, &me, [0; 3], 100_000);
+        let r = upsert(&mut l, &me, [0; 3], 60_000);
         assert_eq!((r.count, r.pruned, r.grow), (2, 1, false));
         assert_eq!(keys(&l[..2]), vec![1, 2]);
         // The owner collects it on its own move.
         let owner = Pubkey::new_from_array([2; 32]);
-        assert_eq!(upsert(&mut l[..2], &owner, [0; 3], 100_001).pending, 3);
+        assert_eq!(upsert(&mut l[..2], &owner, [0; 3], 60_001).pending, 3);
+        // An abandoned damaged entry is pruned after 60 s.
+        let mut l = vec![entry(2, 0, 3)];
+        let r = upsert(&mut l, &me, [0; 3], 60_001);
+        assert_eq!((r.count, r.pruned, r.grow), (1, 1, false));
+        assert_eq!(keys(&l[..1]), vec![1]);
     }
 
     #[test]

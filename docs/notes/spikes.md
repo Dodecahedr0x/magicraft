@@ -695,7 +695,10 @@ Decisions:
   window chunk under the previous or new xz footprint (`play::required_slots`,
   `ChunkNotReady`) and `old_presence` on every chunk change (`InvalidPresence`); core limits a
   stuck start to a short step (≤ 1 block horizontally, −1..+1.5 vertically, destination
-  clear). Pruning keeps stale entries with `pending_damage > 0` (only the owner's move
-  collects them). **Task 20:** mobs should only damage fresh entries, and close/respawn
-  paths must handle kept damaged entries (they also block `close_chunk` via the count).
+  clear). Pruning removes entries with `pending_damage > 0` only after 60 s
+  (`presence::DAMAGED_STALE_MS`; plain entries 5 s), so pausing doesn't dodge damage and an
+  abandoned damaged entry blocks `close_chunk` for at most 60 s. **Task 20:** mobs should
+  only damage fresh entries. **Task 19:** `place_block` must reject overlap with the box of
+  **any fresh presence entry** (not only the placer's), else a block placed into another
+  player traps them (their stuck escape is limited to 1 block).
   Time exhaustion uses the move gap clamped to 10 s (not the 2 s movement cap).
