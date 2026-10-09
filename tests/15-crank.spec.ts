@@ -742,6 +742,9 @@ describe("chunk tick crank", () => {
       const t = new Terrain(await liveBlocks(w2, existing));
       const col: Col = [cx * 16 + 8, cz * 16 + 8];
       const spot = () => center(col[0], t.h(...col)!, col[1]);
+      // Start from an empty chunk (natural zombies or animals could also
+      // despawn / be the one seen): clear its mobs first.
+      await sendEr([await debugSpawnMobIx(w2, ck, 0, [0, 0, 0])], [stranger()]);
       await sendEr(
         [await debugSpawnMobIx(w2, ck, ZOMBIE, spot())],
         [stranger()]

@@ -894,7 +894,7 @@ in the first slots failed the ER's fee-vault setup tx deterministically on a loa
 ## 2026-10-09: Zombie despawn, mobs don't block close, deterministic zombie tests (Task 21b)
 
 - **Despawn** (`core::mobs`, "Despawn"): a zombie stepped with no fresh target within 32 blocks
-  (3D) accumulates `Mob.alone_ms` (u16 at offset 26; offset 25 is padding, reserved now 4
+  (3D; targets = fresh presence of its chunk and the 4 side neighbors, as the tick sees them) accumulates `Mob.alone_ms` (u16 at offset 26; offset 25 is padding, reserved now 4
   bytes); at 15 s it is cleared (`MobEvent::despawned`, tick logs `tick: zombie despawned`).
   15 s rather than 30 s: a chunk with only mobs keeps ticking just for its remaining crank
   iterations (≥ ~20 s after the last renewal at 250 ms), so a 30 s threshold would rarely fire.
@@ -903,7 +903,9 @@ in the first slots failed the ER's fee-vault setup tx deterministically on a loa
 - **`close_chunk`** no longer checks mobs (empty presence suffices): zombies and animals are
   dropped. `ChunkHasMobs` (6113) stays in the enum unused so codes don't shift. Close with a
   zombie: 27.6k CU, exact refund. e2e: 5-7 of 9 chunks closed (was 0-2), the rest edited or
-  occupied.
+  occupied. Accepted tradeoff: a payer can lure a zombie into its own unedited chunk, leave and
+  close it (same effect as despawn, sooner, at the cost of the chunk). `scripts/build-release.sh`
+  fails if the IDL has any `debug_*` instruction.
 - **`debug_spawn_mob(kind, pos)`** (`localnet` builds only, like `debug_cancel_tick`): mob at a
   FP position inside the chunk, first free slot, then arms the crank; kind 0 clears all slots. The e2e and one 15-crank
   test place a zombie 3 blocks from the player at night; one 15-crank test keeps natural spawns

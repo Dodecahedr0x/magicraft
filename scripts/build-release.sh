@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Release build for devnet/mainnet deploys: plain `anchor build` (no `localnet` feature),
-# then verify the IDL's request_seed oracle_queue is the production ER VRF queue.
+# then verify the IDL's request_seed oracle_queue is the production ER VRF queue and that
+# no `debug_*` test hook (localnet-only) is present.
 # `pnpm test` leaves a `localnet` build (test queue) in target/: never deploy that.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -16,5 +17,10 @@ if (!q || q.address !== process.argv[1]) {
   console.error(`oracle_queue is ${q && q.address}, expected ${process.argv[1]}: not a release build`);
   process.exit(1);
 }
-console.log(`OK: release build, oracle_queue = ${q.address}`);
+const dbg = idl.instructions.filter((i) => i.name.startsWith("debug_")).map((i) => i.name);
+if (dbg.length) {
+  console.error(`test hooks in the IDL (${dbg.join(", ")}): not a release build`);
+  process.exit(1);
+}
+console.log(`OK: release build, oracle_queue = ${q.address}, no debug_ instructions`);
 ' "$PROD_QUEUE"

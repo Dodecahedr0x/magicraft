@@ -97,7 +97,9 @@
 //!   (e.g. 333 ms ticks → hits at ticks 0, 4, 7, 10, …: 10 hits in 30 ticks).
 //! - **Despawn** (Minecraft-style, deterministic): every step with no fresh target within
 //!   [`DESPAWN_RANGE`] (32 blocks, 3D) adds `dt` to `alone_ms` (any target in range
-//!   resets it); at [`DESPAWN_AFTER_MS`] (15 s of stepped time) the slot is cleared
+//!   resets it). "Targets" are the fresh presence entries visible to the tick: the
+//!   center chunk's and its 4 side neighbors' (not diagonals), so a player in a diagonal
+//!   chunk does not keep a zombie alive even within 32 blocks; at [`DESPAWN_AFTER_MS`] (15 s of stepped time) the slot is cleared
 //!   (`died` + `despawned`). Mobs only step while their chunk ticks: a chunk with mobs and
 //!   no fresh presence keeps ticking for the rest of its crank iterations (≥ ~20 s after
 //!   the last renewal at the default 250 ms interval), so the threshold sits below that;
