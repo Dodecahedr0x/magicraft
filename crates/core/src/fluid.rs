@@ -10,8 +10,9 @@
 //! only**. On a change, the voxels whose desired state depends on the changed one are pushed
 //! into the queue of the chunk that owns them (center or one of the 4 orthogonal neighbors).
 //! A neighbor never gets written by another chunk's tick; it continues the flow in its own
-//! tick. So the program must keep a chunk's crank armed while its queue is non-empty, also
-//! when entries arrived from a neighbor's tick.
+//! tick. So the program must keep a chunk's crank armed while
+//! [`FluidQueue::has_work`] holds, also when the work arrived from a neighbor's tick:
+//! [`StepResult::touched_neighbors`] says which neighbors were pushed to.
 //!
 //! # Neighborhood
 //! [`ChunkNeighborhood`] = center chunk + optional N (`cz-1`), S (`cz+1`), E (`cx+1`),
@@ -49,8 +50,8 @@
 //! a strictly lower neighbor chain down to a source or a fall, and orphaned water recedes
 //! in a single outward wave (each voxel goes straight to Air or to `c + 1` at most).
 //! A flowing voxel that recedes to Air re-queues itself (behind the dependents it just
-//! pushed): as Air it accepts any feeder, so water still fed by a higher-level neighbor
-//! (e.g. one of two sources removed) refills at the right level.
+//! pushed) if, as Air, some neighbor would feed it right now: water still fed by a
+//! higher-level neighbor (e.g. one of two sources removed) refills at the right level.
 //!
 //! # Dependencies (what gets enqueued)
 //! `desired(P)` reads `above(P)`, `below(P)`, `H(P)` (4 horizontal neighbors) and
@@ -65,29 +66,47 @@
 //! - `below(Q)`: Air → water: Air or flowing with level `> 1`; water → Air: flowing.
 //! - `above(Q)` and `H(above(Q))`: only if `Q`'s *support* status changed.
 //!
-//! A voxel that went flowing → Air also re-queues itself (see rule 3).
+//! A voxel that went flowing → Air may also re-queue itself (see rule 3).
 //!
 //! Player edits call [`enqueue_neighbors`], which pushes `Q` itself plus all 10 dependents
 //! (unfiltered except for Air/flowing).
 //!
-//! If a queue is full the entry is dropped (water stays in a valid but possibly stale
-//! state until a later edit nearby re-triggers it). The filters above keep the peak low;
-//! measured in the tests: radius-7 spread 28, its recede 28, fall + landing spread 24,
-//! two sources 31 entries (the plain `min(L + 1)` recede rule hit the 64 cap).
+//! # Overflow
+//! If a queue is full the push is dropped, counted in [`StepResult::dropped`], and the
+//! queue's `overflow` flag is set. That chunk's [`step`] then uses spare budget (queue
+//! drained) to rescan itself, [`RESCAN_WINDOW`] voxels per tick from `rescan_cursor`,
+//! pushing every Air/flowing voxel that is not at its desired state (≤
+//! [`RESCAN_MAX_PUSHES`] per tick). A full pass (128 ticks) without a new drop clears the
+//! flag. Once queues are drained and the flags clear, every voxel is at its fixed point,
+//! so drops only delay water; they never leave ghost water (tested against runs that
+//! never drop). A present chunk passed without a queue also counts as a drop but cannot
+//! be flagged; the program always passes the queue of every chunk it passes.
 //!
-//! # Cost (per processed entry)
-//! `desired`: ≤ 10 block reads (each: a few compares to pick the chunk + one load).
-//! On a change: 1 write, ≤ 6 more reads for the dependency filters, and ≤ 11 pushes
-//! (each: 1 read + a dedup scan of ≤ 64 `u16`s). Unchanged entries (the common case for
-//! back-propagated entries) cost ≈ 50–80 ops; a worst-case change ≈ 10 × 64 compares ≈
-//! 1–2k ops. With the planned budget of 32 entries/tick the hard upper bound is ≈ 60k CU;
-//! typical ticks are far below. (Hand count, not an SBF measurement.) `bench_step` (native
-//! release, spread + recede of one source): ≈ 300 entries per scenario, ≈ 35 ns/entry
-//! including test-harness overhead; measure real CU once `tick_chunk` exists.
+//! Queue high-water marks in the tests (all well below 64, no drops): radius-7 spread
+//! 28, its recede 46, fall + landing 24 (its recede 38), two sources 31, spread across a
+//! border 44. The plain `min(L + 1)` recede rule hit the 64 cap.
+//!
+//! # Cost (hand count of SBF ops ≈ CU; not measured on SBF yet)
+//! - Block read: `locate` (range compares, slot select, option check, index math) + bounds
+//!   check + load ≈ 15.
+//! - Push: one `locate` + read ≈ 20, dedup scan ≈ 7 per queued entry (index wrap, load,
+//!   compare, branch, counter) → ≤ 64 × 7 ≈ 450, append ≈ 10 → **≤ ~480**.
+//! - Entry: pop + read ≈ 30, `desired` ≤ 10 reads + logic ≈ 200; on a change, write ≈ 20,
+//!   dependency filters ≤ 6 reads ≈ 100, ≤ 11 pushes (10 dependents + self re-queue,
+//!   which costs one more `desired`) ≈ 5.3k → **≤ ~5.7k** worst, ≈ 250 if unchanged.
+//! - Rescan window: [`RESCAN_WINDOW`] 128 × (read + `desired` + loop ≈ 230) ≈ 30k +
+//!   [`RESCAN_MAX_PUSHES`] 16 × 480 ≈ 8k → **≤ ~38k**.
+//! - Tick with [`FLUID_BUDGET`] = 16: 16 × 5.7k + 38k ≈ **≤ 130k** worst case (both terms
+//!   at their maxima at once is not actually reachable: the rescan only runs when the
+//!   queue drained before the budget ran out). Typical ticks: a few k.
+//!
+//! `bench_step` (native release, spread + recede of one source): ≈ 250 entries per
+//! scenario, ≈ 38 ns/entry including test-harness overhead. Measure real CU once
+//! `tick_chunk` exists.
 //!
 //! # SBF stack
 //! No arrays on the stack: [`ChunkNeighborhood`] is 6 words; [`step`] / `desired` /
-//! `on_change` are `#[inline(never)]` and hold only a handful of scalars (well under 256 B).
+//! `on_change` / `rescan` are `#[inline(never)]` and hold only a handful of scalars (well under 256 B).
 
 use crate::blocks::Block;
 use crate::consts::{CHUNK_H, CHUNK_VOL, CHUNK_W};
@@ -143,24 +162,43 @@ fn support(b: u8) -> bool {
 /// Ring buffer of pending fluid updates: local block indices (`0..16384`) of the owning
 /// chunk, FIFO, deduplicated, capacity 64.
 ///
-/// Byte layout (`#[repr(C)]`, size [`FluidQueue::SIZE`] = 130, align 2, no padding;
-/// integers little-endian on SBF):
+/// Byte layout (`#[repr(C)]`, size [`FluidQueue::SIZE`] = 134, align 2, no padding;
+/// integers little-endian on SBF; place it at a 2-aligned offset):
 ///
-/// | offset | size | field  |                                              |
-/// |--------|------|--------|----------------------------------------------|
-/// | 0      | 128  | `buf`  | `[u16; 64]` ring storage                     |
-/// | 128    | 1    | `head` | index of the oldest entry (used `& 63`)      |
-/// | 129    | 1    | `len`  | number of entries (values > 64 read as 64)   |
+/// | offset | size | field           |                                                |
+/// |--------|------|-----------------|------------------------------------------------|
+/// | 0      | 128  | `buf`           | `[u16; 64]` ring storage                       |
+/// | 128    | 2    | `rescan_cursor` | next local index of the overflow rescan        |
+/// | 130    | 1    | `head`          | index of the oldest entry (used `& 63`)        |
+/// | 131    | 1    | `len`           | number of entries (values > 64 read as 64)     |
+/// | 132    | 1    | `overflow`      | 0 clean, 1 rescan pass running, 2 dirty        |
+/// | 133    | 1    | `high_water`    | max `len` ever reached (monitoring)            |
 ///
-/// All-zero bytes are an empty queue. Methods tolerate arbitrary field values (head is
-/// masked, len clamped, stored entries ≥ 16384 are skipped by [`step`]) and never panic.
+/// All-zero bytes are an empty, clean queue. Methods tolerate arbitrary field values
+/// (head masked, len clamped, cursor taken mod 16384, stored entries ≥ 16384 skipped by
+/// [`step`]) and never panic.
+///
+/// **Overflow recovery.** A push that finds the queue full sets `overflow = 2`. While
+/// `overflow != 0`, [`step`] spends spare budget on a rescan of the chunk (see
+/// [`RESCAN_WINDOW`]); a pass that completes without a new drop clears the flag. So a
+/// dropped update delays water but never leaves it permanently wrong.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FluidQueue {
     pub buf: [u16; 64],
+    pub rescan_cursor: u16,
     pub head: u8,
     pub len: u8,
+    pub overflow: u8,
+    pub high_water: u8,
 }
+
+/// [`FluidQueue::overflow`]: no rescan needed.
+pub const OVERFLOW_CLEAN: u8 = 0;
+/// [`FluidQueue::overflow`]: a rescan pass is running and nothing was dropped since it began.
+pub const OVERFLOW_SCANNING: u8 = 1;
+/// [`FluidQueue::overflow`]: something was dropped; a full pass must (re)start.
+pub const OVERFLOW_DIRTY: u8 = 2;
 
 const _: () = assert!(core::mem::size_of::<FluidQueue>() == FluidQueue::SIZE);
 
@@ -174,15 +212,25 @@ impl FluidQueue {
     /// Capacity in entries.
     pub const CAP: usize = 64;
     /// Size in bytes (see the layout table).
-    pub const SIZE: usize = 130;
+    pub const SIZE: usize = 134;
 
     /// Empty queue.
     pub const fn new() -> Self {
         FluidQueue {
             buf: [0; 64],
+            rescan_cursor: 0,
             head: 0,
             len: 0,
+            overflow: OVERFLOW_CLEAN,
+            high_water: 0,
         }
+    }
+
+    /// Whether the owning chunk's tick has fluid work (queued entries or a pending
+    /// overflow rescan). The program keeps the chunk's crank armed while this holds.
+    #[inline]
+    pub fn has_work(&self) -> bool {
+        !self.is_empty() || self.overflow != OVERFLOW_CLEAN
     }
 
     /// Number of queued entries (clamped to 64).
@@ -197,7 +245,7 @@ impl FluidQueue {
     }
 
     /// Queues `idx`. Returns `true` if it is queued afterwards (newly or already present),
-    /// `false` if it was dropped (queue full, or `idx >= CHUNK_VOL`).
+    /// `false` if it was dropped: queue full (sets `overflow` dirty) or `idx >= CHUNK_VOL`.
     pub fn push(&mut self, idx: u16) -> bool {
         if idx as usize >= CHUNK_VOL {
             return false;
@@ -212,11 +260,12 @@ impl FluidQueue {
             i += 1;
         }
         if len >= Self::CAP {
+            self.overflow = OVERFLOW_DIRTY;
             return false;
         }
-
         self.buf[(head + len) & (Self::CAP - 1)] = idx;
         self.len = (len + 1) as u8;
+        self.high_water = self.high_water.max(self.len);
         true
     }
 
@@ -312,6 +361,15 @@ impl<'a> ChunkNeighborhood<'a> {
         ))
     }
 
+    /// Byte at a located `(slot, idx)`; Stone if somehow absent.
+    #[inline]
+    fn read_at(&self, slot: usize, idx: usize) -> u8 {
+        match self.chunks.get(slot) {
+            Some(Some(c)) => c.get(idx).copied().unwrap_or(STONE),
+            _ => STONE,
+        }
+    }
+
     /// Read in frame coordinates.
     #[inline]
     fn fget(&self, x: i32, y: i32, z: i32) -> u8 {
@@ -322,10 +380,7 @@ impl<'a> ChunkNeighborhood<'a> {
             return AIR;
         }
         match self.locate(x, y, z) {
-            Some((slot, idx)) => match self.chunks.get(slot) {
-                Some(Some(c)) => c.get(idx).copied().unwrap_or(STONE),
-                _ => STONE,
-            },
+            Some((slot, idx)) => self.read_at(slot, idx),
             None => STONE,
         }
     }
@@ -348,19 +403,33 @@ impl<'a> ChunkNeighborhood<'a> {
         }
     }
 
-    /// Pushes frame position `(x, y, z)` into its owner's queue if it is Air or flowing.
-    /// Returns `false` only if the entry was dropped because the queue is full.
+    /// Pushes frame position `(x, y, z)` into its owner's queue if it is Air or flowing
+    /// (one `locate`). Missing chunks are skipped. Counts a drop if the queue is full or
+    /// the chunk is present without a queue; marks touched neighbors.
     #[inline]
-    fn push_if_updatable(&self, queues: &mut FluidQueues, x: i32, y: i32, z: i32) -> bool {
+    fn push_if_updatable(
+        &self,
+        queues: &mut FluidQueues,
+        acc: &mut StepResult,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) {
         let Some((slot, idx)) = self.locate(x, y, z) else {
-            return true;
+            return;
         };
-        if !updatable(self.fget(x, y, z)) {
-            return true;
+        if !updatable(self.read_at(slot, idx)) {
+            return;
         }
-        match queues.get_mut(slot) {
+        if slot != CENTER {
+            acc.touched_neighbors |= 1 << slot;
+        }
+        let ok = match queues.get_mut(slot) {
             Some(Some(q)) => q.push(idx as u16),
-            _ => true,
+            _ => false,
+        };
+        if !ok {
+            acc.dropped += 1;
         }
     }
 }
@@ -415,16 +484,16 @@ fn desired(w: &ChunkNeighborhood, x: i32, y: i32, z: i32, cur: u8) -> u8 {
 }
 
 /// Enqueues the dependents of frame position `Q = (x, y, z)` that can change because `Q`
-/// went from `old` to `new` (filters in the module docs). Returns the number dropped.
+/// went from `old` to `new` (filters in the module docs).
 #[inline(never)]
 fn on_change(
     w: &ChunkNeighborhood,
     queues: &mut FluidQueues,
+    acc: &mut StepResult,
     (x, y, z): (i32, i32, i32),
     old: u8,
     new: u8,
-) -> u32 {
-    let mut dropped = 0u32;
+) {
     let ol = level(old);
     let nl = level(new);
     let q_spreads = support(w.fget(x, y - 1, z));
@@ -448,8 +517,8 @@ fn on_change(
         if let Some(o) = ol {
             want |= weaker && is_flowing(h) && hl == o + 1;
         }
-        if want && !w.push_if_updatable(queues, hx, y, hz) {
-            dropped += 1;
+        if want {
+            w.push_if_updatable(queues, acc, hx, y, hz);
         }
     }
     let b = w.fget(x, y - 1, z);
@@ -458,83 +527,111 @@ fn on_change(
         (Some(_), None) => is_flowing(b),
         _ => false,
     };
-    if want_below && !w.push_if_updatable(queues, x, y - 1, z) {
-        dropped += 1;
+    if want_below {
+        w.push_if_updatable(queues, acc, x, y - 1, z);
     }
     if support(old) != support(new) {
-        dropped += push_above(w, queues, x, y, z);
+        push_above(w, queues, acc, x, y, z);
     }
-    dropped
 }
 
-/// Pushes `above(Q)` and `H(above(Q))`. Returns the number dropped.
-fn push_above(w: &ChunkNeighborhood, queues: &mut FluidQueues, x: i32, y: i32, z: i32) -> u32 {
-    let mut dropped = 0;
-    if !w.push_if_updatable(queues, x, y + 1, z) {
-        dropped += 1;
-    }
+/// Pushes `above(Q)` and `H(above(Q))`.
+fn push_above(
+    w: &ChunkNeighborhood,
+    queues: &mut FluidQueues,
+    acc: &mut StepResult,
+    x: i32,
+    y: i32,
+    z: i32,
+) {
+    w.push_if_updatable(queues, acc, x, y + 1, z);
     for (dx, dz) in DIRS {
-        if !w.push_if_updatable(queues, x + dx, y + 1, z + dz) {
-            dropped += 1;
-        }
+        w.push_if_updatable(queues, acc, x + dx, y + 1, z + dz);
     }
-    dropped
+}
+
+/// Outcome of [`step`] / [`enqueue_neighbors`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StepResult {
+    /// Queue entries popped (`<= budget`).
+    pub processed: u32,
+    /// Voxels examined by the overflow rescan.
+    pub rescanned: u32,
+    /// Pushes that were dropped (queue full, or a present chunk passed without a queue).
+    /// Full queues recover via their overflow rescan.
+    pub dropped: u32,
+    /// Bit `1 << slot` ([`NORTH`], [`SOUTH`], [`EAST`], [`WEST`]) for every neighbor that
+    /// was pushed to (or dropped on): the program should make sure those chunks' cranks are
+    /// armed.
+    pub touched_neighbors: u8,
 }
 
 /// Notifies the fluid system of a block edit at **world** position `(x, y, z)` (call it
 /// after writing the new block): pushes the position itself and every voxel whose state
 /// can depend on it — `below`, `above`, the 4 horizontal neighbors and the 4 horizontal
 /// neighbors of `above` — that is Air or flowing, into the owning chunk's queue (skipped
-/// for missing chunks). Returns the number of entries dropped because a queue was full.
+/// for missing chunks). `processed` is always 0 in the result.
 pub fn enqueue_neighbors(
     world: &ChunkNeighborhood,
     queues: &mut FluidQueues,
     x: i32,
     y: i32,
     z: i32,
-) -> u32 {
+) -> StepResult {
+    let mut acc = StepResult::default();
     let Some((fx, fz)) = world.to_frame(x, z) else {
-        return 0;
+        return acc;
     };
     // Keep y + 1 / y - 1 overflow-free; anything outside 0..64 is never queued anyway.
     if !(-1..=CHUNK_H as i32).contains(&y) {
-        return 0;
+        return acc;
     }
-    let mut dropped = 0;
-    for (px, py, pz) in [(fx, y, fz), (fx, y - 1, fz)] {
-        if !world.push_if_updatable(queues, px, py, pz) {
-            dropped += 1;
-        }
-    }
+    world.push_if_updatable(queues, &mut acc, fx, y, fz);
+    world.push_if_updatable(queues, &mut acc, fx, y - 1, fz);
     for (dx, dz) in DIRS {
-        if !world.push_if_updatable(queues, fx + dx, y, fz + dz) {
-            dropped += 1;
-        }
+        world.push_if_updatable(queues, &mut acc, fx + dx, y, fz + dz);
     }
-    dropped + push_above(world, queues, fx, y, fz)
+    push_above(world, queues, &mut acc, fx, y, fz);
+    acc
 }
 
-/// Processes up to `budget` entries of the center chunk's queue (see the module docs).
-/// Writes only into the center chunk; pushes follow-up work into the owning chunks'
-/// queues. Returns the number of entries popped (`<= budget`). Never panics.
+/// Default per-tick entry budget for `tick_chunk` (see the cost section).
+pub const FLUID_BUDGET: u32 = 16;
+/// Voxels examined per tick by the overflow rescan (a full pass = 16384 / 128 = 128 ticks
+/// with spare budget).
+pub const RESCAN_WINDOW: u32 = 128;
+/// Max pushes per tick by the overflow rescan (it stops early when reached).
+pub const RESCAN_MAX_PUSHES: u32 = 16;
+
+#[inline]
+fn decode(idx: usize) -> (i32, i32, i32) {
+    (
+        (idx % CHUNK_W) as i32,
+        (idx / (CHUNK_W * CHUNK_W)) as i32,
+        ((idx / CHUNK_W) % CHUNK_W) as i32,
+    )
+}
+
+/// Processes up to `budget` entries of the center chunk's queue (see the module docs);
+/// if the queue drains with budget to spare and the center's `overflow` flag is set, runs
+/// one rescan window. Writes only into the center chunk; pushes follow-up work into the
+/// owning chunks' queues. Never panics.
 #[inline(never)]
-pub fn step(world: &mut ChunkNeighborhood, queues: &mut FluidQueues, budget: u32) -> u32 {
-    let mut processed = 0u32;
-    while processed < budget {
+pub fn step(world: &mut ChunkNeighborhood, queues: &mut FluidQueues, budget: u32) -> StepResult {
+    let mut acc = StepResult::default();
+    while acc.processed < budget {
         let Some(idx) = (match queues.get_mut(CENTER) {
             Some(Some(q)) => q.pop(),
             _ => None,
         }) else {
             break;
         };
-        processed += 1;
+        acc.processed += 1;
         let idx = idx as usize;
         if idx >= CHUNK_VOL {
             continue;
         }
-        let x = (idx % CHUNK_W) as i32;
-        let z = ((idx / CHUNK_W) % CHUNK_W) as i32;
-        let y = (idx / (CHUNK_W * CHUNK_W)) as i32;
+        let (x, y, z) = decode(idx);
         let cur = world.fget(x, y, z);
         if !updatable(cur) {
             continue;
@@ -543,17 +640,63 @@ pub fn step(world: &mut ChunkNeighborhood, queues: &mut FluidQueues, budget: u32
         if want == cur || !world.fset(x, y, z, want) {
             continue;
         }
-        on_change(world, queues, (x, y, z), cur, want);
-        if want == AIR {
-            // Receded for lack of a feeder `<= c`; as Air it may be re-fed by a higher
-            // neighbor that is still fed. Re-check after the dependents just pushed, so
-            // orphaned outer water gets the chance to recede first.
-            if let Some(Some(q)) = queues.get_mut(CENTER) {
-                q.push(idx as u16);
-            }
+        on_change(world, queues, &mut acc, (x, y, z), cur, want);
+        if want == AIR && desired(world, x, y, z, AIR) != AIR {
+            // Receded for lack of a feeder `<= c`, but as Air a higher neighbor would feed
+            // it. Re-check after the dependents just pushed, so orphaned outer water gets
+            // the chance to recede first. (If no neighbor can feed it now, a later feeder
+            // change pushes it anyway.)
+            world.push_if_updatable(queues, &mut acc, x, y, z);
         }
     }
-    processed
+    if acc.processed < budget {
+        rescan(world, queues, &mut acc);
+    }
+    acc
+}
+
+/// One overflow-rescan window over the center chunk: from the cursor, examines up to
+/// [`RESCAN_WINDOW`] voxels and pushes every Air/flowing voxel that is not at its desired
+/// state (at most [`RESCAN_MAX_PUSHES`]). A pass starts at index 0 (flag → scanning) and
+/// clears the flag on wrap-around if nothing was dropped meanwhile (else the flag is dirty
+/// and the next pass starts).
+#[inline(never)]
+fn rescan(world: &ChunkNeighborhood, queues: &mut FluidQueues, acc: &mut StepResult) {
+    let mut cursor = match queues.get_mut(CENTER) {
+        Some(Some(q)) if q.overflow != OVERFLOW_CLEAN => {
+            let c = q.rescan_cursor as usize % CHUNK_VOL;
+            if c == 0 {
+                q.overflow = OVERFLOW_SCANNING;
+            }
+            c
+        }
+        _ => return,
+    };
+    let mut pushes = 0;
+    let mut n = 0;
+    while n < RESCAN_WINDOW && pushes < RESCAN_MAX_PUSHES {
+        n += 1;
+        let (x, y, z) = decode(cursor);
+        let cur = world.fget(x, y, z);
+        if updatable(cur) && desired(world, x, y, z, cur) != cur {
+            world.push_if_updatable(queues, acc, x, y, z);
+            pushes += 1;
+        }
+        cursor += 1;
+        if cursor == CHUNK_VOL {
+            cursor = 0;
+            if let Some(Some(q)) = queues.get_mut(CENTER) {
+                if q.overflow == OVERFLOW_SCANNING {
+                    q.overflow = OVERFLOW_CLEAN;
+                }
+            }
+            break;
+        }
+    }
+    acc.rescanned += n;
+    if let Some(Some(q)) = queues.get_mut(CENTER) {
+        q.rescan_cursor = cursor as u16;
+    }
 }
 
 #[cfg(test)]
@@ -592,6 +735,8 @@ mod tests {
     struct World {
         chunks: BTreeMap<(i32, i32), Box<[u8; CHUNK_VOL]>>,
         queues: BTreeMap<(i32, i32), FluidQueue>,
+        /// Total drops reported by `edit` / `run`.
+        dropped: u32,
     }
 
     impl World {
@@ -602,7 +747,11 @@ mod tests {
                 chunks.insert(c, floor_chunk(floor));
                 queues.insert(c, FluidQueue::new());
             }
-            World { chunks, queues }
+            World {
+                chunks,
+                queues,
+                dropped: 0,
+            }
         }
 
         /// Runs `f` with the neighborhood + queues centered on `(cx, cz)` (center must exist).
@@ -654,28 +803,50 @@ mod tests {
         fn edit(&mut self, x: i32, y: i32, z: i32, b: u8) {
             let (cx, _) = crate::coords::world_to_chunk(x);
             let (cz, _) = crate::coords::world_to_chunk(z);
-            self.with(cx, cz, |world, queues| {
+            let r = self.with(cx, cz, |world, queues| {
                 assert!(world.set(x, y, z, b));
-                enqueue_neighbors(world, queues, x, y, z);
+                enqueue_neighbors(world, queues, x, y, z)
             });
+            assert_eq!(r.processed, 0);
+            self.dropped += r.dropped;
         }
 
-        /// Ticks every chunk with a non-empty queue (in key order) until all queues drain.
+        /// Highest queue high-water mark in the world.
+        fn high_water(&self) -> u8 {
+            self.queues
+                .values()
+                .map(|q| q.high_water)
+                .max()
+                .unwrap_or(0)
+        }
+
+        /// Fills chunk `k`'s queue with 64 no-op entries (stone floor voxels at y = 0).
+        fn jam(&mut self, k: (i32, i32)) {
+            let q = self.queues.get_mut(&k).unwrap();
+            for i in 0..64u16 {
+                q.push(i);
+            }
+            assert_eq!(q.len(), 64);
+        }
+
+        /// Ticks every chunk with fluid work (in key order) until no chunk has any.
         /// Returns the number of rounds.
         fn run(&mut self, budget: u32, max_rounds: u32) -> u32 {
             for round in 0..max_rounds {
                 let busy: Vec<(i32, i32)> = self
                     .queues
                     .iter()
-                    .filter(|(_, q)| !q.is_empty())
+                    .filter(|(_, q)| q.has_work())
                     .map(|(k, _)| *k)
                     .collect();
                 if busy.is_empty() {
                     return round;
                 }
                 for (cx, cz) in busy {
-                    let n = self.with(cx, cz, |world, queues| step(world, queues, budget));
-                    assert!(n <= budget);
+                    let r = self.with(cx, cz, |world, queues| step(world, queues, budget));
+                    assert!(r.processed <= budget);
+                    assert!(r.rescanned <= RESCAN_WINDOW);
+                    self.dropped += r.dropped;
                 }
             }
             panic!("queues did not drain in {max_rounds} rounds");
@@ -701,6 +872,16 @@ mod tests {
         }
     }
 
+    /// No drops happened and the queue high-water mark stayed `<= max`.
+    fn assert_queues_ok(wd: &World, max: u8) {
+        assert_eq!(wd.dropped, 0, "no drops expected");
+        assert!(
+            wd.high_water() <= max,
+            "high water {} > {max}",
+            wd.high_water()
+        );
+    }
+
     fn manhattan(a: (i32, i32), b: (i32, i32)) -> i32 {
         (a.0 - b.0).abs() + (a.1 - b.1).abs()
     }
@@ -709,9 +890,17 @@ mod tests {
 
     #[test]
     fn queue_layout() {
-        assert_eq!(FluidQueue::SIZE, 130);
+        use core::mem::offset_of;
+        assert_eq!(FluidQueue::SIZE, 134);
         assert_eq!(core::mem::size_of::<FluidQueue>(), FluidQueue::SIZE);
         assert_eq!(core::mem::align_of::<FluidQueue>(), 2);
+        assert_eq!(offset_of!(FluidQueue, buf), 0);
+        assert_eq!(offset_of!(FluidQueue, rescan_cursor), 128);
+        assert_eq!(offset_of!(FluidQueue, head), 130);
+        assert_eq!(offset_of!(FluidQueue, len), 131);
+        assert_eq!(offset_of!(FluidQueue, overflow), 132);
+        assert_eq!(offset_of!(FluidQueue, high_water), 133);
+        assert!(!FluidQueue::new().has_work());
         let q = FluidQueue::new();
         assert!(q.is_empty());
         assert_eq!(q.len(), 0);
@@ -727,7 +916,10 @@ mod tests {
             assert!(q.push(100 + i));
         }
         assert_eq!(q.len(), 64);
+        assert_eq!(q.overflow, OVERFLOW_CLEAN);
+        assert_eq!(q.high_water, 64);
         assert!(!q.push(9999), "full queue drops");
+        assert_eq!(q.overflow, OVERFLOW_DIRTY, "drop marks overflow");
         assert!(q.push(5), "already queued counts as queued even when full");
         assert_eq!(q.len(), 64);
         assert!(!q.push(CHUNK_VOL as u16), "out-of-range index rejected");
@@ -763,8 +955,11 @@ mod tests {
     fn queue_tolerates_corrupt_fields() {
         let mut q = FluidQueue {
             buf: [0xFFFF; 64],
+            rescan_cursor: 0xFFFF,
             head: 200,
             len: 250,
+            overflow: 77,
+            high_water: 255,
         };
         assert_eq!(q.len(), 64);
         assert!(!q.push(1));
@@ -847,6 +1042,7 @@ mod tests {
                 assert_eq!(wd.get(x, 11, z), want, "floor ({x},{z}) d={d}");
             }
         }
+        assert_queues_ok(&wd, 24);
     }
 
     #[test]
@@ -871,6 +1067,7 @@ mod tests {
                 }
             }
         }
+        assert_queues_ok(&wd, 28);
     }
 
     #[test]
@@ -884,6 +1081,7 @@ mod tests {
         assert_eq!(wd.get(7, 11, 7), w(1));
         assert_eq!(wd.get(7, 11, 9), w(1));
         assert_eq!(wd.get(5, 11, 8), w(1));
+        assert_queues_ok(&wd, 31);
     }
 
     #[test]
@@ -896,6 +1094,7 @@ mod tests {
         wd.run(32, 10_000);
         assert_eq!(wd.get(7, 11, 8), w(1));
         assert_eq!(wd.get(7, 10, 8), w(1), "fell into the hole");
+        assert_queues_ok(&wd, 31);
     }
 
     #[test]
@@ -908,6 +1107,7 @@ mod tests {
         wd.run(32, 10_000);
         let fresh = World::new(&[(0, 0)], 10);
         assert_same(&wd, &fresh);
+        assert_queues_ok(&wd, 46);
     }
 
     #[test]
@@ -918,6 +1118,7 @@ mod tests {
         wd.edit(8, 40, 8, AIR);
         wd.run(32, 10_000);
         assert_same(&wd, &World::new(&[(0, 0)], 10));
+        assert_queues_ok(&wd, 38);
     }
 
     #[test]
@@ -933,6 +1134,7 @@ mod tests {
         wd.run(32, 10_000);
         assert_eq!(wd.get(9, 11, 8), w(1));
         assert_eq!(wd.get(10, 11, 8), w(2));
+        assert_queues_ok(&wd, 28);
     }
 
     #[test]
@@ -947,6 +1149,7 @@ mod tests {
         only.edit(11, 11, 10, SRC);
         only.run(32, 10_000);
         assert_same(&wd, &only);
+        assert_queues_ok(&wd, 39);
     }
 
     /// Every Air/flowing voxel of the center chunk is at its desired state.
@@ -1009,17 +1212,115 @@ mod tests {
         }
     }
 
+    /// Places sources on a 5×5 grid without ticking in between, so the center queue
+    /// overflows; the rescan must still reach the same fixed point as draining after
+    /// every edit (which never drops).
+    #[test]
+    fn overflow_flood_recovers() {
+        let spots: Vec<(i32, i32)> = (0..5)
+            .flat_map(|i| (0..5).map(move |j| (1 + 3 * i, 1 + 3 * j)))
+            .collect();
+        let mut reference = World::new(&[(0, 0)], 10);
+        for &(x, z) in &spots {
+            reference.edit(x, 11, z, SRC);
+            reference.run(FLUID_BUDGET, 100_000);
+        }
+        assert_queues_ok(&reference, 12);
+
+        let mut wd = World::new(&[(0, 0)], 10);
+        for &(x, z) in &spots {
+            wd.edit(x, 11, z, SRC);
+        }
+        assert!(wd.dropped > 0, "flood must overflow the queue");
+        assert_eq!(wd.queues[&(0, 0)].overflow, OVERFLOW_DIRTY);
+        wd.run(FLUID_BUDGET, 100_000);
+        assert_same(&wd, &reference);
+        assert_eq!(wd.queues[&(0, 0)].overflow, OVERFLOW_CLEAN);
+        assert_fixed_point(&mut wd, 0, 0);
+
+        // Removing every source at once (another overflow) leaves no water at all.
+        let before = wd.dropped;
+        for &(x, z) in &spots {
+            let (cx, cz) = (0, 0);
+            wd.with(cx, cz, |world, _| assert!(world.set(x, 11, z, AIR)));
+        }
+        for &(x, z) in &spots {
+            wd.edit(x, 11, z, AIR);
+        }
+        wd.run(FLUID_BUDGET, 100_000);
+        assert!(wd.dropped > before);
+        let mut fresh = World::new(&[(0, 0)], 10);
+        fresh.dropped = wd.dropped;
+        assert_same(&wd, &fresh);
+    }
+
+    /// Cross-border pushes into a full neighbor queue are reported as dropped, mark the
+    /// neighbor dirty, and its rescan still produces the unbounded-queue result, both for
+    /// spreading and for receding.
+    #[test]
+    fn overflow_neighbor_queue_recovers() {
+        let mut reference = World::new(&[(0, 0), (1, 0)], 10);
+        reference.edit(12, 11, 8, SRC);
+        reference.run(FLUID_BUDGET, 100_000);
+        assert_queues_ok(&reference, 21);
+
+        let mut wd = World::new(&[(0, 0), (1, 0)], 10);
+        wd.edit(12, 11, 8, SRC);
+        wd.jam((1, 0));
+        let mut dropped = 0;
+        let mut touched = 0;
+        while !wd.queues[&(0, 0)].is_empty() {
+            let r = wd.with(0, 0, |world, queues| step(world, queues, FLUID_BUDGET));
+            dropped += r.dropped;
+            touched |= r.touched_neighbors;
+        }
+        assert!(dropped > 0, "pushes into the full east queue are reported");
+        assert_eq!(touched, 1 << EAST);
+        assert_eq!(wd.queues[&(1, 0)].overflow, OVERFLOW_DIRTY);
+        wd.run(FLUID_BUDGET, 100_000);
+        assert_same(&wd, &reference);
+
+        // Recede with the east queue jammed again: no ghost water may survive.
+        wd.edit(12, 11, 8, AIR);
+        wd.jam((1, 0));
+        wd.run(FLUID_BUDGET, 100_000);
+        assert_same(&wd, &World::new(&[(0, 0), (1, 0)], 10));
+        assert!(wd.queues.values().all(|q| q.overflow == OVERFLOW_CLEAN));
+    }
+
+    #[test]
+    fn present_chunk_without_queue_counts_as_dropped() {
+        let mut c = floor_chunk(10);
+        let mut e = floor_chunk(10);
+        c[block_index(15, 11, 8)] = SRC;
+        let mut q = FluidQueue::new();
+        let mut world = ChunkNeighborhood::new(0, 0, &mut c, [None, None, Some(&mut e), None]);
+        let mut queues: FluidQueues = [Some(&mut q), None, None, None, None];
+        let r = enqueue_neighbors(&world, &mut queues, 15, 11, 8);
+        assert_eq!(r.dropped, 2, "east (16,11,8) and (16,12,8) have no queue");
+        assert_eq!(r.touched_neighbors, 1 << EAST);
+        let r = step(&mut world, &mut queues, FLUID_BUDGET);
+        assert!(
+            r.dropped > 0,
+            "spreading along the border keeps hitting the queue-less east"
+        );
+        assert_eq!(r.touched_neighbors, 1 << EAST);
+    }
+
     #[test]
     fn flow_crosses_chunk_border() {
         let mut wd = World::new(&[(0, 0), (1, 0)], 10);
         wd.edit(12, 11, 8, SRC);
+        let mut touched = 0u8;
         // Tick only the source chunk: the east chunk gets queue entries but no writes.
         for _ in 0..1000 {
             if wd.queues[&(0, 0)].is_empty() {
                 break;
             }
-            wd.with(0, 0, |world, queues| step(world, queues, 32));
+            let r = wd.with(0, 0, |world, queues| step(world, queues, 32));
+            touched |= r.touched_neighbors;
         }
+        assert_eq!(touched, 1 << EAST, "only the east neighbor was pushed to");
         assert!(wd.queues[&(0, 0)].is_empty());
         assert_eq!(wd.get(15, 11, 8), w(3));
         assert!(
@@ -1044,6 +1345,7 @@ mod tests {
         wd.edit(12, 11, 8, AIR);
         wd.run(32, 10_000);
         assert_same(&wd, &World::new(&[(0, 0), (1, 0)], 10));
+        assert_queues_ok(&wd, 44);
     }
 
     #[test]
@@ -1071,6 +1373,7 @@ mod tests {
         wd.run(32, 10_000);
         assert_eq!(wd.get(8, 11, 1), w(1));
         assert_eq!(wd.get(7, 11, 0), w(1));
+        assert_queues_ok(&wd, 15);
     }
 
     #[test]
@@ -1082,7 +1385,7 @@ mod tests {
         q.push(block_index(0, 11, 8) as u16);
         let mut world = ChunkNeighborhood::new(0, 0, &mut c, [None, None, None, None]);
         let mut queues: FluidQueues = [Some(&mut q), None, None, None, None];
-        assert_eq!(step(&mut world, &mut queues, 32), 1);
+        assert_eq!(step(&mut world, &mut queues, 32).processed, 1);
         assert_eq!(world.get(0, 11, 8), AIR);
     }
 
@@ -1096,18 +1399,18 @@ mod tests {
         c[11 * 256 + 100] = SRC;
         let mut world = ChunkNeighborhood::new(0, 0, &mut c, [None, None, None, None]);
         let mut queues: FluidQueues = [Some(&mut q), None, None, None, None];
-        assert_eq!(step(&mut world, &mut queues, 0), 0);
-        assert_eq!(step(&mut world, &mut queues, 5), 5);
+        assert_eq!(step(&mut world, &mut queues, 0), StepResult::default());
+        assert_eq!(step(&mut world, &mut queues, 5).processed, 5);
         let left = queues[0].as_ref().unwrap().len();
         assert!(
             left >= 59,
             "5 popped, possibly some re-pushed (left {left})"
         );
-        let n = step(&mut world, &mut queues, 1000);
+        let n = step(&mut world, &mut queues, 1000).processed;
         assert!(n <= 1000);
         // No center queue: nothing happens.
         let mut none: FluidQueues = [None, None, None, None, None];
-        assert_eq!(step(&mut world, &mut none, 32), 0);
+        assert_eq!(step(&mut world, &mut none, 32), StepResult::default());
     }
 
     #[test]
@@ -1170,6 +1473,9 @@ mod tests {
                     let r = splitmix_next(&mut st);
                     q.head = r as u8;
                     q.len = (r >> 8) as u8;
+                    q.overflow = (r >> 16) as u8 % 4;
+                    q.rescan_cursor = (r >> 24) as u16;
+                    q.high_water = (r >> 40) as u8;
                     q
                 })
                 .collect();
@@ -1200,9 +1506,10 @@ mod tests {
             };
             let mut queues: FluidQueues = [qn(8), qn(4), qn(5), qn(6), qn(7)];
             for _ in 0..3 {
-                let n = step(&mut world, &mut queues, budget);
-                assert!(n <= budget);
-                total += n as u64;
+                let r = step(&mut world, &mut queues, budget);
+                assert!(r.processed <= budget && r.rescanned <= RESCAN_WINDOW);
+                assert_eq!(r.touched_neighbors & 1, 0);
+                total += r.processed as u64 + r.rescanned as u64;
             }
             let x = splitmix_next(&mut st) as i32;
             enqueue_neighbors(&world, &mut queues, x, 5, x);
@@ -1232,14 +1539,18 @@ mod tests {
                 if wd.queues[&(0, 0)].is_empty() {
                     break;
                 }
-                n += wd.with(0, 0, |world, queues| step(world, queues, 32)) as u64;
+                n += wd
+                    .with(0, 0, |world, queues| step(world, queues, 32))
+                    .processed as u64;
             }
             wd.edit(8, 11 + (r % 3) as i32, 8, AIR);
             for _ in 0..100_000 {
                 if wd.queues[&(0, 0)].is_empty() {
                     break;
                 }
-                n += wd.with(0, 0, |world, queues| step(world, queues, 32)) as u64;
+                n += wd
+                    .with(0, 0, |world, queues| step(world, queues, 32))
+                    .processed as u64;
             }
             entries += n;
         }
