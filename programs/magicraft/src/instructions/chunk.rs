@@ -29,8 +29,8 @@ use magicraft_core::consts::CHUNK_VOL;
 use crate::state::{
     check_chunk_identity, chunk_for, chunk_header, chunk_header_from, chunk_parts_mut,
     ensure_sponsor_reserve, init_chunk_header, init_presence_header, presence_for, presence_len,
-    Player, World, CHUNK_BLOCKS_OFFSET, CHUNK_FULL_LEN, CHUNK_INITIAL_LEN, CHUNK_SEED, GEN_CREATED,
-    GEN_DONE, GEN_STAGE1, PLAYER_SEED, PRESENCE_SEED,
+    Player, PlayerState, World, CHUNK_BLOCKS_OFFSET, CHUNK_FULL_LEN, CHUNK_INITIAL_LEN, CHUNK_SEED,
+    GEN_CREATED, GEN_DONE, GEN_STAGE1, PLAYER_SEED, PRESENCE_SEED,
 };
 
 /// Byte size of a fresh (empty) `ChunkPresence`.
@@ -75,27 +75,38 @@ pub struct CreateChunk<'info> {
     /// `chunk_for` against its stored coordinates). Omit only for the world's first
     /// chunk (0,0).
     pub neighbor: Option<UncheckedAccount<'info>>,
-    // TODO(Task 18): `player_state: Option<Account<PlayerState>>` — allow creating the
-    // chunk the player currently stands in (`(cx, cz) == (player_state.cx, .cz)`), see
-    // `check_adjacency`.
+    /// The signing player's `PlayerState` in `world` (identity checked in the handler):
+    /// allows creating the chunk the player currently stands in, see `check_adjacency`.
+    pub player_state: Option<Account<'info, PlayerState>>,
     /// CHECK: ephemeral rent vault
     #[account(mut, address = EPHEMERAL_VAULT_ID)]
     pub vault: UncheckedAccount<'info>,
     pub magic_program: Program<'info, MagicProgram>,
 }
 
-/// Adjacency rule: an existing, fully generated (`DONE`, else `ChunkNotReady`) edge neighbor
-/// in `world` is passed, or the world has no chunks and this is (0,0). (Task 18 adds: the
-/// player's current chunk.) `chunk_count` is why `create_chunk` / `close_chunk` take the
-/// World writable; both are rare, so the write lock is acceptable (`populate_chunk` and
-/// gameplay ixs take it read-only).
+/// Adjacency rule: `(cx, cz)` is the player's current chunk (`own_chunk`, from its
+/// `PlayerState` in this world), or an existing, fully generated (`DONE`, else
+/// `ChunkNotReady`) edge neighbor in `world` is passed, or the world has no chunks and this
+/// is (0,0). `chunk_count` is why `create_chunk` / `close_chunk` take the World writable;
+/// both are rare, so the write lock is acceptable (`populate_chunk` and gameplay ixs take it
+/// read-only).
+///
+/// Why the player's own chunk: `move_player` reads a missing chunk as Stone, so a player
+/// whose current chunk no longer exists could never move again. That happens when the
+/// player is away long enough for its presence entry to be pruned (stale after 5 s) and the
+/// chunk's payer then closes it (unedited, empty presence) — possibly with no remaining
+/// neighbor. Recreating it regenerates identical terrain.
 fn check_adjacency(
     neighbor: Option<&AccountInfo>,
+    own_chunk: Option<(i32, i32)>,
     world: &Pubkey,
     chunk_count: u32,
     cx: i32,
     cz: i32,
 ) -> Result<()> {
+    if own_chunk == Some((cx, cz)) {
+        return Ok(());
+    }
     match neighbor {
         Some(n) => {
             let (nx, nz) = {
@@ -136,7 +147,24 @@ pub fn create_chunk(mut ctx: Context<CreateChunk>, cx: i32, cz: i32) -> Result<(
     let a = &ctx.accounts;
     let world_key = a.world.key();
     let neighbor = a.neighbor.as_ref().map(|n| n.to_account_info());
-    check_adjacency(neighbor.as_ref(), &world_key, a.world.chunk_count, cx, cz)?;
+    let own_chunk = match &a.player_state {
+        Some(ps) => {
+            require!(
+                ps.player == a.player.key() && ps.world == world_key,
+                MagicraftError::Unauthorized
+            );
+            Some((ps.cx, ps.cz))
+        }
+        None => None,
+    };
+    check_adjacency(
+        neighbor.as_ref(),
+        own_chunk,
+        &world_key,
+        a.world.chunk_count,
+        cx,
+        cz,
+    )?;
 
     let player_ai = a.player.to_account_info();
     ensure_sponsor_reserve(&player_ai, CHUNK_TOTAL_RENT)?;
@@ -302,7 +330,7 @@ pub struct SetSpawn<'info> {
 
 /// Sets `World.spawn` once (`SpawnAlreadySet` afterwards) from the populated chunk (0,0)
 /// (`ChunkNotReady` unless full size and `DONE`): [`spawn_point`], in **block**
-/// coordinates of the feet block (Task 18 converts to FP). Permissionless; the client sends
+/// coordinates of the feet block (`join_world` converts to FP). Permissionless; the client sends
 /// it right after `populate_chunk(0, 0)`. Kept out of `populate_chunk` so that one takes the
 /// World read-only. If (0,0) was edited before anyone called this, the spawn reflects the
 /// edited blocks (harmless: it is still ground with 2 air above, or the center fallback).
@@ -418,6 +446,19 @@ mod tests {
         assert!(!is_edge_neighbor(0, 0, 0, 0));
         assert!(!is_edge_neighbor(0, 0, 2, 0));
         assert!(!is_edge_neighbor(i32::MAX, 0, i32::MIN, 0));
+    }
+
+    #[test]
+    fn own_chunk_is_always_creatable() {
+        let w = Pubkey::new_unique();
+        // Player standing in (5, -3): creatable without any neighbor, in a non-empty world.
+        assert!(check_adjacency(None, Some((5, -3)), &w, 7, 5, -3).is_ok());
+        let e = check_adjacency(None, Some((5, -3)), &w, 7, 5, -2).unwrap_err();
+        assert_eq!(e, error!(MagicraftError::NotAdjacent));
+        assert!(check_adjacency(None, None, &w, 7, 5, -3).is_err());
+        // The first-chunk rule still holds.
+        assert!(check_adjacency(None, None, &w, 0, 0, 0).is_ok());
+        assert!(check_adjacency(None, Some((1, 1)), &w, 1, 0, 0).is_err());
     }
 
     #[test]

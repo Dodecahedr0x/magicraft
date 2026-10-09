@@ -56,6 +56,8 @@ export async function createChunkIx(
   cz: number,
   o: {
     neighbor?: web3.PublicKey | null;
+    /** The player's PlayerState in `world` (creating its current chunk). */
+    playerState?: web3.PublicKey | null;
     signer?: web3.PublicKey;
     sessionToken?: web3.PublicKey | null;
   } = {}
@@ -71,6 +73,7 @@ export async function createChunkIx(
       chunk,
       presence: presencePda(chunk),
       neighbor: o.neighbor ?? null,
+      playerState: o.playerState ?? null,
     })
     .instruction();
 }

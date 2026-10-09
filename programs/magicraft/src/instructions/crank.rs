@@ -84,3 +84,14 @@ pub fn tick_day(ctx: Context<TickDay>) -> Result<()> {
     ctx.accounts.world.tick(&clock);
     Ok(())
 }
+
+// ---------- chunk tick crank watchdog (Task 20) ----------
+
+/// Watchdog hook called by `move_player` (and later block edits) with the mover's current
+/// chunk (read-only). **Placeholder until Task 20**: there is no chunk tick crank yet, so
+/// this is a no-op. Task 20 re-arms the chunk's crank here when work exists and it is stale
+/// (`CRANK_STALE_MS`), with the Chunk PDA as (read-only) task authority.
+#[inline(always)]
+pub fn maybe_arm_chunk(_chunk: &AccountInfo, _now_ms: i64) -> Result<()> {
+    Ok(())
+}

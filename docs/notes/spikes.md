@@ -650,3 +650,42 @@ chunks; its value was confirmed on the pre-17b build (491994e).
 Other: the 12-chunk spec's stage-1 regenerate test re-sent a byte-identical create + grow tx
 within the same ER blockhash once grow got fast ("already processed"); it now uses a different
 ComputeBudget limit.
+
+## 2026-10-09: Join, presence, movement (Task 18, permanent code)
+
+Test: `tests/13-move.spec.ts` (walks a BFS path planned over magicraft-core reference blocks
+from the spawn into an edge neighbor chunk, one block per update; the terrain depends on the
+per-run VRF seed). Code: `instructions/play.rs`, `presence.rs`.
+
+**SBF-measured CU** (local ER, whole ix):
+
+| Ix | CU |
+|---|---|
+| `join_world` (EphemeralAccount create 432 B + PDA bump search) | 13.6k-16.6k |
+| `move_player`, wallet signer, in-chunk step (no resize) | 14.5k-15.4k |
+| `move_player`, first move (presence grow CPI) | 16.0k |
+| `move_player`, border crossing (shrink old + grow new) | 20.2k |
+| `move_player`, session-key signer (token checks add ~1-6k) | 15.7k-24.4k |
+
+Decisions:
+- `join_world`: `MoveState::spawn(spawn_fp, chain_ms)` (`last_ms` = chain reading at join);
+  no presence entry at join — the first move adds it (a move re-adds a missing own entry
+  anyway, e.g. after pruning). New error `SpawnNotSet` (6143).
+- Hot-path identity checks without `create_program_address` (~1.5k CU each): window chunks
+  (`state::ready_chunk_blocks_ro`), presence (`presence_of`) and `PlayerState` (stored
+  `player`/`world` constraints) are checked by owner + discriminator + stored identity; only
+  the program writes those headers, always at the matching PDA.
+- Coarse chain time: `chain_ms + 750` is passed to `check_move` (lead 1 000 ms, lag 1 250 ms).
+- Presence: one resize CPI at most per list; crossing leaves the old list first (refund),
+  then enters the new one, so a crossing nets to exactly 0 lamports (tested). Pruning
+  (≤ 4 entries stale > 5 s chain time, never the mover's own) refunds the mover.
+- Vitals (`play::apply_vitals`, unit-tested; constants in `play.rs`): exhaustion 16 units per
+  block of horizontal travel + 20 per second, 4 000 per food point; every ≥ 4 s of client
+  time (one step per move): +1 health if food ≥ 18 (costs 1 500 exhaustion), or −1 health if
+  food is 0 (not below 1). Damage = fall + pending (both presence entries when crossing);
+  health 0 ⇒ `Dead` on every later move.
+- `create_chunk` accepts an optional `player_state`: the player's current chunk is always
+  creatable (a player whose chunk was closed while away — entry pruned, payer closed it —
+  would otherwise be stuck: missing chunks read as Stone).
+- Not e2e-testable yet (unit tests instead): fall damage (no block edits to build a drop),
+  `pending_damage` (written by mobs, Task 20), death. Revoked token: `AccountNotInitialized`.

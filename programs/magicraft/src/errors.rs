@@ -112,6 +112,8 @@ pub enum MagicraftError {
     // ----- worlds (appended) -----
     #[msg("World spawn is already set")]
     SpawnAlreadySet, // 6142
+    #[msg("World spawn is not set yet")]
+    SpawnNotSet, // 6143
 }
 
 impl From<MoveError> for MagicraftError {
@@ -205,11 +207,12 @@ mod tests {
             MissingInputs,
             MissingFuel,
             SpawnAlreadySet,
+            SpawnNotSet,
         ];
         for (i, e) in all.into_iter().enumerate() {
             assert_eq!(u32::from(e), 6100 + i as u32, "{e:?}");
         }
-        assert_eq!(all.len(), 43);
+        assert_eq!(all.len(), 44);
     }
 
     #[test]

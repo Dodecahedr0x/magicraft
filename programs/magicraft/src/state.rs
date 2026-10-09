@@ -408,7 +408,7 @@ pub struct World {
     pub seed: [u8; 32],
     pub seed_set: bool,
     /// **Block** coordinates (not fixed-point) of the spawn feet block, set once by
-    /// `set_spawn` from chunk (0,0). Task 18 (`join_world` / `respawn`) converts to FP feet
+    /// `set_spawn` from chunk (0,0). `join_world` / `respawn` convert to the FP feet
     /// position: `x·256 + 128, y·256, z·256 + 128` (block center).
     pub spawn: [i32; 3],
     pub spawn_set: bool,
@@ -883,6 +883,36 @@ pub fn chunk_for<'a>(
     Ok(h)
 }
 
+/// Read-only blocks of the playable chunk `(cx, cz)` of `world` for hot gameplay paths
+/// (`move_player`): owner, discriminator, stored world / coordinates, full size and
+/// `GEN_DONE` are checked (`InvalidChunk` / `ChunkNotReady`), **without** re-deriving the
+/// PDA (a `create_program_address` costs ~1.5k CU per account). Sound because only this
+/// program can own an account whose data starts with [`CHUNK_DISCRIMINATOR`], and the only
+/// writer of a chunk header is `create_chunk`, which creates the account at the PDA of the
+/// `(world, cx, cz)` it stores; no ix lets a user write header bytes. So stored identity ⇒
+/// PDA identity.
+pub fn ready_chunk_blocks_ro<'a>(
+    ai: &'a AccountInfo,
+    world: &Pubkey,
+    cx: i32,
+    cz: i32,
+) -> Result<core::cell::Ref<'a, [u8; CHUNK_VOL]>> {
+    check_owner(ai)?;
+    let data = ai.try_borrow_data()?;
+    let h = chunk_header_from(&data)?;
+    require!(
+        h.world == *world && h.cx.get() == cx && h.cz.get() == cz,
+        MagicraftError::InvalidChunk
+    );
+    require!(
+        h.is_done() && data.len() >= CHUNK_FULL_LEN,
+        MagicraftError::ChunkNotReady
+    );
+    Ok(core::cell::Ref::map(data, |d| {
+        <&[u8; CHUNK_VOL]>::try_from(&d[CHUNK_BLOCKS_OFFSET..CHUNK_FULL_LEN]).unwrap()
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // ChunkPresence
 // ---------------------------------------------------------------------------
@@ -1000,6 +1030,19 @@ pub fn presence_for<'a>(
 ) -> Result<(RefMut<'a, PresenceHeader>, RefMut<'a, [PresenceEntry]>)> {
     let (h, e) = presence_mut(ai)?;
     check_presence_identity(&h, ai.key, chunk)?;
+    Ok((h, e))
+}
+
+/// Like [`presence_for`] but without re-deriving the PDA (hot path, `move_player`): owner,
+/// discriminator, length/count and the stored `chunk` are checked. Sound for the same
+/// reason as [`ready_chunk_blocks_ro`]: only `create_chunk` writes a presence header, at
+/// the PDA `["presence", chunk]` of the chunk it stores.
+pub fn presence_of<'a>(
+    ai: &'a AccountInfo,
+    chunk: &Pubkey,
+) -> Result<(RefMut<'a, PresenceHeader>, RefMut<'a, [PresenceEntry]>)> {
+    let (h, e) = presence_mut(ai)?;
+    require_keys_eq!(h.chunk, *chunk, MagicraftError::InvalidPresence);
     Ok((h, e))
 }
 

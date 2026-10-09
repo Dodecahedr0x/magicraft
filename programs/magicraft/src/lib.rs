@@ -4,6 +4,7 @@ use ephemeral_rollups_sdk::anchor::ephemeral;
 pub mod auth;
 pub mod errors;
 pub mod instructions;
+pub mod presence;
 pub mod scheduler;
 pub mod state;
 
@@ -98,6 +99,24 @@ pub mod magicraft {
     /// Closes an unedited, empty chunk + presence; refunds the payer Player.
     pub fn close_chunk(ctx: Context<CloseChunk>, cx: i32, cz: i32) -> Result<()> {
         instructions::chunk::close_chunk(ctx, cx, cz)
+    }
+
+    // ----- Playing (ER) -----
+
+    /// Creates the player's `PlayerState` in the world at the spawn (sponsored by the Player).
+    pub fn join_world(ctx: Context<JoinWorld>) -> Result<()> {
+        instructions::play::join_world(ctx)
+    }
+
+    /// Validates and applies one movement update (presence, damage, hunger). World read-only.
+    pub fn move_player(
+        ctx: Context<MovePlayer>,
+        pos: [i32; 3],
+        vel: [i32; 3],
+        on_ground: bool,
+        client_ms: i64,
+    ) -> Result<()> {
+        instructions::play::move_player(ctx, pos, vel, on_ground, client_ms)
     }
 
     // ----- Day crank (ER) -----
