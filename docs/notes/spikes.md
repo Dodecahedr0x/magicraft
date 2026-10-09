@@ -115,3 +115,73 @@ Node 25 strips TS types natively and loaded the `.spec.ts` files itself
 (bypassing ts-node/tsconfig, with a `MODULE_TYPELESS_PACKAGE_JSON` warning).
 The Anchor.toml test script sets `NODE_OPTIONS=--no-experimental-strip-types`
 so ts-mocha's ts-node path is used.
+
+## 2026-10-09: Player sponsor + 16.8 KB ephemeral chunk (Task 3)
+
+Test: `tests/01-spike-chunk.spec.ts`. Spike code: `programs/magicraft/src/instructions/spike.rs`
+(`spike_chunk`, `spike_resize`, `spike_fill`; temporary, remove in Task 6). Kept code:
+`state.rs` (`Player { authority, bump }`, seeds `["player", authority]`) and
+`instructions/player.rs` (`init_player`, `deposit`, `delegate_player`).
+
+### Player: init + fund + delegate in one base tx: works
+
+`init_player` + `deposit(0.05 SOL)` + `delegate_player(mAGicPQ...)` as three ixs in **one**
+base-layer tx succeeds. Afterwards the Player's base owner is the delegation program and its lamports
+are rent-exempt minimum + deposit. The ER clones it right away (owner = magicraft on the ER).
+`delegate_player` uses `#[delegate]` with `#[account(mut, del, seeds, bump)] player: UncheckedAccount`
+(the macro rejects typed `Account<>` for `del` fields). `deposit` is a plain system transfer
+wallet → PDA, valid only before delegation (it takes `Account<Player>`).
+
+### Ephemeral chunk creation
+
+| Tried | Result |
+|---|---|
+| `#[ephemeral_accounts]` with eph seeds `[b"chunk", player, cx.to_le_bytes(), cz.to_le_bytes()]` | **Does not compile** (E0425 `cx` not in scope). The macro re-derives the seeds inside the generated `impl Struct { fn create_ephemeral_chunk(&self, ..) }`, where `#[instruction(..)]` args don't exist. It also calls `find_program_address` at runtime for both sponsor and eph. |
+| SDK builder directly: `EphemeralAccount::new(player, chunk, vault).with_signer_seeds(&[player_seeds, chunk_seeds]).create(16_896)`, with `vault` (`address = EPHEMERAL_VAULT_ID`) and `magic_program: Program<MagicProgram>` declared by hand | **Fails**: the Magic program logs `Created ephemeral: 16896 bytes, 542592 rent`, then the SVM rejects with `Account data size realloc limited to 10240 in inner instructions` → `InvalidRealloc`. The 10 KiB CPI growth cap (MAX_PERMITTED_DATA_INCREASE) applies even though the Magic program is native. |
+| `spike_chunk(len = 10_240)` then `spike_resize(16_896)` as **two ixs in one ER tx** | **Works.** Chunk exists only on the ER: 16 896 bytes, owner magicraft, absent on base. |
+
+Rent: Player lamports on the ER dropped by exactly **542 592** = (16 896 + 60) × 32
+(create 10 240 → 329 600, resize +6 656 → 212 992). The fee payer is the authority wallet, so the
+Player pays only rent.
+
+CU: create 8 415, resize 8 416 (each including Anchor overhead and an on-chain `find_program_address`
+for the chunk bump).
+
+### Writing 16 384 block bytes in one ix (ER, default 200k limit)
+
+| Mode | CU consumed (whole ix) |
+|---|---|
+| no write (baseline: Anchor + 2 PDA checks) | 4 751 |
+| `for b in blocks { *b = v }` | 4 823 (LLVM lowers it to memset) |
+| `blocks.fill(v)` | 4 824 |
+| `copy_from_slice` from a 16 KB `vec!` | 4 920 |
+| per-byte computed value (`(i*0x9E3779B1 ^ v) >> 29`) | 119 443 (≈ 7 CU/byte above baseline) |
+
+Bulk copies/fills of the whole block array are nearly free. Anything computed per block costs
+about 7 CU per byte at minimum, so terrain generation with real noise will not fit in one 200k ix;
+plan for 1.4M or staged generation (`gen_stage`).
+
+### ER compute limits
+
+- Default: 200 000 per ix; the tx budget is 200k × (number of ixs). A 2-ix tx showed `of 400000`
+  for the first ix and the remainder for the second.
+- `ComputeBudgetProgram.setComputeUnitLimit(1_400_000)` is honoured on the ER: the program sees
+  1 399 850 (the ComputeBudget ix itself is charged 150).
+
+### Other findings
+
+- The ER confirms a tx that fails with `InvalidRealloc` only after about **29.5 s**: web3.js
+  `confirmTransaction` waits until blockhash expiry. A program-error failure (`Custom(101)`)
+  confirms in about 2 ms. `sendEr` still reports the error and logs correctly. If this matters,
+  make `sendEr` poll `getSignatureStatuses`.
+
+### Decisions
+
+1. Chunk accounts are created in **two top-level instructions**: create at ≤ 10 240 bytes, then
+   `resize` to the full size (they can go in the same tx). Alternatively, make a chunk ≤ 10 240
+   bytes.
+2. Don't use the generated `create_ephemeral_*` / `resize_ephemeral_*` methods when the eph seeds
+   depend on ix args. Call `ephemeral_rollups_sdk::ephemeral_accounts::EphemeralAccount` directly
+   with Anchor's bumps (`ctx.bumps.chunk`, `player.bump`), and declare `vault` and `magic_program`
+   yourself. This also avoids the macro's extra runtime `find_program_address` calls.
+3. Player = sponsor works as `Account<Player>` with `mut, seeds, bump = player.bump, has_one = authority`.

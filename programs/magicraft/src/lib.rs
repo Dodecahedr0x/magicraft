@@ -1,5 +1,11 @@
+#![allow(ambiguous_glob_reexports)]
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::anchor::ephemeral;
+
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
 
 declare_id!("4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9");
 
@@ -11,6 +17,40 @@ pub mod magicraft {
     pub fn ping(_ctx: Context<Ping>) -> Result<()> {
         msg!("pong v{}", magicraft_core::version());
         Ok(())
+    }
+
+    // ----- Player (base layer) -----
+
+    pub fn init_player(ctx: Context<InitPlayer>) -> Result<()> {
+        instructions::player::init_player(ctx)
+    }
+
+    pub fn deposit(ctx: Context<Deposit>, lamports: u64) -> Result<()> {
+        instructions::player::deposit(ctx, lamports)
+    }
+
+    pub fn delegate_player(ctx: Context<DelegatePlayer>, validator: Option<Pubkey>) -> Result<()> {
+        instructions::player::delegate_player(ctx, validator)
+    }
+
+    // ----- TEMPORARY spikes (Task 3; remove in Task 6) -----
+
+    pub fn spike_chunk(ctx: Context<SpikeChunk>, cx: i32, cz: i32, len: u32) -> Result<()> {
+        instructions::spike::spike_chunk(ctx, cx, cz, len)
+    }
+
+    pub fn spike_resize(ctx: Context<SpikeChunk>, cx: i32, cz: i32, new_len: u32) -> Result<()> {
+        instructions::spike::spike_resize(ctx, cx, cz, new_len)
+    }
+
+    pub fn spike_fill(
+        ctx: Context<SpikeFill>,
+        cx: i32,
+        cz: i32,
+        value: u8,
+        mode: u8,
+    ) -> Result<()> {
+        instructions::spike::spike_fill(ctx, cx, cz, value, mode)
     }
 }
 
