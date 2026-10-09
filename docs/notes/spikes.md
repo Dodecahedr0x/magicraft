@@ -360,14 +360,14 @@ crates `ephemeral-vrf-sdk 0.17.3` (+ `ephemeral-vrf-sdk-vrf-macro`), `session-ke
 |---|---|
 | Does an ER request on `DEFAULT_EPHEMERAL_TEST_QUEUE` get fulfilled locally? (tested) | **Yes.** Callback landed **~110 ms** after the request (3 runs: 109-113 ms; one PDA-payer run 208 ms). No script changes were needed: the second oracle (`vrf-er`, RPC 7799/WS 7800) fulfils it. The earlier "no callback observed" was just never having sent a request. |
 | Does the callback reach an **ephemeral** account? (tested) | **Yes.** 32 non-zero bytes appear at chunk[16..48] of the 16 896-byte ephemeral chunk. |
-| Must the payer be a wallet, or can the delegated Player PDA pay? (tested on ER; base path from source) | **On the ER queue the Player PDA works** (`payer_mode 1`: manual `invoke_signed` with the identity seeds **and** the Player seeds; `invoke_signed_vrf` itself only signs with the identity seed, so it cannot be used for a PDA payer). The VRF program only checks `payer.is_signer()`; ephemeral queues (`DEFAULT_EPHEMERAL_QUEUE`, and the test queue in builds with the `ephemeral-test-queue` feature) are **fee-exempt** (`fees.rs::is_fee_exempt_ephemeral_queue`). Lamport deltas on the ER: wallet 0, Player 0, for both modes. **On a base-layer queue** the program `system_instruction::transfer`s 500 000 lamports (800 000 high priority) from the payer to the queue, which needs a system-owned, data-less payer: a Player PDA (program-owned, with data) could not pay there. |
+| Must the payer be a wallet, or can the delegated Player PDA pay? (tested on ER; base path from source) | **On the local ER test queue the Player PDA works** (tested) (`payer_mode 1`: manual `invoke_signed` with the identity seeds **and** the Player seeds; `invoke_signed_vrf` itself only signs with the identity seed, so it cannot be used for a PDA payer). The VRF program only checks `payer.is_signer()`; ephemeral queues (`DEFAULT_EPHEMERAL_QUEUE`, and the test queue in builds with the `ephemeral-test-queue` feature) are **fee-exempt** (`fees.rs::is_fee_exempt_ephemeral_queue`). **The production `DEFAULT_EPHEMERAL_QUEUE` exemption is source-only** (repo main, not the deployed devnet/mainnet binary): re-check on devnet before relying on a PDA payer; if the deployed program charges the fee there, the PDA cannot pay. Lamport deltas on the ER: wallet 0, Player 0, for both modes. **On a base-layer queue** the program `system_instruction::transfer`s 500 000 lamports (800 000 high priority) from the payer to the queue, which needs a system-owned, data-less payer: a Player PDA (program-owned, with data) could not pay there. |
 | Who pays the fulfilment? (tested) | The oracle identity `paywJ…` is the fee payer of the fulfil tx; ER fee 0. It sets a compute limit of 300 000 (regular) / 400 000 (high priority); the callback CPI saw **~262k CU available** (`consumed 3826 of 261651`), the VRF program itself used ~42k in total. **Do not generate terrain in the callback**; store the seed only. |
 | CU of the request (tested) | `spike_vrf` 34.5k CU total (VRF program 11.8k); the rest is Anchor + PDA bump searches (`#[vrf]`'s `program_identity` seeds, `invoke_signed_vrf`'s runtime `try_find_program_address`). |
 | Forged callback (tested) | Calling `spike_vrf_callback` with a random keypair as `vrf_program_identity` (signed) → `ConstraintAddress` (2012). |
 | Local queue noise (observed) | The dumped test queue `Sc9MJ…` arrives with ~53 stale devnet requests (e.g. callback program `AMwxv…`, not deployed locally). The ER oracle retries them and they fail with VRF error 13 (`OracleMustProvideInDifferentSlot`); ~1 000 failed oracle txs on the queue in the first ~270 slots, then it stopped. Harmless locally (fee 0), but don't use `getSignaturesForAddress(queue)` to find our fulfilment. |
 
 Design implication: the World seed request can be made inside the ER with the **Player PDA (or World
-PDA) as payer**, the callback writes the seed into the ephemeral World account in ~100 ms. No base-layer
+PDA) as payer** (tested locally; devnet fee exemption still to confirm), the callback writes the seed into the ephemeral World account in ~100 ms. No base-layer
 fallback needed. A base-layer request would need a wallet payer and costs 0.0005 SOL.
 
 ### Session keys API as used
@@ -420,3 +420,27 @@ fallback needed. A base-layer request would need a wallet payer and costs 0.0005
    (or in the same tx as) Player init/delegation, with `top_up` off or small, and signs ER txs with the session key
    as fee payer.
 3. Program errors start at 6100 (`#[error_code(offset = 6100)]`) to stay clear of SessionError.
+
+### Carry over to permanent code (Task 6+)
+
+- **VRF request with a PDA payer:** don't use `invoke_signed_vrf` (it signs with the identity seed only).
+  Call `invoke_signed` yourself with account infos in this exact order: `[payer PDA, program_identity,
+  oracle_queue, system_program, slot_hashes]`, and **both** seed sets: `["identity", bump]` and the payer
+  PDA's seeds + bump. Build the ix with `create_request_randomness_ix` (the scoped request in 0.17.3);
+  never the deprecated legacy builders, since `#[vrf_callback]` only accepts the scoped identity and
+  the manual path does not get `invoke_signed_vrf`'s discriminator rewrite.
+- **Callback target:** a typed, seed-constrained World account (`Account<World>` with `seeds`/`bump`), not
+  an `UncheckedAccount` with an owner check, plus a guard that the seed is still unset
+  (`require!(!world.seed_set)`), so a second fulfilment cannot re-roll the world.
+- **Constrain `oracle_queue`** with `address = DEFAULT_EPHEMERAL_QUEUE` (cfg/feature switch to
+  `DEFAULT_EPHEMERAL_TEST_QUEUE` for localnet) instead of accepting any queue as the spike does.
+- **`session_auth_or`:** write the fallback through `ctx.accounts.…`
+  (`ctx.accounts.player.authority == ctx.accounts.signer.key()`), import `session_keys::SessionError`
+  next to `session_auth_or`/`Session`/`SessionTokenV2`, and keep `player` a seeded
+  `Account<Player>` (`seeds = [PLAYER_SEED, player.authority.as_ref()], bump = player.bump`) so the
+  `authority` used by `#[session(authority = player.authority.key())]` comes from a validated account.
+- **Client error mapping:** SessionError is not in our IDL; the client needs its own map
+  6000 `ValidityTooLong`, 6001 `InvalidToken`, 6002 `NoToken`, 6003 `InvalidAuthority`
+  (see `SESSION_ERRORS` in `tests/helpers/session.ts`).
+- Session client helpers (`createSessionIx`, `revokeSessionIx`, `sessionTokenPda`, program ids) live in
+  `tests/helpers/session.ts`; port them to the web client.

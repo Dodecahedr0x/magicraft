@@ -1,21 +1,19 @@
 // Task 5 spike: MagicBlock VRF requested inside the ER (callback writes into an
 // EPHEMERAL chunk) and gpl_session session keys used on the ER.
 // spike_* instructions are temporary (removed in Task 6).
-import { createHash, randomBytes } from "crypto";
+import { randomBytes } from "crypto";
 import { expect } from "chai";
-import { BN, web3 } from "@anchor-lang/core";
+import { web3 } from "@anchor-lang/core";
 import { baseConn, erConn, erProgramFor, sendEr, TxError } from "./helpers/env";
+import {
+  createSessionIx,
+  ER_TEST_QUEUE,
+  GPL_SESSION,
+  revokeSessionIx,
+  sessionTokenPda,
+} from "./helpers/session";
 import { setupPlayer, sleep, SpikePlayer, until } from "./helpers/spike";
 
-const VRF_PROGRAM = new web3.PublicKey(
-  "Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz"
-);
-const ER_TEST_QUEUE = new web3.PublicKey(
-  "Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT"
-); // DEFAULT_EPHEMERAL_TEST_QUEUE
-const GPL_SESSION = new web3.PublicKey(
-  "KeyspM2ssCJbqUhQ4k7sveSiY4WjnYsrXkC8oDbwde5"
-);
 const VRF_OFFSET = 16;
 const PING_OFFSET = 8;
 
@@ -37,92 +35,6 @@ async function expectTxError(p: Promise<unknown>): Promise<TxError> {
     throw e;
   }
   throw new Error("expected the transaction to fail");
-}
-
-// ---------- gpl_session client (hand-built ixs; see docs/notes/spikes.md) ----------
-
-const disc = (name: string) =>
-  createHash("sha256").update(`global:${name}`).digest().subarray(0, 8);
-
-function optBool(v?: boolean): Buffer {
-  return v === undefined ? Buffer.from([0]) : Buffer.from([1, v ? 1 : 0]);
-}
-function optU64(v?: number | bigint, signed = false): Buffer {
-  if (v === undefined) return Buffer.from([0]);
-  const b = Buffer.alloc(9);
-  b[0] = 1;
-  if (signed) b.writeBigInt64LE(BigInt(v), 1);
-  else b.writeBigUInt64LE(BigInt(v), 1);
-  return b;
-}
-
-function sessionTokenPda(
-  programId: web3.PublicKey,
-  signer: web3.PublicKey,
-  authority: web3.PublicKey
-): web3.PublicKey {
-  return web3.PublicKey.findProgramAddressSync(
-    [
-      Buffer.from("session_token_v2"),
-      programId.toBuffer(),
-      signer.toBuffer(),
-      authority.toBuffer(),
-    ],
-    GPL_SESSION
-  )[0];
-}
-
-/** gpl_session `create_session_v2(top_up, valid_until, lamports)`. */
-function createSessionIx(o: {
-  programId: web3.PublicKey;
-  signer: web3.PublicKey;
-  authority: web3.PublicKey;
-  validUntil: number;
-  topUpLamports?: number;
-}): web3.TransactionInstruction {
-  const token = sessionTokenPda(o.programId, o.signer, o.authority);
-  return new web3.TransactionInstruction({
-    programId: GPL_SESSION,
-    keys: [
-      { pubkey: token, isSigner: false, isWritable: true },
-      { pubkey: o.signer, isSigner: true, isWritable: true },
-      { pubkey: o.authority, isSigner: true, isWritable: true }, // fee_payer
-      { pubkey: o.authority, isSigner: true, isWritable: false }, // authority
-      { pubkey: o.programId, isSigner: false, isWritable: false },
-      {
-        pubkey: web3.SystemProgram.programId,
-        isSigner: false,
-        isWritable: false,
-      },
-    ],
-    data: Buffer.concat([
-      disc("create_session_v2"),
-      optBool(o.topUpLamports !== undefined),
-      optU64(o.validUntil, true),
-      optU64(o.topUpLamports),
-    ]),
-  });
-}
-
-/** gpl_session `revoke_session_v2` (authority must sign while the token is active). */
-function revokeSessionIx(
-  token: web3.PublicKey,
-  authority: web3.PublicKey
-): web3.TransactionInstruction {
-  return new web3.TransactionInstruction({
-    programId: GPL_SESSION,
-    keys: [
-      { pubkey: token, isSigner: false, isWritable: true },
-      { pubkey: authority, isSigner: false, isWritable: true }, // fee_payer
-      { pubkey: authority, isSigner: true, isWritable: false }, // authority
-      {
-        pubkey: web3.SystemProgram.programId,
-        isSigner: false,
-        isWritable: false,
-      },
-    ],
-    data: disc("revoke_session_v2"),
-  });
 }
 
 async function sendBase(
