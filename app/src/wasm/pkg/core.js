@@ -12,6 +12,29 @@ export function block_flags() {
 }
 
 /**
+ * `blocks::break_time_ms(block, tool of item)` in ms; 0 = not breakable (air, water,
+ * bedrock, unknown byte). `item` 0 = bare hand.
+ * @param {number} block
+ * @param {number} item
+ * @returns {number}
+ */
+export function break_time_ms(block, item) {
+    const ret = wasm.break_time_ms(block, item);
+    return ret >>> 0;
+}
+
+/**
+ * `blocks::can_harvest(block, tool of item)` (false for unknown bytes).
+ * @param {number} block
+ * @param {number} item
+ * @returns {boolean}
+ */
+export function can_harvest(block, item) {
+    const ret = wasm.can_harvest(block, item);
+    return ret !== 0;
+}
+
+/**
  * Runs `physics::check_move` on a 2×2 chunk window.
  *
  * - `params`: 48 B `WorldParams`; `prev`: 72 B `MoveState` (the last accepted state).
@@ -112,6 +135,27 @@ export function core_version() {
 }
 
 /**
+ * `recipes::craft` on a copy of `inv` (216 B, the `PlayerState` inventory bytes):
+ * `[code, inventory after (216 B)]`; code 0 = ok, `1 + CraftError` discriminant
+ * (1 UnknownRecipe, 2 WrongStation, 3 MissingInputs, 4 MissingFuel, 5 NoSpace,
+ * 6 InvalidCount) or [`BAD_INPUT`] (then no inventory follows).
+ * @param {Uint8Array} inv
+ * @param {number} recipe_id
+ * @param {number} count
+ * @param {boolean} table
+ * @param {boolean} furnace
+ * @returns {Uint8Array}
+ */
+export function craft(inv, recipe_id, count, table, furnace) {
+    const ptr0 = passArray8ToWasm0(inv, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.craft(ptr0, len0, recipe_id, count, table, furnace);
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * `WorldParams::default()` bytes (48 B).
  * @returns {Uint8Array}
  */
@@ -120,6 +164,59 @@ export function default_params() {
     var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v1;
+}
+
+/**
+ * `blocks::drop_item(block)` as `[item, count]`, or empty if it drops nothing.
+ * @param {number} block
+ * @returns {Uint16Array}
+ */
+export function drop_item(block) {
+    const ret = wasm.drop_item(block);
+    var v1 = getArrayU16FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 2, 2);
+    return v1;
+}
+
+/**
+ * Every item id (`Item::ALL`).
+ * @returns {Uint16Array}
+ */
+export function item_ids() {
+    const ret = wasm.item_ids();
+    var v1 = getArrayU16FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 2, 2);
+    return v1;
+}
+
+/**
+ * Properties of item `id`: `[block (−1 = not placeable), tool kind (−1 none; 0 pickaxe,
+ * 1 axe, 2 shovel, 3 sword), tier (0 none, 1..=4), attack damage (1 = fist for
+ * non-tools), max stack, max durability, food value (−1 not edible)]`; empty if unknown.
+ * @param {number} id
+ * @returns {Int32Array}
+ */
+export function item_info(id) {
+    const ret = wasm.item_info(id);
+    var v1 = getArrayI32FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+    return v1;
+}
+
+/**
+ * The largest `count` (0..=[`MAX_CRAFT_COUNT`]) for which [`craft`] succeeds (a craft that
+ * works for `n` works for every smaller `n`: inputs, fuel and output space all scale).
+ * @param {Uint8Array} inv
+ * @param {number} recipe_id
+ * @param {boolean} table
+ * @param {boolean} furnace
+ * @returns {number}
+ */
+export function max_crafts(inv, recipe_id, table, furnace) {
+    const ptr0 = passArray8ToWasm0(inv, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.max_crafts(ptr0, len0, recipe_id, table, furnace);
+    return ret;
 }
 
 /**
@@ -148,6 +245,18 @@ export function physics_constants() {
     const ret = wasm.physics_constants();
     var v1 = getArrayI32FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+    return v1;
+}
+
+/**
+ * `recipes::RECIPES` flattened, in id order: per recipe `[n_inputs, (item, amount) ×
+ * n_inputs, output item, output amount, station (0 none, 1 table, 2 furnace), fuel]`.
+ * @returns {Uint16Array}
+ */
+export function recipe_table() {
+    const ret = wasm.recipe_table();
+    var v1 = getArrayU16FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 2, 2);
     return v1;
 }
 
@@ -216,6 +325,11 @@ function getArrayI32FromWasm0(ptr, len) {
     return getInt32ArrayMemory0().subarray(ptr / 4, ptr / 4 + len);
 }
 
+function getArrayU16FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint16ArrayMemory0().subarray(ptr / 2, ptr / 2 + len);
+}
+
 function getArrayU8FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
@@ -231,6 +345,14 @@ function getInt32ArrayMemory0() {
 
 function getStringFromWasm0(ptr, len) {
     return decodeText(ptr >>> 0, len);
+}
+
+let cachedUint16ArrayMemory0 = null;
+function getUint16ArrayMemory0() {
+    if (cachedUint16ArrayMemory0 === null || cachedUint16ArrayMemory0.byteLength === 0) {
+        cachedUint16ArrayMemory0 = new Uint16Array(wasm.memory.buffer);
+    }
+    return cachedUint16ArrayMemory0;
 }
 
 let cachedUint32ArrayMemory0 = null;
@@ -285,6 +407,7 @@ function __wbg_finalize_init(instance, module) {
     wasm = instance.exports;
     wasmModule = module;
     cachedInt32ArrayMemory0 = null;
+    cachedUint16ArrayMemory0 = null;
     cachedUint32ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
     wasm.__wbindgen_start();

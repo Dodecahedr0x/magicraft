@@ -12,6 +12,9 @@
 //   after a short debounce (nearest first).
 // - Implements `ChunkView` (`exists` / `ready`) for the chain builders and `getBlock` for
 //   physics (Task 25).
+// - Optimistic edits (Task 26): `setLocal` writes a block byte locally (break / place sent,
+//   not confirmed yet) and keeps it as an overlay re-applied over every account update until
+//   `clearLocal` (confirmed) or `revertLocal` (failed: restore + re-read the chunk).
 import type { AccountInfo, Connection, PublicKey } from "@solana/web3.js";
 import { accountKind, CHUNK_GEN_STAGE_OFFSET, CHUNK_HEADER_SIZE, chunkBlocks, chunkPda, chunkReady, chunkKey, GEN_DONE, type ChunkView } from "../chain";
 import { borderOf, DIRS } from "./mesher";
@@ -69,6 +72,8 @@ export class ChunkStore implements ChunkView {
   private dirty = new Set<string>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
+  /** Optimistic edits per chunk key: local block index → byte. */
+  private overlay = new Map<string, Map<number, number>>();
   center: [number, number] | null = null;
 
   constructor(readonly opts: StoreOptions) {
@@ -126,6 +131,73 @@ export class ChunkStore implements ChunkView {
     return e?.blocks && e.genStage === GEN_DONE && this.ready(cx, cz) ? e.blocks : null;
   }
 
+  // ------------------------------------------------------------ optimistic edits
+
+  private locate(x: number, y: number, z: number) {
+    if (y < 0 || y >= 64) return null;
+    const cx = Math.floor(x / 16);
+    const cz = Math.floor(z / 16);
+    const e = this.get(cx, cz);
+    if (!e?.blocks || e.genStage !== GEN_DONE) return null;
+    const [lx, lz] = [x - cx * 16, z - cz * 16];
+    return { e, lx, lz, i: (y * 16 + lz) * 16 + lx };
+  }
+
+  /** Writes block `b` at `(x, y, z)` locally and keeps it over account updates until
+   *  `clearLocal` / `revertLocal`. Returns the previous byte, or null if the chunk is not
+   *  ready (nothing written). */
+  setLocal(x: number, y: number, z: number, b: number): number | null {
+    const l = this.locate(x, y, z);
+    if (!l) return null;
+    const old = l.e.blocks![l.i];
+    let m = this.overlay.get(l.e.key);
+    if (!m) this.overlay.set(l.e.key, (m = new Map()));
+    m.set(l.i, b);
+    l.e.blocks![l.i] = b;
+    this.markEdit(l.e, l.lx, l.lz);
+    return old;
+  }
+
+  /** The edit at `(x, y, z)` was confirmed: stop re-applying it (the chain has it now). */
+  clearLocal(x: number, y: number, z: number) {
+    const l = this.locate(x, y, z);
+    const m = l && this.overlay.get(l.e.key);
+    if (!m) return;
+    m.delete(l.i);
+    if (!m.size) this.overlay.delete(l.e.key);
+  }
+
+  /** The edit at `(x, y, z)` failed: drop it, put `old` back (if the byte is still ours)
+   *  and re-read the chunk from the chain. */
+  revertLocal(x: number, y: number, z: number, old: number) {
+    const l = this.locate(x, y, z);
+    if (!l) return;
+    const m = this.overlay.get(l.e.key);
+    const mine = m?.get(l.i);
+    m?.delete(l.i);
+    if (m && !m.size) this.overlay.delete(l.e.key);
+    if (mine !== undefined && l.e.blocks![l.i] === mine) {
+      l.e.blocks![l.i] = old;
+      this.markEdit(l.e, l.lx, l.lz);
+    }
+    void this.refresh(l.e.key);
+  }
+
+  /** Number of pending optimistic edits (stats / tests). */
+  get localEdits() {
+    let n = 0;
+    for (const m of this.overlay.values()) n += m.size;
+    return n;
+  }
+
+  private markEdit(e: ChunkEntry, lx: number, lz: number) {
+    this.markDirty(e.key);
+    if (lz === 0) this.markNeighbor(e.cx, e.cz - 1);
+    if (lz === 15) this.markNeighbor(e.cx, e.cz + 1);
+    if (lx === 0) this.markNeighbor(e.cx - 1, e.cz);
+    if (lx === 15) this.markNeighbor(e.cx + 1, e.cz);
+  }
+
   /** Mesher input for `key` (copies), or null when it has no blocks. */
   meshInput(key: string): { blocks: Uint8Array; borders: (Uint8Array | null)[] } | null {
     const e = this.map.get(key);
@@ -176,6 +248,7 @@ export class ChunkStore implements ChunkView {
 
   private unload(e: ChunkEntry) {
     this.map.delete(e.key);
+    this.overlay.delete(e.key);
     if (e.sub !== null) void Promise.resolve(this.opts.conn.removeAccountChangeListener(e.sub)).catch(() => {});
     e.sub = null;
     // Removal of its mesh (meshInput is null now).
@@ -231,6 +304,9 @@ export class ChunkStore implements ChunkView {
     e.genStage = data ? data[CHUNK_GEN_STAGE_OFFSET] : -1;
     e.blocks = data ? chunkBlocks(data) : null;
     const next = e.blocks;
+    const ov = this.overlay.get(e.key);
+    if (ov && next) for (const [i, b] of ov) next[i] = b;
+    else if (ov && !data) this.overlay.delete(e.key);
     if (!prev !== !next) {
       this.markDirty(e.key);
       for (const [dx, dz] of DIRS) this.markNeighbor(e.cx + dx, e.cz + dz);
@@ -294,6 +370,7 @@ export class ChunkStore implements ChunkView {
     for (const e of this.map.values())
       if (e.sub !== null) void Promise.resolve(this.opts.conn.removeAccountChangeListener(e.sub)).catch(() => {});
     this.map.clear();
+    this.overlay.clear();
     this.dirty.clear();
   }
 }

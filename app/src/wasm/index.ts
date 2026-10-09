@@ -133,3 +133,100 @@ export function spawnState(pos: readonly number[], nowMs: number, onGround = fal
 }
 
 export const coreVersion = () => (need(), pkg.core_version());
+
+// ---------------------------------------------------------------- items / blocks / recipes
+
+/** `blocks::break_time_ms(block, tool of item)` in ms; 0 = not breakable. `item` 0 = hand. */
+export function breakTimeMs(block: number, item: number): number {
+  need();
+  return pkg.break_time_ms(block, item);
+}
+
+/** `blocks::can_harvest(block, tool of item)`. */
+export function canHarvest(block: number, item: number): boolean {
+  need();
+  return pkg.can_harvest(block, item);
+}
+
+/** `blocks::drop_item(block)` → `[item, count]`, or null. */
+export function dropItem(block: number): [number, number] | null {
+  need();
+  const r = pkg.drop_item(block);
+  return r.length === 2 ? [r[0], r[1]] : null;
+}
+
+/** Item properties from the core (`items::Item`). */
+export type CoreItem = {
+  id: number;
+  /** Block placed by the item, or −1. */
+  block: number;
+  /** Tool kind (0 pickaxe, 1 axe, 2 shovel, 3 sword), or −1. */
+  toolKind: number;
+  /** Tool tier 1..4 (wood..diamond), 0 for non-tools. */
+  tier: number;
+  /** Attack damage (1 = fist for non-tools). */
+  damage: number;
+  maxStack: number;
+  maxDurability: number;
+  /** Food points, or −1 if not edible. */
+  food: number;
+};
+
+/** Every item of the core with its properties (cached). */
+let itemCache: Map<number, CoreItem> | null = null;
+export function coreItems(): Map<number, CoreItem> {
+  need();
+  if (itemCache) return itemCache;
+  itemCache = new Map();
+  for (const id of pkg.item_ids()) {
+    const [block, toolKind, tier, damage, maxStack, maxDurability, food] = pkg.item_info(id);
+    itemCache.set(id, { id, block, toolKind, tier, damage, maxStack, maxDurability, food });
+  }
+  return itemCache;
+}
+
+/** One `recipes::RECIPES` entry; `id` = its index (what `craft` takes). */
+export type CoreRecipe = {
+  id: number;
+  inputs: [item: number, amount: number][];
+  output: [item: number, amount: number];
+  /** 0 anywhere, 1 crafting table, 2 furnace. */
+  station: number;
+  /** Fuel units per craft (coal first, then planks). */
+  fuel: number;
+};
+
+let recipeCache: CoreRecipe[] | null = null;
+/** The core's recipe table in id order (cached). */
+export function coreRecipes(): CoreRecipe[] {
+  need();
+  if (recipeCache) return recipeCache;
+  const t = pkg.recipe_table();
+  const out: CoreRecipe[] = [];
+  for (let i = 0; i < t.length; ) {
+    const n = t[i++];
+    const inputs: [number, number][] = [];
+    for (let k = 0; k < n; k++, i += 2) inputs.push([t[i], t[i + 1]]);
+    out.push({ id: out.length, inputs, output: [t[i], t[i + 1]], station: t[i + 2], fuel: t[i + 3] });
+    i += 4;
+  }
+  return (recipeCache = out);
+}
+
+/** `recipes::CraftError` names by wasm result code (`1 + discriminant`). */
+export const CRAFT_ERRORS = ["", "UnknownRecipe", "WrongStation", "MissingInputs", "MissingFuel", "InventoryFull", "InvalidCount"] as const;
+
+/** `recipes::craft` on a copy of the 216 inventory bytes: the inventory after, or the error
+ *  (named like the program's errors: `NoSpace` → `InventoryFull`). */
+export function simulateCraft(inv: Uint8Array, recipe: number, count: number, table: boolean, furnace: boolean): { ok: true; inv: Uint8Array } | { ok: false; error: string } {
+  need();
+  const r = pkg.craft(inv, recipe, count, table, furnace);
+  if (r[0] === 0) return { ok: true, inv: r.slice(1) };
+  return { ok: false, error: r[0] === 255 ? "BadInput" : CRAFT_ERRORS[r[0]] };
+}
+
+/** Largest craftable count (0..64) of `recipe` with this inventory and stations. */
+export function maxCrafts(inv: Uint8Array, recipe: number, table: boolean, furnace: boolean): number {
+  need();
+  return pkg.max_crafts(inv, recipe, table, furnace);
+}

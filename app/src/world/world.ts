@@ -173,7 +173,8 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
   const help = h(
     "p",
     { class: "fly-help" },
-    "Click to look around (Esc releases) · WASD move · Space jump / swim · Shift sprint" + (cam ? " · F debug fly camera (drag to look, Space up, C / Q down)" : ""),
+    "Click to capture the mouse (Esc releases) · WASD move · Space jump / swim · Shift sprint · Left mine / attack · Right place / eat · 1–9 or wheel hotbar · E inventory" +
+      (cam ? " · F debug fly camera" : ""),
   );
   const ui = h("div", { class: "world-ui" }, panel, help, toasts);
 

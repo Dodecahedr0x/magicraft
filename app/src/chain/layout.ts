@@ -384,6 +384,8 @@ export type PlayerStateAccount = {
 export const PSTATE_MOVE_OFFSET = 73;
 /** `PlayerState.health` offset (u8; 0 ⇔ dead). */
 export const PSTATE_HEALTH_OFFSET = 145;
+/** `PlayerState.inventory` offset (`core::inventory::Inventory`, 216 B). */
+export const PSTATE_INVENTORY_OFFSET = 149;
 
 export function decodePlayerState(d: Uint8Array): PlayerStateAccount {
   expectKind(d, "playerState", PSTATE_LEN);
@@ -396,7 +398,7 @@ export function decodePlayerState(d: Uint8Array): PlayerStateAccount {
     health: r.u8(PSTATE_HEALTH_OFFSET),
     food: r.u8(146),
     exhaustion: r.u16(147),
-    inventory: decodeInventory(d, 149),
+    inventory: decodeInventory(d, PSTATE_INVENTORY_OFFSET),
     heldSlot: r.u8(365),
     cx: r.i32(366),
     cz: r.i32(370),

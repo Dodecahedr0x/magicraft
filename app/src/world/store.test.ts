@@ -160,4 +160,40 @@ describe("ChunkStore", () => {
     await p;
     expect(store.ready(0, 0)).toBe(true);
   });
+
+  it("keeps optimistic edits over updates until cleared or reverted", async () => {
+    const f = fakeConn();
+    f.put(0, 0, chunkData((b) => (b[bi(15, 10, 3)] = 3)));
+    f.put(1, 0, chunkData());
+    const dirty: string[][] = [];
+    const store = new ChunkStore({ conn: f.conn, programId, world, radius: 1, debounceMs: 0, onDirty: (k) => dirty.push(k) });
+    await store.setCenter(0, 0);
+    store.flush();
+    dirty.length = 0;
+    // Break (15, 10, 3) locally: the border neighbor (1, 0) re-meshes too.
+    expect(store.setLocal(15, 10, 3, 0)).toBe(3);
+    expect(store.getBlock(15, 10, 3)).toBe(0);
+    expect(store.localEdits).toBe(1);
+    store.flush();
+    expect(dirty.flat().sort()).toEqual(["0,0", "1,0"]);
+    // An unrelated update (crank tick) still carries the old block: the overlay wins.
+    f.push(0, 0, chunkData((b) => (b[bi(15, 10, 3)] = 3)));
+    expect(store.getBlock(15, 10, 3)).toBe(0);
+    // Confirmed: overlay dropped; the chain's state arrives with the next update.
+    store.clearLocal(15, 10, 3);
+    expect(store.localEdits).toBe(0);
+    f.push(0, 0, chunkData());
+    expect(store.getBlock(15, 10, 3)).toBe(0);
+    // A failed place is reverted (and the chunk re-read).
+    expect(store.setLocal(4, 11, 4, 2)).toBe(0);
+    expect(store.getBlock(4, 11, 4)).toBe(2);
+    store.revertLocal(4, 11, 4, 0);
+    expect(store.getBlock(4, 11, 4)).toBe(0);
+    expect(store.localEdits).toBe(0);
+    await Promise.resolve();
+    expect(f.conn.getAccountInfo).toHaveBeenCalled();
+    // Unknown chunk: nothing written.
+    expect(store.setLocal(100, 10, 0, 0)).toBeNull();
+    store.dispose();
+  });
 });

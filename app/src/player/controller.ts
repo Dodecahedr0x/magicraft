@@ -51,6 +51,8 @@ export class PlayerController {
   pitch = -0.2;
   /** Input disabled (dead, not joined). */
   frozen = false;
+  /** Movement input disabled while a UI panel (inventory) is open. */
+  blocked = false;
   readonly keys = new Set<keyof Input>();
   private override: { input: Partial<Input>; until: number } | null = null;
   private drag: { x: number; y: number } | null = null;
@@ -128,7 +130,7 @@ export class PlayerController {
   }
 
   input(): Input {
-    if (this.frozen || this.o.isFlying?.()) return { ...NO_INPUT };
+    if (this.frozen || this.blocked || this.o.isFlying?.()) return { ...NO_INPUT };
     const inp: Input = { ...NO_INPUT };
     for (const k of this.keys) inp[k] = true;
     if (this.override) {
@@ -172,6 +174,8 @@ export class PlayerController {
 export type PlayerSession = {
   controller: PlayerController;
   sync: MoveSync;
+  /** Chain-time estimate (cooldowns, presence freshness). */
+  clock: ChainClock;
   /** PlayerState account data (initial fetch + notifications). */
   onPlayerState(data: Uint8Array): void;
   stop(): void;
@@ -287,6 +291,7 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
   return {
     controller,
     sync,
+    clock,
     onPlayerState: (data) => sync.onPlayerState(data),
     stop() {
       stopped = true;

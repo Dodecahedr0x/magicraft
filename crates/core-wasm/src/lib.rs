@@ -12,9 +12,12 @@
 //! Byte layouts are the core's: [`WorldParams`] (48 B, the `World.params` bytes) and
 //! [`MoveState`] (72 B, the `PlayerState.move_state` bytes).
 
-use magicraft_core::blocks::BLOCK_FLAGS;
+use magicraft_core::blocks::{self as blk, Block, BLOCK_FLAGS};
 use magicraft_core::consts::CHUNK_VOL;
+use magicraft_core::inventory::Inventory;
+use magicraft_core::items::{Item, Tier, ToolKind};
 use magicraft_core::physics::{self, ChunkQuad, MoveState, WorldParams};
+use magicraft_core::recipes::{self, Stations, MAX_CRAFT_COUNT, RECIPES};
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 
@@ -224,6 +227,138 @@ pub fn core_version() -> u32 {
     magicraft_core::version()
 }
 
+// ---------------------------------------------------------------- items / blocks / recipes
+// The interaction UI (Task 26) uses the core's own tables so mining progress, tool info and
+// recipe filtering match what `break_block` / `craft` will do.
+
+/// The tool of item id `item` (0 / unknown / non-tool = bare hand).
+fn tool_of(item: u16) -> Option<(ToolKind, Tier)> {
+    Item::from_u16(item).and_then(|it| it.tool())
+}
+
+/// `blocks::break_time_ms(block, tool of item)` in ms; 0 = not breakable (air, water,
+/// bedrock, unknown byte). `item` 0 = bare hand.
+#[wasm_bindgen]
+pub fn break_time_ms(block: u8, item: u16) -> u32 {
+    Block::from_u8(block)
+        .and_then(|b| blk::break_time_ms(b, tool_of(item)))
+        .unwrap_or(0)
+}
+
+/// `blocks::can_harvest(block, tool of item)` (false for unknown bytes).
+#[wasm_bindgen]
+pub fn can_harvest(block: u8, item: u16) -> bool {
+    Block::from_u8(block).is_some_and(|b| blk::can_harvest(b, tool_of(item)))
+}
+
+/// `blocks::drop_item(block)` as `[item, count]`, or empty if it drops nothing.
+#[wasm_bindgen]
+pub fn drop_item(block: u8) -> Vec<u16> {
+    Block::from_u8(block)
+        .and_then(blk::drop_item)
+        .map_or(vec![], |(it, n)| vec![it as u16, n as u16])
+}
+
+/// Every item id (`Item::ALL`).
+#[wasm_bindgen]
+pub fn item_ids() -> Vec<u16> {
+    Item::ALL.iter().map(|&it| it as u16).collect()
+}
+
+/// Properties of item `id`: `[block (−1 = not placeable), tool kind (−1 none; 0 pickaxe,
+/// 1 axe, 2 shovel, 3 sword), tier (0 none, 1..=4), attack damage (1 = fist for
+/// non-tools), max stack, max durability, food value (−1 not edible)]`; empty if unknown.
+#[wasm_bindgen]
+pub fn item_info(id: u16) -> Vec<i32> {
+    let Some(it) = Item::from_u16(id) else {
+        return vec![];
+    };
+    let (kind, tier, dmg) = it.tool_info().map_or((-1, 0, 1), |(k, t, d)| {
+        let k = match k {
+            ToolKind::Pickaxe => 0,
+            ToolKind::Axe => 1,
+            ToolKind::Shovel => 2,
+            ToolKind::Sword => 3,
+        };
+        (k, t as i32, d as i32)
+    });
+    vec![
+        it.as_block().map_or(-1, |b| b as i32),
+        kind,
+        tier,
+        dmg,
+        it.max_stack() as i32,
+        it.max_durability() as i32,
+        it.food_value().map_or(-1, |v| v as i32),
+    ]
+}
+
+/// `recipes::RECIPES` flattened, in id order: per recipe `[n_inputs, (item, amount) ×
+/// n_inputs, output item, output amount, station (0 none, 1 table, 2 furnace), fuel]`.
+#[wasm_bindgen]
+pub fn recipe_table() -> Vec<u16> {
+    let mut out = Vec::new();
+    for r in RECIPES {
+        out.push(r.inputs.len() as u16);
+        for &(it, k) in r.inputs {
+            out.push(it as u16);
+            out.push(k as u16);
+        }
+        out.push(r.output.0 as u16);
+        out.push(r.output.1 as u16);
+        out.push(r.station as u16);
+        out.push(r.fuel as u16);
+    }
+    out
+}
+
+fn inventory_of(b: &[u8]) -> Option<Inventory> {
+    Some(Inventory::from_bytes(b.try_into().ok()?))
+}
+
+/// `recipes::craft` on a copy of `inv` (216 B, the `PlayerState` inventory bytes):
+/// `[code, inventory after (216 B)]`; code 0 = ok, `1 + CraftError` discriminant
+/// (1 UnknownRecipe, 2 WrongStation, 3 MissingInputs, 4 MissingFuel, 5 NoSpace,
+/// 6 InvalidCount) or [`BAD_INPUT`] (then no inventory follows).
+#[wasm_bindgen]
+pub fn craft(inv: &[u8], recipe_id: u16, count: u8, table: bool, furnace: bool) -> Vec<u8> {
+    let Some(mut inv) = inventory_of(inv) else {
+        return vec![BAD_INPUT];
+    };
+    let near = Stations { table, furnace };
+    let code = match recipes::craft(&mut inv, recipe_id, count, near) {
+        Ok(()) => 0,
+        Err(e) => 1 + e as u8,
+    };
+    let mut out = vec![code];
+    out.extend_from_slice(&inv.to_bytes());
+    out
+}
+
+/// The largest `count` (0..=[`MAX_CRAFT_COUNT`]) for which [`craft`] succeeds (a craft that
+/// works for `n` works for every smaller `n`: inputs, fuel and output space all scale).
+#[wasm_bindgen]
+pub fn max_crafts(inv: &[u8], recipe_id: u16, table: bool, furnace: bool) -> u8 {
+    let Some(inv) = inventory_of(inv) else {
+        return 0;
+    };
+    let near = Stations { table, furnace };
+    let ok = |n: u8| {
+        let mut tmp = inv;
+        recipes::craft(&mut tmp, recipe_id, n, near).is_ok()
+    };
+    let (mut lo, mut hi) = (0u8, MAX_CRAFT_COUNT);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if ok(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +498,50 @@ mod tests {
         );
         assert_eq!(block_flags()[Block::Stone as usize] & 1, 1);
         assert_eq!(block_flags()[Block::WaterSource as usize] & 4, 4);
+    }
+
+    #[test]
+    fn items_blocks_recipes() {
+        let wood_pick = Item::WoodPickaxe as u16;
+        assert_eq!(break_time_ms(Block::Stone as u8, 0), 7500);
+        assert_eq!(break_time_ms(Block::Stone as u8, wood_pick), 3750);
+        assert_eq!(break_time_ms(Block::Stone as u8, Item::Dirt as u16), 7500);
+        assert_eq!(break_time_ms(Block::Bedrock as u8, wood_pick), 0);
+        assert_eq!(break_time_ms(Block::Air as u8, 0), 0);
+        assert_eq!(break_time_ms(200, 0), 0);
+        assert!(!can_harvest(Block::Stone as u8, 0));
+        assert!(can_harvest(Block::Stone as u8, wood_pick));
+        assert_eq!(
+            drop_item(Block::Stone as u8),
+            vec![Item::Cobblestone as u16, 1]
+        );
+        assert!(drop_item(Block::Leaves as u8).is_empty());
+        assert_eq!(item_ids().len(), Item::ALL.len());
+        assert_eq!(item_info(wood_pick), vec![-1, 0, 1, 2, 1, 59, -1]);
+        assert_eq!(
+            item_info(Item::Planks as u16),
+            vec![11, -1, 0, 1, 64, 0, -1]
+        );
+        assert_eq!(item_info(Item::CookedBeef as u16)[6], 8);
+        assert!(item_info(8).is_empty());
+        let t = recipe_table();
+        // Recipe 0: 1 input (log × 1) → planks × 4, no station, no fuel.
+        assert_eq!(
+            &t[..7],
+            &[1, Item::Log as u16, 1, Item::Planks as u16, 4, 0, 0]
+        );
+
+        let mut inv = Inventory::new();
+        inv.add(Item::Log, 3);
+        let b = inv.to_bytes();
+        assert_eq!(max_crafts(&b, 0, false, false), 3);
+        assert_eq!(max_crafts(&b, 5, true, false), 0);
+        let r = craft(&b, 0, 2, false, false);
+        assert_eq!(r[0], 0);
+        let after = Inventory::from_bytes(r[1..].try_into().unwrap());
+        assert_eq!(after.count(Item::Planks), 8);
+        assert_eq!(craft(&b, 0, 4, false, false)[0], 3); // MissingInputs
+        assert_eq!(craft(&b, 3, 1, false, false)[0], 2); // furnace needs a table
+        assert_eq!(craft(&b[1..], 0, 1, false, false), vec![BAD_INPUT]);
     }
 }
