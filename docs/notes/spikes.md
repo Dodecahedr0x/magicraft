@@ -449,3 +449,26 @@ fallback needed. A base-layer request would need a wallet payer and costs 0.0005
   (see `SESSION_ERRORS` in `tests/helpers/session.ts`).
 - Session client helpers (`createSessionIx`, `revokeSessionIx`, `sessionTokenPda`, program ids) live in
   `tests/helpers/session.ts`; port them to the web client.
+
+## 2026-10-09: Ephemeral chunk PDA as crank authority (Task 6 follow-up)
+
+Spike commit `d6dfb8a` (`spike: ephemeral chunk PDA as crank authority`; code and test removed in
+the next commit). Ixs: `spike_chunk` (64-byte ephemeral chunk sponsored by the Player),
+`spike_tick`, `spike_chunk_schedule(owner, cx, cz, task_id, interval_ms, iterations)` and
+`spike_chunk_cancel(owner, cx, cz, task_id)`. The latter two take **any** signer as `caller`; the
+`ScheduleTask`/`CancelTask` CPI has the chunk PDA as account 0 (writable, signer via
+`invoke_signed` with the chunk seeds). Test: `tests/02-spike-chunk-authority.spec.ts` (3 tests, all
+passing).
+
+| Question | Answer (tested) |
+|---|---|
+| Can an ephemeral, **non-delegated** program PDA with **0 lamports** (the chunk: 64 B, 0 lamports, owner magicraft) be task authority? | **Yes.** `Scheduled task request` logged; 100 ms × 10 → counter exactly 10 within ~1 s and stays 10. Schedule CPI ix: 10.6k CU. |
+| Can it later **replace** its task, with the CPI triggered by a different caller? | **Yes.** Task 100 ms × 1000 armed by the owner's wallet; a fresh 0-lamport keypair re-scheduled the same id × 2 → exactly 2 more ticks. The authority is the chunk PDA, not the caller, so re-arming is permissionless. |
+| Can it **cancel**, triggered by a different caller? | **Yes.** 100 ms × 1000, cancelled by the stranger after 500 ms → counter frozen. |
+
+### Decision
+
+Chunk tick crank authority = the **Chunk PDA** itself; day crank authority = the **World PDA**
+(same kind of account: ephemeral, program-owned, non-delegated). Neither needs a delegated
+`Player` in the arming tx, so any player's move/edit (or the watchdog) can re-arm a chunk crank.
+The fallback (a program-wide `["crank"]` PDA delegated once) is not needed.
