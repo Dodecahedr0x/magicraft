@@ -6,6 +6,7 @@ pub mod coords;
 pub mod hash;
 pub mod items;
 pub mod noise;
+pub mod terrain;
 
 /// Version of the core game rules.
 pub fn version() -> u32 {
