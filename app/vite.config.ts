@@ -38,5 +38,7 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/**/*.test.ts"],
+    // The core wasm (src/wasm/pkg) is loaded from the file in Node.
+    setupFiles: ["src/wasm/setup.node.ts"],
   },
 });

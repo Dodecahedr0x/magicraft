@@ -25,6 +25,7 @@ Recorded 2026-10-09 when scaffolding the workspace (Task 1). `anchor build` and
 | bytemuck | `1`, features `derive`, `min_const_generics` (Task 15) | 1.25.2 (+ bytemuck_derive 1.12.1; both were already in the lock via Solana crates, so adding it changed only the magicraft dependency list) |
 | solana-sha256-hasher | `3.1` (Task 16: crank task ids, VRF caller seed) | 3.1.0 (already in the lock via Anchor's Solana crates; only the dependency list changed) |
 | magicraft-core | path `crates/core` | 0.1.0 |
+| wasm-bindgen (`crates/core-wasm` only, Task 25) | `=0.2.129` | 0.2.129 (already in the lock via Solana crates; adding it changed only the new package's entry) |
 
 ## npm
 
@@ -64,3 +65,12 @@ Recorded 2026-10-09 when scaffolding the workspace (Task 1). `anchor build` and
   pushed terrain stage 1 past the 1.4M CU limit (≈ 2.5× slower). Debug/test builds keep the checks;
   the program crate keeps them in release. **Any other build of `magicraft-core` that must match
   onchain results (e.g. the wasm client) must use the same profile setting** (see the crate docs).
+- **Client wasm build of the core (Task 25).** `crates/core-wasm` (wasm-bindgen wrapper:
+  `check_move`, `move_window`, `block_flags`, …) is built by `pnpm -C app build:wasm`
+  (`app/scripts/build-wasm.sh`: wasm-pack 0.15.0, `--release --target web --mode no-install`,
+  offline when wasm-pack's cache holds the wasm-bindgen 0.2.129 CLI + binaryen; `wasm-opt -O`)
+  into `app/src/wasm/pkg/` (**committed**: dev, test and build need no Rust toolchain; rebuild
+  after changing `crates/core` physics/blocks). The release profile builds both
+  `magicraft-core` and `magicraft-core-wasm` with `overflow-checks = false` (root
+  `Cargo.toml`), like the program. `core_bg.wasm` ≈ 20 KB (≈ 10 KB gzip). The wasm-bindgen
+  crate and CLI versions must match exactly; bump both together.

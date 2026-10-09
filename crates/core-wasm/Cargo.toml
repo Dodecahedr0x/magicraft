@@ -1,0 +1,19 @@
+[package]
+name = "magicraft-core-wasm"
+version = "0.1.0"
+description = "wasm-bindgen wrapper of magicraft-core for the browser client (move pre-validation)"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+magicraft-core = { path = "../core" }
+# Pinned to the version already in Cargo.lock (and the wasm-bindgen CLI wasm-pack uses):
+# the CLI and the crate must match exactly.
+wasm-bindgen = "=0.2.129"
+
+[package.metadata.wasm-pack.profile.release]
+# wasm-pack's cached binaryen (no download needed when cached).
+wasm-opt = ["-O"]

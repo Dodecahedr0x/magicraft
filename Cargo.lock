@@ -1301,6 +1301,14 @@ name = "magicraft-core"
 version = "0.1.0"
 
 [[package]]
+name = "magicraft-core-wasm"
+version = "0.1.0"
+dependencies = [
+ "magicraft-core",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
