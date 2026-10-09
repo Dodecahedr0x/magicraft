@@ -111,48 +111,45 @@ pub fn fbm_2d(seed: &Seed, x: i32, z: i32, octaves: u32, base_cell_log2: u32, sa
     (sum / ((1i64 << octaves) - 1)) as i32
 }
 
-/// Number of lattice cells a 16-wide axis can touch (16 cells + the `+1` corner).
+/// Number of lattice corners a 16-wide axis can touch (16 cells + the `+1` corner).
 const MAX_CORNERS: usize = 17;
 
-/// Per-axis precompute for one octave: lattice-row offset of each column and its weight.
+/// Per-axis precompute for one octave: lattice-row offset of each sample and its weight.
 #[inline(always)]
-fn axis(o: i32, k: u32) -> (i32, [u8; 16], [i64; 16], usize) {
+fn axis<const N: usize>(o: i32, k: u32) -> (i32, [u8; N], [i64; N], usize) {
     let mask = (1u32 << k) - 1;
     let i0 = o >> k;
-    let mut idx = [0u8; 16];
-    let mut w = [0i64; 16];
-    for l in 0..16 {
+    let mut idx = [0u8; N];
+    let mut w = [0i64; N];
+    for l in 0..N {
         let x = o + l as i32;
         idx[l] = ((x >> k) - i0) as u8;
         w[l] = smooth(frac(x as u32 & mask, k));
     }
     // Corners spanned: last cell offset + 1 (for the `+1` corner) + 1.
-    (i0, idx, w, idx[15] as usize + 2)
+    (i0, idx, w, idx[N - 1] as usize + 2)
 }
 
-/// [`fbm_2d`] for a whole 16×16 chunk column grid: `out[lz * 16 + lx] =
-/// fbm_2d(seed, ox + lx, oz + lz, ...)` exactly.
+/// Shared body of [`fbm_chunk`] / [`fbm_grid9`]: `out[lz * N + lx] = fbm_2d(ox + lx, oz + lz)`.
 ///
-/// `(ox, oz)` is the chunk's world origin. Per octave it hashes each lattice corner touched
-/// once (≤ 9 for cells ≥ 16, ≤ 289 for cell 1) and precomputes the 16 smoothstep weights
-/// per axis, so each column costs only 3 lerps + accumulate (~20 ops) per octave instead of
-/// ~90. No heap; ~1.2 KiB of stack for the corner table.
-///
-/// If `ox` or `oz` exceeds `i32::MAX - 15` (not a chunk origin; the column range would
-/// wrap) it falls back to per-column [`fbm_2d`].
-pub fn fbm_chunk(
+/// Stack: corner table 17×17×4 = 1156 B + two axis tables 2×(N + 8N) B ≈ 1.5 KB at N = 16.
+#[inline(always)]
+fn fbm_grid<const N: usize>(
     seed: &Seed,
     ox: i32,
     oz: i32,
     octaves: u32,
     base_cell_log2: u32,
     salt: u32,
-    out: &mut [i32; 256],
+    out: &mut [i32],
 ) {
-    if ox > i32::MAX - 15 || oz > i32::MAX - 15 {
-        for lz in 0..16 {
-            for lx in 0..16 {
-                out[lz * 16 + lx] = fbm_2d(
+    const { assert!(N >= 1 && N < MAX_CORNERS) };
+    let out = &mut out[..N * N];
+    let last = N as i32 - 1;
+    if ox > i32::MAX - last || oz > i32::MAX - last {
+        for lz in 0..N {
+            for lx in 0..N {
+                out[lz * N + lx] = fbm_2d(
                     seed,
                     ox.wrapping_add(lx as i32),
                     oz.wrapping_add(lz as i32),
@@ -165,13 +162,13 @@ pub fn fbm_chunk(
         return;
     }
     let octaves = octaves.clamp(1, 16);
-    *out = [0; 256];
+    out.fill(0);
     let mut corners = [[0i32; MAX_CORNERS]; MAX_CORNERS]; // [z][x]
     for i in 0..octaves {
         let k = base_cell_log2.saturating_sub(i).min(MAX_CELL_LOG2);
         let s = salt.wrapping_add(i.wrapping_mul(0x9E37_79B9));
-        let (ix0, xi, xw, nx) = axis(ox, k);
-        let (iz0, zi, zw, nz) = axis(oz, k);
+        let (ix0, xi, xw, nx) = axis::<N>(ox, k);
+        let (iz0, zi, zw, nz) = axis::<N>(oz, k);
         for (cz, row) in corners.iter_mut().enumerate().take(nz) {
             let iz = iz0.wrapping_add(cz as i32);
             for (cx, c) in row.iter_mut().enumerate().take(nx) {
@@ -179,13 +176,13 @@ pub fn fbm_chunk(
             }
         }
         let shift = octaves - 1 - i;
-        for lz in 0..16 {
+        for lz in 0..N {
             let (r0, r1) = (&corners[zi[lz] as usize], &corners[zi[lz] as usize + 1]);
             let sz = zw[lz];
-            for lx in 0..16 {
+            for lx in 0..N {
                 let (a, sx) = (xi[lx] as usize, xw[lx]);
                 let v = lerp(lerp(r0[a], r0[a + 1], sx), lerp(r1[a], r1[a + 1], sx), sz);
-                out[lz * 16 + lx] += v << shift;
+                out[lz * N + lx] += v << shift;
             }
         }
     }
@@ -193,6 +190,44 @@ pub fn fbm_chunk(
     for v in out.iter_mut() {
         *v /= total;
     }
+}
+
+/// [`fbm_2d`] for a whole 16×16 chunk column grid: `out[lz * 16 + lx] =
+/// fbm_2d(seed, ox + lx, oz + lz, ...)` exactly.
+///
+/// `(ox, oz)` is the chunk's world origin. Per octave it hashes each lattice corner touched
+/// once (≤ 9 for cells ≥ 16, ≤ 289 for cell 1) and precomputes the 16 smoothstep weights
+/// per axis, so each column costs only 3 lerps + accumulate (~20 ops) per octave instead of
+/// ~90. No heap; SBF frame ≈ 1.5 KB (corner table 1156 B + axis tables).
+///
+/// If `ox` or `oz` exceeds `i32::MAX - 15` (not a chunk origin; the column range would
+/// wrap) it falls back to per-column [`fbm_2d`].
+#[inline(never)]
+pub fn fbm_chunk(
+    seed: &Seed,
+    ox: i32,
+    oz: i32,
+    octaves: u32,
+    base_cell_log2: u32,
+    salt: u32,
+    out: &mut [i32; 256],
+) {
+    fbm_grid::<16>(seed, ox, oz, octaves, base_cell_log2, salt, out);
+}
+
+/// [`fbm_chunk`] for a 9×9 grid: `out[j * 9 + i] = fbm_2d(seed, ox + i, oz + j, ...)` exactly.
+/// Used for the terrain biome lattice. SBF frame ≈ 1.3 KB.
+#[inline(never)]
+pub fn fbm_grid9(
+    seed: &Seed,
+    ox: i32,
+    oz: i32,
+    octaves: u32,
+    base_cell_log2: u32,
+    salt: u32,
+    out: &mut [i32; 81],
+) {
+    fbm_grid::<9>(seed, ox, oz, octaves, base_cell_log2, salt, out);
 }
 
 #[cfg(test)]
@@ -350,6 +385,29 @@ mod tests {
                     let x = ox.wrapping_add(lx as i32);
                     let z = oz.wrapping_add(lz as i32);
                     assert_eq!(out[lz * 16 + lx], fbm_2d(&s, x, z, 3, 5, 1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fbm_grid9_matches_fbm_2d() {
+        let s = seed(14);
+        let mut out = [0i32; 81];
+        for &(ox, oz) in &[
+            (0, 0),
+            (-2, -2),
+            (-402, 158),
+            (i32::MAX - 8, -7),
+            (i32::MAX - 3, 5),
+        ] {
+            for (oct, k) in [(2u32, 6u32), (2, 5), (3, 2), (1, 0)] {
+                fbm_grid9(&s, ox, oz, oct, k, 9, &mut out);
+                for j in 0..9 {
+                    for i in 0..9 {
+                        let (x, z) = (ox.wrapping_add(i), oz.wrapping_add(j));
+                        assert_eq!(out[(j * 9 + i) as usize], fbm_2d(&s, x, z, oct, k, 9));
+                    }
                 }
             }
         }
