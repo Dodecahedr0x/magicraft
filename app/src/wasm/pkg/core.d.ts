@@ -24,6 +24,17 @@ export function block_flags(): Uint8Array;
 export function check_move(params: Uint8Array, prev: Uint8Array, pos: Int32Array, vel: Int32Array, on_ground: boolean, client_ms: number, chain_ms: number, cx0: number, cz0: number, quad: Uint8Array, mask: number): Uint8Array;
 
 /**
+ * [`check_move`] against the stored window (see [`set_quad_slot`]); `mask` bit `i` =
+ * slot `i` holds a chunk.
+ */
+export function check_move_stored(params: Uint8Array, prev: Uint8Array, pos: Int32Array, vel: Int32Array, on_ground: boolean, client_ms: number, chain_ms: number, cx0: number, cz0: number, mask: number): Uint8Array;
+
+/**
+ * FNV-1a 64 (hex) of the core + wrapper sources this build was made from (`build.rs`).
+ */
+export function core_src_hash(): string;
+
+/**
  * Rules version of the core this build wraps (`magicraft_core::version`).
  */
 export function core_version(): number;
@@ -37,6 +48,17 @@ export function default_params(): Uint8Array;
  * `physics::move_window(a, b)` → `[cx0, cz0]`, or empty if the move spans more chunks.
  */
 export function move_window(a: Int32Array, b: Int32Array): Int32Array;
+
+/**
+ * Physics constants the client mirrors: `[HALF_W, FEET_EPS, BODY_H, GROUND_HALF_W,
+ * GROUND_EPS, LEAD_MS, LAG_MS]`.
+ */
+export function physics_constants(): Int32Array;
+
+/**
+ * Copies `blocks` (16 384 B) into slot `i` (0..4) of the stored window; false on bad input.
+ */
+export function set_quad_slot(i: number, blocks: Uint8Array): boolean;
 
 /**
  * `MoveState::spawn(pos, now_ms)` bytes (72 B), optionally on ground.
@@ -55,9 +77,13 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly block_flags: () => [number, number];
     readonly check_move: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => [number, number];
+    readonly check_move_stored: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => [number, number];
+    readonly core_src_hash: () => [number, number];
     readonly core_version: () => number;
     readonly default_params: () => [number, number];
     readonly move_window: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly physics_constants: () => [number, number];
+    readonly set_quad_slot: (a: number, b: number, c: number) => number;
     readonly spawn_state: (a: number, b: number, c: number, d: number) => [number, number];
     readonly validate_params: (a: number, b: number) => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;

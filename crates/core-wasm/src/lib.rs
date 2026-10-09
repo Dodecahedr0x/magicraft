@@ -15,6 +15,7 @@
 use magicraft_core::blocks::BLOCK_FLAGS;
 use magicraft_core::consts::CHUNK_VOL;
 use magicraft_core::physics::{self, ChunkQuad, MoveState, WorldParams};
+use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 
 /// [`check_move`] result code: accepted.
@@ -102,6 +103,76 @@ pub fn check_move(
         Err(e) => out[0] = 1 + e as u8,
     }
     out
+}
+
+thread_local! {
+    /// Persistent 2×2 window for [`check_move_stored`] (filled by [`set_quad_slot`]), so a
+    /// caller trying many candidate positions in one window uploads the chunks once.
+    static QUAD: RefCell<Vec<u8>> = RefCell::new(vec![0u8; 4 * CHUNK_VOL]);
+}
+
+/// Copies `blocks` (16 384 B) into slot `i` (0..4) of the stored window; false on bad input.
+#[wasm_bindgen]
+pub fn set_quad_slot(i: usize, blocks: &[u8]) -> bool {
+    if i >= 4 || blocks.len() != CHUNK_VOL {
+        return false;
+    }
+    QUAD.with(|q| q.borrow_mut()[i * CHUNK_VOL..(i + 1) * CHUNK_VOL].copy_from_slice(blocks));
+    true
+}
+
+/// [`check_move`] against the stored window (see [`set_quad_slot`]); `mask` bit `i` =
+/// slot `i` holds a chunk.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn check_move_stored(
+    params: &[u8],
+    prev: &[u8],
+    pos: &[i32],
+    vel: &[i32],
+    on_ground: bool,
+    client_ms: f64,
+    chain_ms: f64,
+    cx0: i32,
+    cz0: i32,
+    mask: u8,
+) -> Vec<u8> {
+    QUAD.with(|q| {
+        check_move(
+            params,
+            prev,
+            pos,
+            vel,
+            on_ground,
+            client_ms,
+            chain_ms,
+            cx0,
+            cz0,
+            &q.borrow(),
+            mask,
+        )
+    })
+}
+
+/// FNV-1a 64 (hex) of the core + wrapper sources this build was made from (`build.rs`).
+#[wasm_bindgen]
+pub fn core_src_hash() -> String {
+    env!("CORE_SRC_HASH").to_string()
+}
+
+/// Physics constants the client mirrors: `[HALF_W, FEET_EPS, BODY_H, GROUND_HALF_W,
+/// GROUND_EPS, LEAD_MS, LAG_MS]`.
+#[wasm_bindgen]
+pub fn physics_constants() -> Vec<i32> {
+    vec![
+        physics::HALF_W,
+        physics::FEET_EPS,
+        physics::BODY_H,
+        physics::GROUND_HALF_W,
+        physics::GROUND_EPS,
+        physics::LEAD_MS as i32,
+        physics::LAG_MS as i32,
+    ]
 }
 
 /// `physics::move_window(a, b)` → `[cx0, cz0]`, or empty if the move spans more chunks.
@@ -263,6 +334,23 @@ mod tests {
             )[0],
             BAD_INPUT
         );
+    }
+
+    #[test]
+    fn stored_quad_matches() {
+        let p = default_params();
+        let prev = spawn_state(&HOME, 1000.0, true);
+        let q = flat();
+        for i in 0..4 {
+            assert!(set_quad_slot(i, &q[i * CHUNK_VOL..(i + 1) * CHUNK_VOL]));
+        }
+        assert!(!set_quad_slot(4, &q[..CHUNK_VOL]));
+        let pos = [HOME[0] + 100, HOME[1], HOME[2]];
+        let a = check_move(&p, &prev, &pos, &[0; 3], true, 1125.0, 1125.0, 0, 0, &q, 15);
+        let b = check_move_stored(&p, &prev, &pos, &[0; 3], true, 1125.0, 1125.0, 0, 0, 15);
+        assert_eq!(a, b);
+        assert_eq!(core_src_hash().len(), 16);
+        assert_eq!(physics_constants()[3], 78);
     }
 
     #[test]

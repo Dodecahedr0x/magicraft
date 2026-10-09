@@ -72,5 +72,8 @@ Recorded 2026-10-09 when scaffolding the workspace (Task 1). `anchor build` and
   into `app/src/wasm/pkg/` (**committed**: dev, test and build need no Rust toolchain; rebuild
   after changing `crates/core` physics/blocks). The release profile builds both
   `magicraft-core` and `magicraft-core-wasm` with `overflow-checks = false` (root
-  `Cargo.toml`), like the program. `core_bg.wasm` ≈ 20 KB (≈ 10 KB gzip). The wasm-bindgen
-  crate and CLI versions must match exactly; bump both together.
+  `Cargo.toml`), like the program. `core_bg.wasm` ≈ 24 KB (≈ 11 KB gzip). The wasm-bindgen
+  crate and CLI versions must match exactly; bump both together. Staleness guard:
+  `crates/core-wasm/build.rs` hashes `crates/core/Cargo.toml`, `crates/core/src/**` and
+  `crates/core-wasm/src/**` (FNV-1a 64, sorted paths) into `core_src_hash()`;
+  `app/src/wasm/hash.test.ts` recomputes it and fails with "run `pnpm -C app build:wasm`".

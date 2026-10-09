@@ -56,6 +56,53 @@ export function check_move(params, prev, pos, vel, on_ground, client_ms, chain_m
 }
 
 /**
+ * [`check_move`] against the stored window (see [`set_quad_slot`]); `mask` bit `i` =
+ * slot `i` holds a chunk.
+ * @param {Uint8Array} params
+ * @param {Uint8Array} prev
+ * @param {Int32Array} pos
+ * @param {Int32Array} vel
+ * @param {boolean} on_ground
+ * @param {number} client_ms
+ * @param {number} chain_ms
+ * @param {number} cx0
+ * @param {number} cz0
+ * @param {number} mask
+ * @returns {Uint8Array}
+ */
+export function check_move_stored(params, prev, pos, vel, on_ground, client_ms, chain_ms, cx0, cz0, mask) {
+    const ptr0 = passArray8ToWasm0(params, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(prev, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArray32ToWasm0(pos, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passArray32ToWasm0(vel, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.check_move_stored(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, on_ground, client_ms, chain_ms, cx0, cz0, mask);
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * FNV-1a 64 (hex) of the core + wrapper sources this build was made from (`build.rs`).
+ * @returns {string}
+ */
+export function core_src_hash() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const ret = wasm.core_src_hash();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Rules version of the core this build wraps (`magicraft_core::version`).
  * @returns {number}
  */
@@ -90,6 +137,31 @@ export function move_window(a, b) {
     var v3 = getArrayI32FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
     return v3;
+}
+
+/**
+ * Physics constants the client mirrors: `[HALF_W, FEET_EPS, BODY_H, GROUND_HALF_W,
+ * GROUND_EPS, LEAD_MS, LAG_MS]`.
+ * @returns {Int32Array}
+ */
+export function physics_constants() {
+    const ret = wasm.physics_constants();
+    var v1 = getArrayI32FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+    return v1;
+}
+
+/**
+ * Copies `blocks` (16 384 B) into slot `i` (0..4) of the stored window; false on bad input.
+ * @param {number} i
+ * @param {Uint8Array} blocks
+ * @returns {boolean}
+ */
+export function set_quad_slot(i, blocks) {
+    const ptr0 = passArray8ToWasm0(blocks, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.set_quad_slot(i, ptr0, len0);
+    return ret !== 0;
 }
 
 /**
@@ -157,6 +229,10 @@ function getInt32ArrayMemory0() {
     return cachedInt32ArrayMemory0;
 }
 
+function getStringFromWasm0(ptr, len) {
+    return decodeText(ptr >>> 0, len);
+}
+
 let cachedUint32ArrayMemory0 = null;
 function getUint32ArrayMemory0() {
     if (cachedUint32ArrayMemory0 === null || cachedUint32ArrayMemory0.byteLength === 0) {
@@ -185,6 +261,20 @@ function passArray8ToWasm0(arg, malloc) {
     getUint8ArrayMemory0().set(arg, ptr / 1);
     WASM_VECTOR_LEN = arg.length;
     return ptr;
+}
+
+let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
+cachedTextDecoder.decode();
+const MAX_SAFARI_DECODE_BYTES = 2146435072;
+let numBytesDecoded = 0;
+function decodeText(ptr, len) {
+    numBytesDecoded += len;
+    if (numBytesDecoded >= MAX_SAFARI_DECODE_BYTES) {
+        cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
+        cachedTextDecoder.decode();
+        numBytesDecoded = len;
+    }
+    return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
 }
 
 let WASM_VECTOR_LEN = 0;

@@ -43,9 +43,21 @@ export type CheckResult =
  *  `(cx0,cz0+1)`, `(cx0+1,cz0+1)`; a null slot reads as Stone (not passed to the program). */
 export type Quad = { cx0: number; cz0: number; slots: (Uint8Array | null)[] };
 
-const quadBuf = new Uint8Array(4 * CHUNK_BYTES);
+/** What the wasm-side window holds (slot arrays by identity), or null = unknown. */
+let uploaded: { cx0: number; cz0: number; slots: (Uint8Array | null)[] } | null = null;
+let uploads = 0;
 
-/** `physics::check_move` (exactly the program's). Times in chain ms. */
+/** Forgets the uploaded window (call when chunk bytes may have changed in place; the sync
+ *  layer calls it once per decision). */
+export function invalidateQuad() {
+  uploaded = null;
+}
+
+/** Number of chunk uploads to wasm so far (stats / tests). */
+export const quadUploads = () => uploads;
+
+/** `physics::check_move` (exactly the program's). Times in chain ms. The window's chunks
+ *  are copied into wasm memory only when they differ (by identity) from the last call's. */
 export function checkMove(
   params: Uint8Array,
   prev: Uint8Array,
@@ -58,12 +70,16 @@ export function checkMove(
 ): CheckResult {
   need();
   let mask = 0;
+  const same = uploaded && uploaded.cx0 === quad.cx0 && uploaded.cz0 === quad.cz0;
   quad.slots.forEach((s, i) => {
     if (!s) return;
-    quadBuf.set(s, i * CHUNK_BYTES);
     mask |= 1 << i;
+    if (same && uploaded!.slots[i] === s) return;
+    if (!pkg.set_quad_slot(i, s)) throw new Error("bad chunk length");
+    uploads++;
   });
-  const r = pkg.check_move(
+  uploaded = { cx0: quad.cx0, cz0: quad.cz0, slots: [...quad.slots] };
+  const r = pkg.check_move_stored(
     params,
     prev,
     Int32Array.from(pos),
@@ -73,12 +89,17 @@ export function checkMove(
     Math.floor(chainMs),
     quad.cx0,
     quad.cz0,
-    quadBuf,
     mask,
   );
   if (r[0] === 0) return { ok: true, fallDamage: r[1], state: r.slice(2) };
   return { ok: false, error: r[0] === 255 ? "BadInput" : (MOVE_ERRORS[r[0]] as MoveErrorName) };
 }
+
+/** FNV-1a 64 of the sources the wasm was built from (see crates/core-wasm/build.rs). */
+export const coreSrcHash = () => (need(), pkg.core_src_hash());
+
+/** `[HALF_W, FEET_EPS, BODY_H, GROUND_HALF_W, GROUND_EPS, LEAD_MS, LAG_MS]` of `physics`. */
+export const physicsConstants = () => (need(), [...pkg.physics_constants()]);
 
 /** `physics::move_window(a, b)` (FP positions), or null if it spans more than 2×2 chunks. */
 export function coreMoveWindow(a: readonly number[], b: readonly number[]): [number, number] | null {
