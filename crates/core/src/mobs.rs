@@ -11,20 +11,40 @@
 //! of the feet (x/z = body center, y = bottom of the feet block, always a multiple of
 //! [`FP`] after a step).
 //!
-//! # Crank contract (implemented by the program)
-//! Per tick, for each non-empty slot of the center chunk: build a [`MobCtx`] (`cx, cz` =
-//! the center chunk, `targets` = **fresh** presence entries (`last_seen` ≤ ~5 s old) of
-//! the center + N/S/E/W presences, `enter_mask` = bit `NORTH/SOUTH/EAST/WEST` set for each
-//! neighbor that exists **and has a free slot**), call [`step_mob`], then:
-//! - `ev.hit = Some(h)` → `presence[h.chunk].entries[h.idx].pending_damage += h.dmg`
-//!   (saturating);
-//! - `ev.cross != (0, 0)` → move the 32 bytes into a free slot of that neighbor and clear
-//!   the source slot (positions are world coordinates, nothing to convert);
-//! - `ev.died` → the slot was already cleared.
+//! # Program duties (implemented by the program, not here)
+//! **`tick_chunk`** (accounts: world, center chunk + presence, N/S/E/W chunks + presences;
+//! all chunks and presences must be passed **writable**, placeholders included, since a
+//! mob may cross into any neighbor and hits go to any presence). Per tick, with
+//! `tick = chain_ms / mob_tick_ms` (a **global** clock, the same for every chunk in the
+//! same period — see [`Mob::last_tick`]), for each non-empty slot of the center chunk:
+//! 1. Build a [`MobCtx`]: `cx, cz` = center; `targets` = **fresh** presence entries
+//!    (`last_seen` ≤ ~5 s old) of the center + N/S/E/W presences, `pos` = the entry's
+//!    world FP feet position, `chunk`/`idx` = which presence and entry; `enter_mask` = bit
+//!    `NORTH/SOUTH/EAST/WEST` set for each neighbor that exists **and has a free slot**,
+//!    **recomputed before every mob** (an earlier crossing this tick may have filled the
+//!    last free slot).
+//! 2. Call [`step_mob`], then:
+//!    - `ev.hit = Some(h)` → `presence[h.chunk].entries[h.idx].pending_damage += h.dmg`
+//!      (saturating);
+//!    - `ev.cross != (0, 0)` → copy the 32 bytes into the free slot of that neighbor that
+//!      `enter_mask` promised, then clear the source slot (positions are world
+//!      coordinates, nothing to convert). Only cross into a slot reserved this way: there
+//!      is no "undo", so a failed copy would silently despawn the mob;
+//!    - `ev.died` → the slot was already cleared.
+//! 3. Then one [`try_spawn_zombie`] call with the **center chunk's** slots (zombie count
+//!    and free-slot checks are center-only); put the result into a free center slot.
 //!
-//! Then one [`try_spawn_zombie`] call if a slot is free. A neighbor that is not enterable
-//! is a wall for that tick; mobs never enter diagonal chunks (`|Δcx| + |Δcz| ≤ 1`), so a
-//! single step moves a mob at most into one orthogonal neighbor.
+//! A neighbor that is not enterable is a wall for that tick; mobs never enter diagonal
+//! chunks (`|Δcx| + |Δcz| ≤ 1`), so a step moves a mob at most into one orthogonal
+//! neighbor.
+//!
+//! **`attack_mob(chunk, idx)`**: check reach (and the attack cooldown) against the mob's
+//! `pos`, then [`damage_mob`]; if it died, roll [`drops`] with a **non-grindable nonce**
+//! (e.g. `mob.id` mixed with the slot index and the current time/slot — never something
+//! the attacker can retry for a better roll), add the items, then [`Mob::clear`].
+//!
+//! **New chunks** (`generate_stage2`): seed the [`MobSpawn`]s into slots with
+//! [`Mob::from_spawn`].
 //!
 //! # Body and collision model
 //! A mob is a **point column**: it occupies the feet block `(x>>8, y>>8, z>>8)` and the
@@ -46,7 +66,11 @@
 //! solid block → pushed up to the first free 2-block gap within 3 blocks (else stays);
 //! feet and head in water → float up 1 block per tick (so a mob in deep water bobs to the
 //! surface with its head out); feet in air → fall straight down to the first solid block
-//! or into water (instant, ≤ 64 reads; mobs take no fall damage).
+//! or into water, at most [`MAX_FALL`] (16) blocks per tick (a longer fall, e.g. after the
+//! floor was mined out, takes several ticks; ≤ 18 reads; mobs take no fall damage). While
+//! still falling the mob can also walk that tick (harmless). Settle never moves a mob
+//! sideways: a mob enclosed in solid blocks with no free 2-block gap within 3 blocks above
+//! stays where it is (and does not suffocate).
 //!
 //! In water (feet block water) mobs move at half speed.
 //!
@@ -58,7 +82,8 @@
 //! # Zombie
 //! - Target: nearest (horizontal) target with `|dx|, |dz|, |dy| ≤ 16` blocks and
 //!   horizontal distance ≤ [`CHASE_RANGE`] (16 blocks). Only the first [`MAX_TARGETS`]
-//!   targets are considered (presence is uncapped; bounds cost). No target → stands still.
+//!   targets are considered (presence is uncapped; bounds cost). No target → wanders like
+//!   a passive mob at half speed (0.6 b/s).
 //! - Chase at [`ZOMBIE_SPEED`] (1.2 b/s) greedily: per axis toward the target without
 //!   overshoot (so the distance never increases), stopping at [`STOP_RANGE`] (0.75 block).
 //!   Major axis (larger |delta|) first. If the major axis makes no progress, the minor axis
@@ -70,19 +95,23 @@
 //!   (no credit when the cooldown was already 0 before this tick), so the long-run rate is
 //!   exactly 1 hit/s for any tick period ≤ 1 s
 //!   (e.g. 333 ms ticks → hits at ticks 0, 4, 7, 10, …: 10 hits in 30 ticks).
-//! - Burning: by day, with feet not in water and **sky-exposed** (no solid block from the
+//! - Burning: by day, with feet not in water and **sky-exposed** (no opaque block from the
 //!   block above the head up to the world top): `burn_ms += dt`, −1 hp per full 1000 ms;
-//!   0 hp → cleared, `died`. Night, shade or water → `burn_ms` resets.
+//!   0 hp → cleared, `died`. Night, shade or water → `burn_ms` resets. Sunlight passes
+//!   through transparent blocks (glass, leaves, ice): only opaque solid blocks shade.
 //!
 //! # Spawning ([`try_spawn_zombie`])
-//! Up to [`SPAWN_ATTEMPTS`] (4) candidates per call, each `h = hash(seed, cx, cz, tick, a)`:
-//! a column of the center chunk and a start height; scan down ≤ [`SPAWN_SCAN`] (16) blocks
-//! for a solid floor with 2 non-solid, non-water blocks above. Then: horizontal distance to
-//! **every** target ≥ 8 blocks and to **some** target ≤ 24; light: night, or not
-//! sky-exposed ([`light_ok_for_spawn`]); finally no torch in the 9×9×9 Chebyshev box of
-//! radius 4 around the feet block (this scan runs at most once per call: a torch hit ends
-//! the call). `zombie_count < cap` (cap clamped to [`MOB_SLOTS`]) and ≥ 1 target are
-//! required. The caller must have a free slot.
+//! Requires a free center slot, fewer than `cap` (clamped to [`MOB_SLOTS`]) zombies in the
+//! **center** chunk's slots, and ≥ 1 target. Up to [`SPAWN_ATTEMPTS`] (4) candidates per
+//! call, each `h = hash(seed, cx, cz, tick, a)`: a column of the center chunk (rejected if
+//! a mob already stands in that block column) and a start height; scan down ≤
+//! [`SPAWN_SCAN`] (16) blocks for a solid floor with 2 non-solid, non-water blocks above.
+//! Then: horizontal distance to **every** target ≥ 8 blocks and to **some** target ≤ 24;
+//! light: night, or not sky-exposed ([`light_ok_for_spawn`]); finally no torch within 4
+//! blocks horizontally (Chebyshev) in the layers from the floor to one above the head
+//! (`fy − 1 ..= fy + 2`, 9×9×4 = 324 reads). The torch scan runs at most once per call: a
+//! torch hit ends the call (trying the remaining attempts would cost up to 3 more scans,
+//! ≈ 35k, which does not fit the tick budget).
 //!
 //! # Randomness
 //! `seed.h64(...)` with per-purpose salts: wander `(id, tick)`, spawn `(cx, cz, tick, a)`,
@@ -94,27 +123,30 @@
 //! (`time_of_day = 0` is sunrise). `len == 0` → always day.
 //!
 //! # Cost (hand count of SBF ops ≈ CU; not measured on SBF yet)
-//! Block read through `ChunkNeighborhood` ≈ 15 (see `fluid`), plus ≈ 5 for the `i64`
-//! guard here → ≈ 20.
-//! - `step_mob`, worst case: validate + ctx ≈ 60; settle ≤ 66 reads (fall from the top)
-//!   ≈ 1.3k; sky check (zombie by day) ≤ 62 reads ≈ 1.3k; target scan ≤ 64 × ≈ 25 =
-//!   1.6k; movement 2 axes (+1 sidestep) × ≤ 2 crossings × ≤ 7 reads ≈ 42 reads ≈ 0.9k;
-//!   misc ≈ 0.2k → **≤ ~5.3k**. Typical (grounded, few targets, night): ≈ 15 reads + 0.3k
-//!   ≈ **0.6k**.
-//! - `try_spawn_zombie`, worst case: 4 attempts × (hash ≈ 40 + floor scan ≤ 18 reads ≈
-//!   360 + targets ≤ 64 × 20 ≈ 1.3k + sky ≤ 62 reads ≈ 1.3k) ≈ 12k, plus one torch box
-//!   729 reads ≈ 15k → **≤ ~27k**.
-//! - Tick: 8 mobs × 5.3k + 27k ≈ **≤ 70k** worst case (< 80k target), typically ≈ 10–20k.
+//! A block read through `ChunkNeighborhood` + the `i64` guard here is budgeted at
+//! **35 CU** (30–40: range checks, slot select, option check, index math, bounds check,
+//! load, palette-flag lookup).
+//! - `step_mob`, worst case: guard + validate ≈ 80; settle ≤ 3 + [`MAX_FALL`] = 19 reads;
+//!   sky check (zombie by day) ≤ 62 reads; movement: 2 axes (+1 sidestep) × ≤ 2 crossings
+//!   × ≤ 7 reads ≈ 42 reads; → ≈ 123 reads ≈ 4.3k; target scan ≤ [`MAX_TARGETS`] 32 × ≈ 25
+//!   = 0.8k; wander hash + misc ≈ 0.2k → **≤ ~5.4k**. Typical (grounded, night, few
+//!   targets): ≈ 15 reads ≈ 0.5k + 0.3k ≈ **0.8k**.
+//! - `try_spawn_zombie`, worst case: slot scans 8 × 4 ≈ 0.3k; 4 attempts × (hash ≈ 40 +
+//!   floor scan ≤ 18 reads ≈ 0.6k + targets ≤ 32 × 20 ≈ 0.6k + sky ≤ 62 reads ≈ 2.2k) ≈
+//!   14k; one torch box 324 reads ≈ 11.3k → **≤ ~26k**.
+//! - Tick: 8 mobs × 5.4k + 26k ≈ **≤ 70k** worst case (< 80k target; the worst cases of
+//!   all 8 mobs at once — every zombie sunlit, every mob mid-fall — are not realistic),
+//!   typically ≈ 10–20k.
 //!
-//! `bench_mobs` (ignored; native release, flat world, 8 targets): `step_mob` ≈ 20 ns/call
-//! (pig/zombie alternating), `try_spawn_zombie` ≈ 260 ns/call (4 attempts, night). Measure
+//! `bench_mobs` (ignored; native release, flat world, 8 targets): `step_mob` ≈ 18 ns/call
+//! (pig/zombie alternating), `try_spawn_zombie` ≈ 165 ns/call (4 attempts, night). Measure
 //! real CU once `tick_chunk` exists.
 //!
 //! # SBF stack
 //! [`Mob`] 32 B, [`MobEvent`] 12 B, [`MobCtx`] ≈ 56 B; `step_mob` / `try_spawn_zombie` are
 //! `#[inline(never)]` and hold only scalars plus a `[i64; 3]` (well under 256 B per frame).
 
-use crate::blocks::{is_fluid_u8, is_solid_u8, Block};
+use crate::blocks::{is_fluid_u8, is_solid_u8, is_transparent_u8, Block};
 use crate::consts::{CHUNK_H, CHUNK_W, FP};
 use crate::fluid::{BlockAccess, EAST, NORTH, SOUTH, WEST};
 use crate::hash::{mix, rand_range, splitmix_next, Seed};
@@ -177,7 +209,9 @@ pub const ATTACK_COOLDOWN_MS: i64 = 1000;
 /// Burning: −1 hp per this much sunlit time.
 pub const BURN_INTERVAL_MS: i64 = 1000;
 /// Targets considered per call (cost bound).
-pub const MAX_TARGETS: usize = 64;
+pub const MAX_TARGETS: usize = 32;
+/// Blocks a mob falls per tick at most (cost bound of settle).
+pub const MAX_FALL: i64 = 16;
 
 /// Spawn candidates per [`try_spawn_zombie`] call.
 pub const SPAWN_ATTEMPTS: u32 = 4;
@@ -187,8 +221,11 @@ pub const SPAWN_SCAN: i64 = 16;
 pub const SPAWN_MIN_DIST: i64 = 8 * FP as i64;
 /// ...and at most this far from some target, FP.
 pub const SPAWN_MAX_DIST: i64 = 24 * FP as i64;
-/// No torch within this Chebyshev radius of the feet block.
+/// No torch within this horizontal Chebyshev radius of the feet block...
 pub const TORCH_RADIUS: i64 = 4;
+/// ...in the layers `fy + TORCH_DY_MIN ..= fy + TORCH_DY_MAX` (floor to above the head).
+pub const TORCH_DY_MIN: i64 = -1;
+pub const TORCH_DY_MAX: i64 = 2;
 
 const SALT_WANDER: u32 = 0x4D_0B_00_01;
 const SALT_SPAWN: u32 = 0x4D_0B_00_10;
@@ -220,7 +257,8 @@ const MAX_BLOCK: i64 = XZ_LIMIT as i64 / FPL;
 /// | 16 | `id` | u32 | stable random id (wander hash) |
 /// | 20 | `cooldown_ms` | u16 | zombie: ms until the next hit is allowed |
 /// | 22 | `burn_ms` | u16 | zombie: sunlit ms not yet turned into damage |
-/// | 24 | `_reserved` | [u8; 8] | 0 |
+/// | 24 | `last_tick` | u8 | stamp of the last [`step_mob`] (`tick % 255 + 1`; 0 = never) |
+/// | 25 | `_reserved` | [u8; 7] | 0 |
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Mob {
@@ -232,7 +270,11 @@ pub struct Mob {
     pub id: u32,
     pub cooldown_ms: u16,
     pub burn_ms: u16,
-    pub _reserved: [u8; 8],
+    /// Stamp of the global tick of the last step (`tick % 255 + 1`, 0 = never), so a mob
+    /// that crossed into a chunk is not stepped again by that chunk's tick in the same
+    /// period. Requires `MobCtx::tick` to be a global clock.
+    pub last_tick: u8,
+    pub _reserved: [u8; 7],
 }
 
 const _: () = assert!(core::mem::size_of::<Mob>() == Mob::SIZE);
@@ -251,7 +293,8 @@ impl Mob {
         id: 0,
         cooldown_ms: 0,
         burn_ms: 0,
-        _reserved: [0; 8],
+        last_tick: 0,
+        _reserved: [0; 7],
     };
 
     /// An animal from populate (chunk-local block coordinates), centered on its block.
@@ -292,15 +335,16 @@ impl Mob {
         b[16..20].copy_from_slice(&self.id.to_le_bytes());
         b[20..22].copy_from_slice(&self.cooldown_ms.to_le_bytes());
         b[22..24].copy_from_slice(&self.burn_ms.to_le_bytes());
-        b[24..32].copy_from_slice(&self._reserved);
+        b[24] = self.last_tick;
+        b[25..32].copy_from_slice(&self._reserved);
         b
     }
 
     /// Parses per the layout table (any bytes are accepted).
     pub fn from_bytes(b: &[u8; 32]) -> Mob {
         let i32_at = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-        let mut reserved = [0u8; 8];
-        reserved.copy_from_slice(&b[24..32]);
+        let mut reserved = [0u8; 7];
+        reserved.copy_from_slice(&b[25..32]);
         Mob {
             kind: b[0],
             hp: b[1],
@@ -310,6 +354,7 @@ impl Mob {
             id: u32::from_le_bytes([b[16], b[17], b[18], b[19]]),
             cooldown_ms: u16::from_le_bytes([b[20], b[21]]),
             burn_ms: u16::from_le_bytes([b[22], b[23]]),
+            last_tick: b[24],
             _reserved: reserved,
         }
     }
@@ -372,7 +417,7 @@ pub struct MobEvent {
 /// Per-tick inputs of [`step_mob`].
 pub struct MobCtx<'a> {
     pub seed: &'a Seed,
-    /// Crank tick counter (randomness only).
+    /// Global mob tick (`chain_ms / mob_tick_ms`): randomness and the double-step guard.
     pub tick: u64,
     /// The chunk holding the slot.
     pub cx: i32,
@@ -559,7 +604,8 @@ fn walk_p<W: BlockAccess + ?Sized>(
     move_axis(w, f, p, 0, dx * s) + move_axis(w, f, p, 2, dz * s)
 }
 
-/// Settles the mob vertically (module docs, "Settle").
+/// Settles the mob vertically (module docs, "Settle"). Falls at most [`MAX_FALL`]
+/// blocks per tick (cost bound); a longer fall continues on the next ticks.
 fn settle<W: BlockAccess + ?Sized>(w: &W, p: &mut [i64; 3]) {
     let (x, z) = (p[0] >> 8, p[2] >> 8);
     let mut y = p[1] >> 8;
@@ -579,7 +625,7 @@ fn settle<W: BlockAccess + ?Sized>(w: &W, p: &mut [i64; 3]) {
         }
     } else {
         let mut i = 0;
-        while y > 0 && i < H {
+        while y > 0 && i < MAX_FALL {
             let b = get(w, x, y - 1, z);
             if is_solid_u8(b) {
                 break;
@@ -598,7 +644,8 @@ fn settle<W: BlockAccess + ?Sized>(w: &W, p: &mut [i64; 3]) {
 fn sky_exposed_i<W: BlockAccess + ?Sized>(w: &W, x: i64, fy: i64, z: i64) -> bool {
     let mut y = (fy + 2).max(0);
     while y < H {
-        if solid(w, x, y, z) {
+        let b = get(w, x, y, z);
+        if is_solid_u8(b) && !is_transparent_u8(b) {
             return false;
         }
         y += 1;
@@ -606,8 +653,9 @@ fn sky_exposed_i<W: BlockAccess + ?Sized>(w: &W, x: i64, fy: i64, z: i64) -> boo
     true
 }
 
-/// Whether a mob whose feet are in block `(bx, fy, bz)` sees the sky: no solid block from
-/// the block above its head (`fy + 2`) up to the world top.
+/// Whether a mob whose feet are in block `(bx, fy, bz)` sees the sky: no opaque block
+/// (solid and not transparent: glass, leaves and ice let sunlight through) from the block
+/// above its head (`fy + 2`) up to the world top.
 pub fn sky_exposed<W: BlockAccess + ?Sized>(w: &W, bx: i32, fy: i32, bz: i32) -> bool {
     sky_exposed_i(w, bx as i64, fy as i64, bz as i64)
 }
@@ -668,6 +716,29 @@ fn chase<W: BlockAccess + ?Sized>(
     }
 }
 
+/// Random wander (module docs, "Passive"); also idle zombies at half speed.
+fn wander<W: BlockAccess + ?Sized>(
+    ctx: &MobCtx,
+    w: &W,
+    f: &Frame,
+    mob: &mut Mob,
+    p: &mut [i64; 3],
+    step: i64,
+) {
+    let h = ctx.seed.h64(mob.id as i64, ctx.tick as i64, 0, SALT_WANDER);
+    if mob.flags & FLAG_BLOCKED != 0 || h & 31 < 2 || mob.dir > DIR_IDLE {
+        let r = rand_range(h, 0, 11) as u8;
+        mob.dir = if r < 8 { r } else { DIR_IDLE };
+        mob.flags &= !FLAG_BLOCKED;
+    }
+    if (mob.dir as usize) < DIRS8.len() && step > 0 {
+        let (dx, dz) = DIRS8[mob.dir as usize];
+        if walk_p(w, f, p, dx, dz, step) == 0 {
+            mob.flags |= FLAG_BLOCKED;
+        }
+    }
+}
+
 /// Advances one mob by one crank tick. Total: any bytes in `mob`, any ctx, any world.
 /// See the module docs for the rules and the caller's duties.
 #[inline(never)]
@@ -681,6 +752,11 @@ pub fn step_mob<W: BlockAccess + ?Sized>(ctx: &MobCtx, mob: &mut Mob, world: &W)
         cz: ctx.cz as i64,
         enter: ctx.enter_mask,
     };
+    let stamp = (ctx.tick % 255) as u8 + 1;
+    if mob.last_tick == stamp {
+        return ev; // already stepped this period (crossed in from a neighbor's tick)
+    }
+    mob.last_tick = stamp;
     let mut p = [mob.pos[0] as i64, mob.pos[1] as i64, mob.pos[2] as i64];
     let maxhp = max_hp(mob.kind);
     if maxhp == 0 || mob.hp == 0 || !f.holds(&p) {
@@ -721,8 +797,9 @@ pub fn step_mob<W: BlockAccess + ?Sized>(ctx: &MobCtx, mob: &mut Mob, world: &W)
 
     if zombie {
         let target = nearest(ctx.targets, &p);
-        if let Some(t) = target {
-            chase(world, &f, mob, &mut p, t, step);
+        match target {
+            Some(t) => chase(world, &f, mob, &mut p, t, step),
+            None => wander(ctx, world, &f, mob, &mut p, step / 2),
         }
         let mut cd = mob.cooldown_ms as i64 - dt;
         if let Some(t) = target {
@@ -745,18 +822,7 @@ pub fn step_mob<W: BlockAccess + ?Sized>(ctx: &MobCtx, mob: &mut Mob, world: &W)
         }
         mob.cooldown_ms = cd.clamp(0, u16::MAX as i64) as u16;
     } else {
-        let h = ctx.seed.h64(mob.id as i64, ctx.tick as i64, 0, SALT_WANDER);
-        if mob.flags & FLAG_BLOCKED != 0 || h & 31 < 2 || mob.dir > DIR_IDLE {
-            let r = rand_range(h, 0, 11) as u8;
-            mob.dir = if r < 8 { r } else { DIR_IDLE };
-            mob.flags &= !FLAG_BLOCKED;
-        }
-        if (mob.dir as usize) < DIRS8.len() && step > 0 {
-            let (dx, dz) = DIRS8[mob.dir as usize];
-            if walk_p(world, &f, &mut p, dx, dz, step) == 0 {
-                mob.flags |= FLAG_BLOCKED;
-            }
-        }
+        wander(ctx, world, &f, mob, &mut p, step);
     }
 
     ev.moved = p != old;
@@ -810,10 +876,11 @@ fn spawn_distance_ok(targets: &[Target], px: i64, pz: i64) -> bool {
     near
 }
 
-/// A torch in the Chebyshev box of radius [`TORCH_RADIUS`] (9×9×9 reads).
+/// A torch within [`TORCH_RADIUS`] horizontally (Chebyshev) and `fy - 1 ..= fy + 2`
+/// vertically (the floor, the body and one above the head): 9×9×4 = 324 reads.
 fn torch_near<W: BlockAccess + ?Sized>(w: &W, x: i64, y: i64, z: i64) -> bool {
-    let mut dy = -TORCH_RADIUS;
-    while dy <= TORCH_RADIUS {
+    let mut dy = TORCH_DY_MIN;
+    while dy <= TORCH_DY_MAX {
         let mut dz = -TORCH_RADIUS;
         while dz <= TORCH_RADIUS {
             let mut dx = -TORCH_RADIUS;
@@ -830,8 +897,10 @@ fn torch_near<W: BlockAccess + ?Sized>(w: &W, x: i64, y: i64, z: i64) -> bool {
     false
 }
 
-/// Tries to spawn a zombie in chunk `(cx, cz)` (module docs, "Spawning"). Returns the new
-/// mob for the caller to put into a free slot. Total for any inputs.
+/// Tries to spawn a zombie in chunk `(cx, cz)` (module docs, "Spawning"). `mobs` = the
+/// center chunk's slots (zombie count, free slot and occupied columns are checked against
+/// them). Returns the new mob for the caller to put into a free center slot. Total for any
+/// inputs.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 pub fn try_spawn_zombie<W: BlockAccess + ?Sized>(
@@ -841,11 +910,14 @@ pub fn try_spawn_zombie<W: BlockAccess + ?Sized>(
     cz: i32,
     world: &W,
     targets: &[Target],
+    mobs: &[Mob],
     is_night: bool,
-    zombie_count: u8,
     cap: u8,
 ) -> Option<Mob> {
-    if zombie_count >= cap.min(MOB_SLOTS as u8) || targets.is_empty() {
+    let slots = &mobs[..mobs.len().min(MOB_SLOTS)];
+    let zombies = slots.iter().filter(|m| m.kind == KIND_ZOMBIE).count();
+    let free = slots.len() < MOB_SLOTS || slots.iter().any(Mob::is_empty);
+    if !free || zombies >= cap.min(MOB_SLOTS as u8) as usize || targets.is_empty() {
         return None;
     }
     let ox = cx as i64 * CW;
@@ -865,6 +937,12 @@ pub fn try_spawn_zombie<W: BlockAccess + ?Sized>(
         let bx = ox + (h & 15) as i64;
         let bz = oz + ((h >> 4) & 15) as i64;
         let y0 = rand_range(h, 1, MAX_FEET as i32) as i64;
+        let occupied = slots
+            .iter()
+            .any(|m| !m.is_empty() && (m.pos[0] >> 8) as i64 == bx && (m.pos[2] >> 8) as i64 == bz);
+        if occupied {
+            continue;
+        }
         let Some(fy) = find_floor(world, bx, bz, y0) else {
             continue;
         };
@@ -1155,7 +1233,8 @@ mod tests {
             id: 0xDEAD_BEEF,
             cooldown_ms: 999,
             burn_ms: 0x1234,
-            _reserved: [9; 8],
+            last_tick: 77,
+            _reserved: [9; 7],
         };
         let b = m.to_bytes();
         assert_eq!(&b[0..4], &[4, 17, 0x81, 5]);
@@ -1165,7 +1244,8 @@ mod tests {
         assert_eq!(&b[16..20], &0xDEAD_BEEFu32.to_le_bytes());
         assert_eq!(&b[20..22], &999u16.to_le_bytes());
         assert_eq!(&b[22..24], &0x1234u16.to_le_bytes());
-        assert_eq!(&b[24..32], &[9; 8]);
+        assert_eq!(b[24], 77);
+        assert_eq!(&b[25..32], &[9; 7]);
         assert_eq!(Mob::from_bytes(&b), m);
         assert_eq!(Mob::EMPTY.to_bytes(), [0; 32]);
     }
@@ -1301,8 +1381,16 @@ mod tests {
         // Unsupported mob falls to the ground in one tick.
         let w = W::flat(10);
         let mut sm = sim(&w);
-        let mut m = mob(KIND_COW, 0, 40, 0);
+        let mut m = mob(KIND_COW, 0, 60, 0);
         sm.step(&mut m);
+        assert_eq!(
+            m.pos[1],
+            (60 - MAX_FALL as i32) * FP,
+            "falls MAX_FALL per tick"
+        );
+        for _ in 0..3 {
+            sm.step(&mut m);
+        }
         assert_eq!(m.pos[1], 11 * FP);
         // In deep water: floats up one block per tick until the head is out.
         let mut w = W::flat(5);
@@ -1408,14 +1496,55 @@ mod tests {
     #[test]
     fn zombie_ignores_far_targets() {
         let w = W::flat(10);
+        let run = |targets: Vec<Target>| {
+            let mut sm = sim(&w);
+            sm.targets = targets;
+            let mut m = mob(KIND_ZOMBIE, 0, 11, 0);
+            for _ in 0..30 {
+                assert!(sm.step(&mut m).hit.is_none());
+            }
+            m
+        };
+        assert_eq!(run(vec![target(0, 11, 17)]), run(vec![]));
+    }
+
+    #[test]
+    fn idle_zombie_wanders_at_half_speed() {
+        let w = W::flat(10);
         let mut sm = sim(&w);
-        sm.targets = vec![target(0, 11, 17)];
-        let mut m = mob(KIND_ZOMBIE, 0, 11, 0);
+        let mut m = mob(KIND_ZOMBIE, 8, 11, 8);
         let start = m.pos;
-        for _ in 0..30 {
+        let max = (ZOMBIE_SPEED * 333 / 1000 / 2) as i32;
+        for _ in 0..300 {
+            let before = m.pos;
             sm.step(&mut m);
+            assert!((m.pos[0] - before[0]).abs() <= max && (m.pos[2] - before[2]).abs() <= max);
         }
-        assert_eq!(m.pos, start);
+        assert_ne!(m.pos, start, "idle zombie should wander");
+    }
+
+    #[test]
+    fn no_double_step_in_one_tick() {
+        let w = W::flat(10);
+        let s = seed(1);
+        let targets = [target(12, 11, 8)];
+        let mk = |tick| MobCtx {
+            seed: &s,
+            tick,
+            cx: 0,
+            cz: 0,
+            targets: &targets,
+            is_day: false,
+            dt_ms: 333,
+            enter_mask: ENTER_ALL,
+        };
+        let mut m = mob(KIND_ZOMBIE, 8, 11, 8);
+        assert!(step_mob(&mk(5), &mut m, &w).moved);
+        let after = m;
+        // Same global tick again (e.g. the neighbor it crossed into): no-op.
+        assert_eq!(step_mob(&mk(5), &mut m, &w), MobEvent::default());
+        assert_eq!(m, after);
+        assert!(step_mob(&mk(6), &mut m, &w).moved);
     }
 
     #[test]
@@ -1534,6 +1663,23 @@ mod tests {
             sm.step(&mut m);
         }
         assert_eq!(m.hp, 20);
+        // Glass, leaves and ice let sunlight through.
+        for roof in [Block::Glass, Block::Leaves, Block::Ice] {
+            let mut w = W::flat(10);
+            for x in LO..LO + SPAN {
+                for z in LO..LO + SPAN {
+                    w.put(x, 14, z, roof as u8);
+                }
+            }
+            let mut sm = sim(&w);
+            sm.is_day = true;
+            sm.dt = 1000;
+            let mut m = mob(KIND_ZOMBIE, 2, 11, 2);
+            for _ in 0..5 {
+                sm.step(&mut m);
+            }
+            assert_eq!(m.hp, 15, "{roof:?} shaded");
+        }
         // Passive mobs never burn.
         let w = W::flat(10);
         let mut sm = sim(&w);
@@ -1609,9 +1755,10 @@ mod tests {
         let mut m = mob(KIND_ZOMBIE, 15, 11, 15);
         for _ in 0..40 {
             let (cx, cz) = home(&m);
+            sm.tick += 1;
             let ctx = MobCtx {
                 seed: &sm.seed,
-                tick: 0,
+                tick: sm.tick,
                 cx,
                 cz,
                 targets: &sm.targets,
@@ -1693,7 +1840,7 @@ mod tests {
         }
         assert!(near, "too far from all targets");
         for dx in -4..=4 {
-            for dy in -4..=4 {
+            for dy in -1..=2 {
                 for dz in -4..=4 {
                     assert_ne!(w.get(x + dx, y + dy, z + dz), TORCH, "torch nearby");
                 }
@@ -1701,10 +1848,19 @@ mod tests {
         }
     }
 
+    /// `count` zombies already in the center slots (standing in column (15, 15)).
     fn spawn_many(w: &W, targets: &[Target], night: bool, count: u8, cap: u8) -> Vec<Mob> {
+        let mut slots = [Mob::EMPTY; MOB_SLOTS];
+        for m in slots.iter_mut().take(count as usize) {
+            *m = mob(KIND_ZOMBIE, 15, 21, 15);
+        }
+        spawn_with(w, targets, night, &slots, cap)
+    }
+
+    fn spawn_with(w: &W, targets: &[Target], night: bool, slots: &[Mob], cap: u8) -> Vec<Mob> {
         let s = seed(5);
         (0..400u64)
-            .filter_map(|t| try_spawn_zombie(&s, t, 0, 0, w, targets, night, count, cap))
+            .filter_map(|t| try_spawn_zombie(&s, t, 0, 0, w, targets, slots, night, cap))
             .collect()
     }
 
@@ -1742,6 +1898,25 @@ mod tests {
         assert!(spawn_many(&w, &targets, true, 4, 4).is_empty());
         assert!(spawn_many(&w, &targets, true, 0, 0).is_empty());
         assert!(!spawn_many(&w, &targets, true, 3, 4).is_empty());
+        // No free slot: never. Occupied columns are never chosen.
+        let full = [mob(KIND_PIG, 15, 21, 15); MOB_SLOTS];
+        assert!(spawn_with(&w, &targets, true, &full, 8).is_empty());
+        let mut slots = [Mob::EMPTY; MOB_SLOTS];
+        for (i, m) in slots.iter_mut().take(7).enumerate() {
+            *m = mob(KIND_COW, 9 + i as i32, 21, 3 + i as i32);
+        }
+        let got = spawn_with(&w, &targets, true, &slots, 4);
+        assert!(!got.is_empty());
+        for z in &got {
+            assert!(slots
+                .iter()
+                .all(|m| (m.pos[0] >> 8, m.pos[2] >> 8) != (z.pos[0] >> 8, z.pos[2] >> 8)));
+        }
+        // More than 8 "slots" are clamped to the first 8 (all full here) -> nothing.
+        let many: Vec<Mob> = (0..256)
+            .map(|i| mob(KIND_PIG, i % 16, 21, i / 16))
+            .collect();
+        assert!(spawn_with(&w, &targets, true, &many, 4).is_empty());
         // Day on the open surface: never.
         assert!(spawn_many(&w, &targets, false, 0, 4).is_empty());
         // Day under a roof: yes.
@@ -1947,8 +2122,8 @@ mod tests {
                 cz,
                 world,
                 &targets,
+                &[m, Mob::from_bytes(&b)][..(r >> 3) as usize % 3],
                 r & 2 == 0,
-                (r >> 3) as u8,
                 (r >> 11) as u8,
             );
             let _ = drops(m.kind, &s, ctx.tick);
@@ -1995,7 +2170,17 @@ mod tests {
         println!("step_mob: {:?}/call", t.elapsed() / n as u32);
         let t = std::time::Instant::now();
         for i in 0..n {
-            std::hint::black_box(try_spawn_zombie(&s, i, 0, 0, &w, &targets, true, 0, 4));
+            std::hint::black_box(try_spawn_zombie(
+                &s,
+                i,
+                0,
+                0,
+                &w,
+                &targets,
+                &[Mob::EMPTY; MOB_SLOTS],
+                true,
+                4,
+            ));
         }
         println!("try_spawn_zombie: {:?}/call", t.elapsed() / n as u32);
     }
