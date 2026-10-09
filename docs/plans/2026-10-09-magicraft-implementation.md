@@ -289,6 +289,8 @@ Commit `feat(program): join, presence, movement`.
 - `break_block`, `place_block`, `craft`, `attack_mob`, `eat`, `respawn` per design, all delegating to core. Block edits enqueue fluid positions (cross-border to neighbor chunk queues when passed) and set `edited`.
 - Tests: punch log → log in inventory; craft planks → table → wooden pickaxe; mine stone with pickaxe gets cobblestone, without gets nothing; out-of-reach rejected; cooldown enforced; place block into own body rejected; respawn only when dead clears inventory and moves to spawn; attack pig until dead → pork in inventory.
 
+**Done (Task 19):** code in `instructions/actions.rs` (not `play.rs`); extra ix `select_slot(slot)` (held tool); `craft(recipe_id, count, table, furnace)` takes optional station positions + `table_chunk`/`furnace_chunk`; `attack_mob(idx)` with `chunk` as an account. `place_block` requires the border-neighbour presences (`remaining_accounts`, see the module docs). Block edits call `crank::maybe_arm_chunk` for every chunk whose fluid queue has work (also neighbours passed as `chunk_n/s/e/w`) — **Task 20** implements it. Measured: break 9.7k-12.3k, place 11.1k, attack 7.7k-8.3k CU. Details: `docs/notes/spikes.md`.
+
 Commit `feat(program): block edits, crafting, combat`.
 
 ### Task 20: Chunk tick crank

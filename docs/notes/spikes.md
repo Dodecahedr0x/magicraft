@@ -702,3 +702,60 @@ Decisions:
   **any fresh presence entry** (not only the placer's), else a block placed into another
   player traps them (their stuck escape is limited to 1 block).
   Time exhaustion uses the move gap clamped to 10 s (not the 2 s movement cap).
+
+## 2026-10-09: Block edits, crafting, combat, eat, respawn (Task 19, permanent code)
+
+Test: `tests/14-actions.spec.ts`. Code: `instructions/actions.rs` (module docs hold the rules).
+The route (an animal, a block next to water, 3 logs, a work spot with stone, soft blocks and two
+pillar columns) is planned over magicraft-core reference blocks of the 5×5 chunks around (0,0)
+by `tests/helpers/scout.ts`; about 1 world in 3 fits (animals and trees both need Plains/Forest
+near the spawn), so the spec retries worlds (scouting is ~0.6 s per world since `referenceChunk`
+now runs the built `gen` binary instead of `cargo run`). Only the chunks the route touches are
+created.
+
+**SBF-measured CU** (local ER, whole ix):
+
+| Ix | CU |
+|---|---|
+| `break_block` (log / stone / soft, no water nearby) | 9.7k-10.4k |
+| `break_block` next to water (fluid enqueue) | 12.1k-12.3k |
+| `place_block` (incl. a border block with a neighbour chunk + presence) | 11.1k-11.2k |
+| `place_block`, neighbour via `find_program_address` (first version) | 18.7k-23.2k |
+| `attack_mob` | 7.7k-8.3k |
+| `craft` (hand / at a table) | 8.5k / 10.6k |
+| `select_slot` / `eat` / `respawn` | 3.8k / 5.4k / 6.8k |
+
+Decisions:
+- **Break cooldown model:** `now ≥ break_until_ms`, then `break_until_ms = now + break_time`
+  (the client animates the mining progress before sending). One block per break time, no
+  start/finish handshake. A full inventory loses the drop; the block still breaks.
+- **No line-of-sight check** (chunk data is public anyway); reach is eye (feet + 1.62) → block
+  center ≤ `params.reach` + 0.5 block slack (the stored position lags the client's), in `u64`
+  squares after a per-axis bound (no division, no signed/checked multiply). Mobs: 3 blocks +
+  slack to the nearest point of the 2-block column.
+- `player` is passed read-only and not PDA-checked (~1.5k CU saved): `player_state.player ==
+  player` ties it; only `join_world` writes that field at the matching PDA.
+- New ix `select_slot(slot)` sets `held_slot` (the tool for `break_block` / `attack_mob`).
+- **Overlap with other players (`place_block`)**: fresh presence entries (≤ 5 s) of the target
+  chunk **and** of every neighbour chunk a player box can reach the block from (x / z / diagonal
+  for edge blocks) are **required** — as `remaining_accounts` (neighbour chunk read-only +
+  presence; or the empty chunk PDA if it does not exist, which costs a `find_program_address`).
+  Optional ones would let a placer trap a player across a border. The box is client-sized
+  (half-width 78 FP, height 461 FP). Dead or quit players' entries go stale after 5 s and never
+  block.
+- Face adjacency only counts solid blocks in passed chunks (omitting a chunk can't fake support).
+- **Fluid:** an edit enqueues (`fluid::enqueue_neighbors`) only if water can be affected — the
+  old block was water, one of the 10 dependent voxels is water, or the block is on a border whose
+  neighbour wasn't passed. So ordinary digging doesn't wake the chunk crank. Neighbour queues
+  (`chunk_n/s/e/w`, optional, writable) get their pushes only when passed; otherwise the
+  center's own voxel is still queued and its tick carries the flow on. Every chunk whose queue
+  has work goes through `crank::maybe_arm_chunk` (still a stub until Task 20).
+- **Drops nonce** `(mob.id << 32) ^ chain_ms ^ slot`: not retryable in the same slot; the killer
+  can still choose the timing of the last blow (it only shifts a 1–3 item roll).
+- **Respawn** resets inventory, vitals, cooldowns, `MoveState::spawn(spawn, chain_ms)` and
+  `cx/cz`; the old presence entry is left to pruning (stale, so it blocks nothing).
+- Fall damage and death are now tested end to end (pillar of 8 → 5-ish damage; pillar to
+  `g2 + 24` and step off → dead; `move`/`break`/`select`/`eat` → `Dead`).
+- Observed: the route's digging can remove the block under the world spawn (respawned players
+  then fall a little); and a block placed into the spawn would put respawned players in a block
+  (they can break their way out — breaking needs no movement).

@@ -119,6 +119,48 @@ pub mod magicraft {
         instructions::play::move_player(ctx, pos, vel, on_ground, client_ms)
     }
 
+    /// Breaks a block within reach (cooldown = break time; drop to inventory, fluid enqueue).
+    pub fn break_block(ctx: Context<BreakBlock>, x: i32, y: i32, z: i32) -> Result<()> {
+        instructions::actions::break_block(ctx, x, y, z)
+    }
+
+    /// Places the block item of `slot` at a free, face-adjacent position within reach.
+    /// `remaining_accounts`: neighbour presence lists for border blocks (see `actions`).
+    pub fn place_block(ctx: Context<PlaceBlock>, x: i32, y: i32, z: i32, slot: u8) -> Result<()> {
+        instructions::actions::place_block(ctx, x, y, z, slot)
+    }
+
+    /// Selects the held inventory slot.
+    pub fn select_slot(ctx: Context<SelfAction>, slot: u8) -> Result<()> {
+        instructions::actions::select_slot(ctx, slot)
+    }
+
+    /// Crafts a recipe; stations are claimed by block position (+ chunk) and verified.
+    pub fn craft(
+        ctx: Context<Craft>,
+        recipe_id: u16,
+        count: u8,
+        table: Option<[i32; 3]>,
+        furnace: Option<[i32; 3]>,
+    ) -> Result<()> {
+        instructions::actions::craft(ctx, recipe_id, count, table, furnace)
+    }
+
+    /// Attacks the mob in slot `idx` of `chunk` (drops to inventory on death).
+    pub fn attack_mob(ctx: Context<AttackMob>, idx: u8) -> Result<()> {
+        instructions::actions::attack_mob(ctx, idx)
+    }
+
+    /// Eats the food in `slot`.
+    pub fn eat(ctx: Context<SelfAction>, slot: u8) -> Result<()> {
+        instructions::actions::eat(ctx, slot)
+    }
+
+    /// Dead player only: back to the spawn with an empty inventory.
+    pub fn respawn(ctx: Context<Respawn>) -> Result<()> {
+        instructions::actions::respawn(ctx)
+    }
+
     // ----- Day crank (ER) -----
 
     /// (Re)arms the World's day crank (permissionless, idempotent).

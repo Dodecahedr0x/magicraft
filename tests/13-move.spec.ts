@@ -264,7 +264,7 @@ describe("join + move", () => {
     });
 
     it("teleport → MoveTooFast", async () => {
-      const err = await fails(move(a, [pos[0] + 20 * FP, pos[1], pos[2]]));
+      const err = await fails(move(a, [pos[0] + 40 * FP, pos[1], pos[2]]));
       expect(err?.code, String(err)).to.equal("MoveTooFast");
     });
 

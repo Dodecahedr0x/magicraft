@@ -252,13 +252,20 @@ once). Validity is checked against the ER clock, max 7 days.
 - `move_player(pos, vel, on_ground)` ~8 Hz — speed bound vs elapsed time, AABB collision vs solid
   blocks, fall damage `max(0, fall_start_y − y − 3)` (water cancels), presence update/migration,
   apply `pending_damage`, hunger drain / regen / starvation.
-- `break_block(x,y,z)` — reach, hardness/tool-tier cooldown, harvest tier, drop to inventory,
-  durability, fluid enqueue, `edited = true`. Bedrock unbreakable.
-- `place_block(x,y,z,slot)` — reach, target air/water, face-adjacent, no self-overlap, fluid enqueue.
-- `craft(recipe_id, count)` — const recipe table; station (none/table/furnace) verified by position
-  within reach; furnace smelting instant with coal/planks fuel.
+- `break_block(x,y,z)` — reach (eye → block center), cooldown model (`now ≥ break_until`, then
+  `break_until = now + break_time(block, held tool)`; the client shows the progress before
+  sending), harvest tier, drop to inventory (lost if full; the block breaks anyway), durability,
+  fluid enqueue, `edited = true`. Air/water/bedrock unbreakable.
+- `place_block(x,y,z,slot)` — reach, target air/water, face-adjacent (to a solid block in a passed
+  chunk), no overlap with the placer or any fresh presence entry (target chunk + required
+  border-neighbour presences), fluid enqueue.
+- `select_slot(slot)` — the held slot (tool for breaking / weapon).
+- `craft(recipe_id, count, table?, furnace?)` — const recipe table; a station is claimed by block
+  position (+ its chunk) and verified (block type, within reach); furnace smelting instant with
+  coal/planks fuel.
 - `attack_mob(chunk, idx)` — reach 3, cooldown, weapon damage, drops to inventory.
 - `eat(slot)`, `respawn` (health 0 → spawn, inventory cleared).
+  Details: `programs/magicraft/src/instructions/actions.rs` (module docs).
 - `close_chunk`, `tick_chunk` (crank target), `tick_day` (crank target).
 
 **Items (u16):** all blocks; pickaxe/axe/shovel/sword × wood/stone/iron/diamond with durability;

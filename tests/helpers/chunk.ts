@@ -1,6 +1,7 @@
 // Chunk helpers: PDAs, layout constants, generation tx builders and the
 // `magicraft-core` reference generator (crates/core/examples/gen.rs).
 import { execFileSync } from "child_process";
+import * as path from "path";
 import { web3 } from "@anchor-lang/core";
 import { erConn, erProgram, sendEr } from "./env";
 import { TestPlayer } from "./player";
@@ -196,23 +197,26 @@ export type RefChunk = {
   spawn: [number, number, number];
 };
 
-/** Reference generation of chunk `(cx, cz)` for `seed` by magicraft-core. */
+let genBin: string | null = null;
+
+/** Reference generation of chunk `(cx, cz)` for `seed` by magicraft-core
+ *  (builds the `gen` example once per process, then runs the binary). */
 export function referenceChunk(seed: Buffer, cx: number, cz: number): RefChunk {
-  const out = execFileSync(
-    "cargo",
-    [
-      "run",
+  if (!genBin) {
+    execFileSync("cargo", [
+      "build",
       "--release",
       "-q",
       "-p",
       "magicraft-core",
       "--example",
       "gen",
-      "--",
-      seed.toString("hex"),
-      String(cx),
-      String(cz),
-    ],
+    ]);
+    genBin = path.join(__dirname, "../../target/release/examples/gen");
+  }
+  const out = execFileSync(
+    genBin,
+    [seed.toString("hex"), String(cx), String(cz)],
     { maxBuffer: 1 << 20 }
   );
   let o = 0;

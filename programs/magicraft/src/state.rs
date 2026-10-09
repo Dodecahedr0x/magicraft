@@ -846,6 +846,24 @@ pub fn ready_chunk_mut<'a>(
     Ok((h, b))
 }
 
+/// Header + blocks of the playable chunk `(cx, cz)` of `world` for gameplay writes (block
+/// edits): [`ready_chunk_mut`] plus the stored world / coordinates (`InvalidChunk`),
+/// **without** re-deriving the PDA (sound for the reason given at
+/// [`ready_chunk_blocks_ro`]).
+pub fn ready_chunk_mut_for<'a>(
+    ai: &'a AccountInfo,
+    world: &Pubkey,
+    cx: i32,
+    cz: i32,
+) -> Result<(RefMut<'a, ChunkHeader>, RefMut<'a, [u8; CHUNK_VOL]>)> {
+    let (h, b) = ready_chunk_mut(ai)?;
+    require!(
+        h.world == *world && h.cx.get() == cx && h.cz.get() == cz,
+        MagicraftError::InvalidChunk
+    );
+    Ok((h, b))
+}
+
 /// Pure identity check of a chunk header against the expected world / coordinates and
 /// its address (PDA from the stored bump).
 pub fn check_chunk_identity(
@@ -1044,6 +1062,31 @@ pub fn presence_of<'a>(
     let (h, e) = presence_mut(ai)?;
     require_keys_eq!(h.chunk, *chunk, MagicraftError::InvalidPresence);
     Ok((h, e))
+}
+
+/// Read-only entries of the presence list of `chunk` (same checks as [`presence_of`]:
+/// owner, discriminator, length/count, stored `chunk`; no PDA derivation).
+pub fn presence_entries_ro<'a>(
+    ai: &'a AccountInfo,
+    chunk: &Pubkey,
+) -> Result<core::cell::Ref<'a, [PresenceEntry]>> {
+    require_keys_eq!(*ai.owner, crate::ID, MagicraftError::InvalidPresence);
+    let data = ai.try_borrow_data()?;
+    require!(
+        data.len() >= PRESENCE_HEADER_SIZE
+            && (data.len() - PRESENCE_HEADER_SIZE).is_multiple_of(PRESENCE_ENTRY_SIZE),
+        MagicraftError::InvalidPresence
+    );
+    let h: &PresenceHeader = bytemuck::from_bytes(&data[..PRESENCE_HEADER_SIZE]);
+    require!(
+        h.discriminator == PRESENCE_DISCRIMINATOR
+            && h.count.get() as usize == (data.len() - PRESENCE_HEADER_SIZE) / PRESENCE_ENTRY_SIZE
+            && h.chunk == *chunk,
+        MagicraftError::InvalidPresence
+    );
+    Ok(core::cell::Ref::map(data, |d| {
+        bytemuck::cast_slice::<u8, PresenceEntry>(&d[PRESENCE_HEADER_SIZE..])
+    }))
 }
 
 // ---------------------------------------------------------------------------
