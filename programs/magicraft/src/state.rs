@@ -9,4 +9,6 @@ pub const PLAYER_SEED: &[u8] = b"player";
 pub struct Player {
     pub authority: Pubkey,
     pub bump: u8,
+    /// Padding for future fields (keeps the account size stable).
+    pub _reserved: [u8; 64],
 }

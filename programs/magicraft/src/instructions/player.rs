@@ -72,6 +72,8 @@ pub struct DelegatePlayer<'info> {
     pub player: UncheckedAccount<'info>,
 }
 
+/// `validator`: the ER validator to delegate to. `None` lets any validator
+/// pick the Player up; production should pin the ER validator identity.
 pub fn delegate_player(ctx: Context<DelegatePlayer>, validator: Option<Pubkey>) -> Result<()> {
     let authority = ctx.accounts.authority.key();
     ctx.accounts.delegate_player(

@@ -149,6 +149,10 @@ for the chunk bump).
 
 ### Writing 16 384 block bytes in one ix (ER, default 200k limit)
 
+Absolute CU varies by ~3 000 between runs: `find_program_address` bump search depends on the
+random authority key, so the number of tries changes. Only the deltas between modes within one run
+are meaningful.
+
 | Mode | CU consumed (whole ix) |
 |---|---|
 | no write (baseline: Anchor + 2 PDA checks) | 4 751 |
@@ -185,3 +189,11 @@ plan for 1.4M or staged generation (`gen_stage`).
    with Anchor's bumps (`ctx.bumps.chunk`, `player.bump`), and declare `vault` and `magic_program`
    yourself. This also avoids the macro's extra runtime `find_program_address` calls.
 3. Player = sponsor works as `Account<Player>` with `mut, seeds, bump = player.bump, has_one = authority`.
+
+### Open questions
+
+- Top-up path for an already delegated Player: `deposit` needs an undelegated Player. Options are
+  commit + undelegate → deposit → re-delegate, or a transfer on the ER side.
+- How ER-side lamport changes (rent moved from the Player into the ephemeral vault) settle to base
+  on commit/undelegate. Does the base Player balance drop by the rent, and is closing chunks before
+  undelegating required to get it back?
