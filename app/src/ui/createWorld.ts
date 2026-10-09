@@ -26,7 +26,7 @@ import {
   type WorldParams,
 } from "../chain";
 import type { App } from "../state";
-import { busy, errText, h, sleep, sol, stepList } from "./dom";
+import { busy, errText, h, sendResultMessage, sleep, sol, stepList } from "./dom";
 import { PARAM_FIELDS, fromForm, jumpHeight, toForm, validateForm, validateName, type ParamField, type ParamForm } from "./params";
 
 export const SETUP_STEPS = [
@@ -45,13 +45,9 @@ async function send(app: App, src: IxSource, opts: SendOptions = {}): Promise<nu
   const sender = app.state.sender;
   if (!sender) throw new Error("No play session. Start one first.");
   const r = await sender.send(src, opts);
-  if (r.status === "confirmed") return r.ms;
-  if (r.status === "superseded") throw new Error("Superseded by a newer transaction.");
-  const f = r.error;
-  if (f.kind === "topup") throw new Error("Your player is out of SOL for rent. Top it up, then retry.");
-  if (f.kind === "renewSession") throw new Error("Your play session expired. Renew it (top bar), then retry.");
-  if (f.kind === "timeout") throw new Error("Not confirmed in time; it may still land. Retry to continue from where it got.");
-  throw new Error(f.message);
+  const msg = sendResultMessage(r);
+  if (msg !== null || r.status !== "confirmed") throw new Error(msg ?? "Not confirmed.");
+  return r.ms;
 }
 
 async function readWorld(app: App, world: PublicKey): Promise<WorldAccount | null> {
@@ -139,10 +135,12 @@ export async function runSetup(
 
     if (!w.spawnSet) {
       await step(5, () => send(app, async () => [await setSpawnIx(app.program, world)]));
-      w = (await until(async () => {
+      const set = await until(async () => {
         const x = await readWorld(app, world);
         return x?.spawnSet ? x : null;
-      }, 5_000)) ?? w;
+      }, 5_000);
+      if (!set) throw new Error("The spawn point is not visible yet. Retry to check again.");
+      w = set;
     } else steps.set(5, "done", "already set");
     return w;
   } catch (e) {

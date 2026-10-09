@@ -46,6 +46,8 @@ export type WithdrawPlan = {
   closable: SponsoredChunk[];
   /** Edited: rent stays locked (by design). */
   edited: SponsoredChunk[];
+  /** Spawn chunks (0,0): `close_chunk` refuses them (`SpawnChunk`); rent stays locked. */
+  spawn: SponsoredChunk[];
   /** Unedited but someone (maybe a stale entry of yours) is listed inside: can't close now;
    *  left open, its rent is only reclaimable after delegating again. */
   occupied: SponsoredChunk[];
@@ -56,12 +58,13 @@ export type WithdrawPlan = {
 /** Splits `chunks` by reclaimability; `presenceCount` maps a chunk PDA (base58) to its
  *  presence entry count (missing = unknown → treated as occupied). */
 export function planWithdraw(chunks: readonly SponsoredChunk[], presenceCount: ReadonlyMap<string, number>): WithdrawPlan {
-  const plan: WithdrawPlan = { closable: [], edited: [], occupied: [], refund: 0 };
+  const plan: WithdrawPlan = { closable: [], edited: [], spawn: [], occupied: [], refund: 0 };
   const sorted = [...chunks].sort(
     (a, b) => a.world.toBase58().localeCompare(b.world.toBase58()) || a.cx - b.cx || a.cz - b.cz,
   );
   for (const c of sorted) {
-    if (c.edited) plan.edited.push(c);
+    if (c.cx === 0 && c.cz === 0) plan.spawn.push(c);
+    else if (c.edited) plan.edited.push(c);
     else if (presenceCount.get(c.pubkey.toBase58()) !== 0) plan.occupied.push(c);
     else plan.closable.push(c);
   }
@@ -97,3 +100,31 @@ export async function fetchWithdrawPlan(er: Connection, programId: PublicKey, pl
 /** Sanity: the chunk PDA of a parsed prefix matches its address (guards a bad slice). */
 export const prefixMatches = (programId: PublicKey, c: SponsoredChunk) =>
   chunkPda(programId, c.world, c.cx, c.cz).equals(c.pubkey);
+
+// ---------------------------------------------------------------- withdraw phases
+
+/** Where an interrupted withdraw stands, from chain state:
+ *  - `withdrawBase`: the Player is back on base (owned by our program) with SOL above its
+ *    rent-exempt minimum → `withdraw_base`; `done` if nothing is left.
+ *  - `settling`: base still delegated, but the ER no longer holds it delegated (or our
+ *    `withdraw` tx is known to have landed) → wait for the base settlement.
+ *  - `withdraw`: still delegated and live on the ER → send `withdraw`.
+ *  - `none`: no Player on base. */
+export type WithdrawPhase = "withdraw" | "settling" | "withdrawBase" | "done" | "none";
+
+export function withdrawPhase(o: {
+  programId: PublicKey;
+  /** Owner of the Player on base (null: missing). */
+  baseOwner: PublicKey | null;
+  /** Base lamports above the rent-exempt minimum. */
+  spendable: number;
+  /** The ER holds the Player as a live delegated account. */
+  onEr: boolean;
+  /** A `withdraw` tx of ours confirmed on the ER. */
+  withdrawLanded: boolean;
+}): WithdrawPhase {
+  if (!o.baseOwner) return "none";
+  if (o.baseOwner.equals(o.programId)) return o.spendable > 0 ? "withdrawBase" : "done";
+  if (o.withdrawLanded || !o.onEr) return "settling";
+  return "withdraw";
+}

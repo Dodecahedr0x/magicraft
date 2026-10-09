@@ -17,7 +17,7 @@ import { bs58, burnerAllowed, burnerKey, burnerKeypair, chainFor, isLocalRpc, lo
 import { chunksFor, parseSol } from "./onboarding";
 import { PARAM_FIELDS, fromForm, jumpHeight, toForm, validateForm, validateName } from "./params";
 import { decodeWorldList, visibleWorlds, worldFilters, worldStatus } from "./worldList";
-import { CHUNK_PREFIX_LEN, parseChunkPrefix, planWithdraw, prefixMatches, type SponsoredChunk } from "./withdrawPlan";
+import { CHUNK_PREFIX_LEN, parseChunkPrefix, planWithdraw, prefixMatches, withdrawPhase, type SponsoredChunk } from "./withdrawPlan";
 
 const PID = new PublicKey("4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9");
 
@@ -215,15 +215,17 @@ describe("withdraw plan", () => {
 
   it("splits closable / edited / occupied and closes the farthest first", () => {
     const mk = (cx: number, cz: number, edited = false): SponsoredChunk => ({ pubkey: chunkPda(PID, world, cx, cz), world, cx, cz, edited, genStage: 2 });
-    const chunks = [mk(0, 0, true), mk(1, 0), mk(2, 0), mk(0, 1), mk(-1, 0)];
+    const chunks = [mk(0, 0), mk(1, 0), mk(2, 0), mk(0, 1), mk(-1, 0), mk(3, 3, true)];
     const counts = new Map([
+      [chunks[0].pubkey.toBase58(), 0], // (0,0): empty but never closable
       [chunks[1].pubkey.toBase58(), 0],
       [chunks[2].pubkey.toBase58(), 0],
       [chunks[3].pubkey.toBase58(), 1], // someone inside
       // chunks[4]: presence unknown → not closable
     ]);
     const plan = planWithdraw(chunks, counts);
-    expect(plan.edited.map((c) => [c.cx, c.cz])).toEqual([[0, 0]]);
+    expect(plan.spawn.map((c) => [c.cx, c.cz])).toEqual([[0, 0]]);
+    expect(plan.edited.map((c) => [c.cx, c.cz])).toEqual([[3, 3]]);
     expect(plan.closable.map((c) => [c.cx, c.cz])).toEqual([
       [2, 0],
       [1, 0],
@@ -233,17 +235,31 @@ describe("withdraw plan", () => {
       [0, 1],
     ]);
     expect(plan.refund).toBe(2 * CHUNK_TOTAL_RENT);
-    expect(planWithdraw([], new Map())).toEqual({ closable: [], edited: [], occupied: [], refund: 0 });
+    expect(planWithdraw([], new Map())).toEqual({ closable: [], edited: [], spawn: [], occupied: [], refund: 0 });
+  });
+
+  it("derives the withdraw phase from chain state", () => {
+    const delegation = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+    const st = { programId: PID, baseOwner: delegation as PublicKey | null, spendable: 0, onEr: true, withdrawLanded: false };
+    expect(withdrawPhase(st)).toBe("withdraw");
+    expect(withdrawPhase({ ...st, withdrawLanded: true })).toBe("settling");
+    expect(withdrawPhase({ ...st, onEr: false })).toBe("settling");
+    expect(withdrawPhase({ ...st, baseOwner: PID, spendable: 5 })).toBe("withdrawBase");
+    expect(withdrawPhase({ ...st, baseOwner: PID, spendable: 0, withdrawLanded: true })).toBe("done");
+    expect(withdrawPhase({ ...st, baseOwner: null })).toBe("none");
   });
 });
 
 describe("burner wallet", () => {
-  it("is offered only in dev builds or against a local RPC", () => {
-    expect(burnerAllowed(false, "https://api.devnet.solana.com")).toBe(true);
-    expect(burnerAllowed(true, "http://127.0.0.1:8799")).toBe(true);
-    expect(burnerAllowed(true, "http://localhost:8799")).toBe(true);
-    expect(burnerAllowed(true, "https://api.devnet.solana.com")).toBe(false);
-    expect(burnerAllowed(true, "https://127.0.0.1.evil.example")).toBe(false);
+  it("is offered only against a local RPC or when explicitly enabled, never on mainnet", () => {
+    expect(burnerAllowed("http://127.0.0.1:8799")).toBe(true);
+    expect(burnerAllowed("http://localhost:8799")).toBe(true);
+    expect(burnerAllowed("https://api.devnet.solana.com")).toBe(false);
+    expect(burnerAllowed("https://api.devnet.solana.com", "1")).toBe(true);
+    expect(burnerAllowed("https://api.devnet.solana.com", "0")).toBe(false);
+    expect(burnerAllowed("https://api.mainnet-beta.solana.com", "1")).toBe(false);
+    expect(burnerAllowed("https://rpc.example.com", true)).toBe(false); // unknown → mainnet
+    expect(burnerAllowed("https://127.0.0.1.evil.example")).toBe(false);
     expect(isLocalRpc("not a url")).toBe(false);
   });
 

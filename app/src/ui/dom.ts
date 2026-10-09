@@ -1,5 +1,6 @@
 // Tiny DOM helpers shared by the screens (no framework).
 import { LAMPORTS_PER_SOL, type PublicKey } from "@solana/web3.js";
+import type { SendResult } from "../chain";
 import { TxError } from "../wallet";
 
 type Child = Node | string | number | null | undefined | false;
@@ -64,7 +65,7 @@ export function focusHeading(root: Element) {
 
 /** Runs `fn` with `btn` disabled and marked busy; restores it afterwards. */
 export async function busy<T>(btn: HTMLButtonElement, label: string, fn: () => Promise<T>): Promise<T> {
-  const old = btn.innerHTML;
+  const old = [...btn.childNodes];
   btn.disabled = true;
   btn.setAttribute("aria-busy", "true");
   btn.textContent = label;
@@ -73,7 +74,26 @@ export async function busy<T>(btn: HTMLButtonElement, label: string, fn: () => P
   } finally {
     btn.disabled = false;
     btn.removeAttribute("aria-busy");
-    btn.innerHTML = old;
+    btn.replaceChildren(...old);
+  }
+}
+
+/** A readable message for a failed / superseded ER send (null when confirmed). */
+export function sendResultMessage(r: SendResult, what = "Transaction"): string | null {
+  if (r.status === "confirmed") return null;
+  if (r.status === "superseded") return `${what} was superseded by a newer one.`;
+  const f = r.error;
+  switch (f.kind) {
+    case "topup":
+      return "Your player is out of SOL for rent. Top it up, then retry.";
+    case "renewSession":
+      return "Your play session expired. Renew it, then retry.";
+    case "timeout":
+      return `${what} was not confirmed in time; it may still land. Retry to continue from where it got.`;
+    case "send":
+      return `${what} could not be sent: ${f.message}`;
+    default:
+      return f.message;
   }
 }
 

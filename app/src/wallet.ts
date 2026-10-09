@@ -61,8 +61,13 @@ export function isLocalRpc(url: string): boolean {
   }
 }
 
-/** The burner is offered in dev builds, or in any build pointed at a local base RPC. */
-export const burnerAllowed = (prod: boolean, baseRpc: string) => !prod || isLocalRpc(baseRpc);
+/** The burner is offered (in any build) when the base RPC is local, or when explicitly
+ *  enabled (`VITE_BURNER=1`, e.g. a devnet test deployment); never against mainnet. */
+export function burnerAllowed(baseRpc: string, explicit?: string | boolean): boolean {
+  if (isLocalRpc(baseRpc)) return true;
+  const on = explicit === true || explicit === "1" || explicit === "true";
+  return on && chainFor(baseRpc) !== "solana:mainnet";
+}
 
 /** One burner per base RPC (a fresh local ledger keeps the same key; airdrops refill it). */
 export const burnerKey = (baseRpc: string) => `magicraft.burner.${baseRpc}`;
@@ -252,7 +257,7 @@ export async function sendWithWallet(
   wallet: AppWallet,
   conn: Connection,
   tx: Transaction,
-  opts: { viaWallet?: boolean; timeoutMs?: number; skipPreflight?: boolean } = {},
+  opts: { viaWallet?: boolean; timeoutMs?: number; skipPreflight?: boolean; onSent?: (sig: string) => void } = {},
 ): Promise<string> {
   let sig: string;
   if (wallet.signTransaction) {
@@ -263,6 +268,7 @@ export async function sendWithWallet(
   } else {
     throw new Error(`${wallet.name} cannot sign transactions without sending them`);
   }
+  opts.onSent?.(sig);
   await confirmSig(conn, sig, opts.timeoutMs);
   return sig;
 }

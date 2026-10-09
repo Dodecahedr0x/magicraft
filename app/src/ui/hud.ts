@@ -21,9 +21,9 @@ import {
 } from "../chain";
 import type { App } from "../state";
 import { isLocalRpc, sendWithWallet } from "../wallet";
-import { announce, busy, clear, errText, h, short, sleep, sol } from "./dom";
-import { parseSol, chunksFor, renewSession, forgetWallet } from "./onboarding";
-import { fetchWithdrawPlan, type SponsoredChunk, type WithdrawPlan } from "./withdrawPlan";
+import { announce, busy, clear, errText, h, sendResultMessage, short, sleep, sol } from "./dom";
+import { parseSol, chunksFor, renewSession, forgetWallet, releaseWallet } from "./onboarding";
+import { fetchWithdrawPlan, withdrawPhase, type SponsoredChunk, type WithdrawPhase, type WithdrawPlan } from "./withdrawPlan";
 
 export type Hud = {
   el: HTMLElement;
@@ -117,6 +117,7 @@ export function createHud(app: App, ev: HudEvents): Hud {
   discBtn.addEventListener("click", async () => {
     hud.detach();
     forgetWallet(app);
+    releaseWallet();
     await app.state.wallet?.disconnect().catch(() => {});
     app.set({ wallet: null, player: null, session: null, sender: null, world: null, sessionStale: false });
     ev.onDisconnect();
@@ -137,23 +138,38 @@ export function createHud(app: App, ev: HudEvents): Hud {
 
 // ---------------------------------------------------------------- dialogs
 
-function dialog(title: string, ...body: (Node | string)[]): { dlg: HTMLDialogElement; body: HTMLElement; close: () => void } {
+type Dialog = { dlg: HTMLDialogElement; body: HTMLElement; close: () => void; setBusy: (b: boolean) => void };
+
+function dialog(title: string, ...body: (Node | string)[]): Dialog {
   const content = h("div", { class: "dialog-body" }, ...body);
   const x = h("button", { class: "icon-btn", type: "button", "aria-label": "Close" }, "×");
   const dlg = h("dialog", { class: "dialog", "aria-labelledby": "dlg-title" }, h("div", { class: "dialog-head" }, h("h2", { id: "dlg-title" }, title), x), content);
+  let busyNow = false;
   const close = () => {
-    dlg.close();
-    dlg.remove();
+    if (dlg.open) dlg.close();
   };
   x.addEventListener("click", close);
   dlg.addEventListener("cancel", (e) => {
-    if (dlg.dataset.busy) e.preventDefault();
+    if (busyNow) e.preventDefault();
   });
   dlg.addEventListener("close", () => dlg.remove());
   document.body.append(dlg);
   dlg.showModal();
-  return { dlg, body: content, close };
+  return {
+    dlg,
+    body: content,
+    close,
+    setBusy(b) {
+      busyNow = b;
+      x.disabled = b;
+    },
+  };
 }
+
+/** Shown before a wallet signs a tx that runs on the rollup: wallets simulate it against
+ *  the base layer, where it would fail, and may say so. */
+const ER_SIGN_NOTE =
+  "Your wallet may warn that this transaction could fail: it checks it against the base layer, but it runs on the rollup. That warning is expected.";
 
 /** Top-up: e-SPL `lamportsDelegatedTransferIx` (base tx, credited on the ER in ~100 ms). */
 export function openTopUp(app: App) {
@@ -162,6 +178,7 @@ export function openTopUp(app: App) {
   const input = h("input", { id: "topup-amount", class: "input", inputmode: "decimal", value: "0.05", autocomplete: "off", "aria-describedby": "topup-cost topup-err" });
   const cost = h("p", { id: "topup-cost", class: "hint" });
   const err = h("p", { id: "topup-err", class: "form-error", role: "alert" });
+  const status = h("p", { class: "muted", role: "status" });
   const go = h("button", { class: "btn primary", type: "submit" }, "Top up");
   const update = () => {
     const r = parseSol(input.value, 0.001);
@@ -182,6 +199,7 @@ export function openTopUp(app: App) {
   };
   input.addEventListener("input", update);
   update();
+  const actions = h("div", { class: "actions" }, go);
   const form = h(
     "form",
     { novalidate: true },
@@ -190,7 +208,8 @@ export function openTopUp(app: App) {
     h("div", { class: "input-wrap" }, input, h("span", { class: "suffix" }, "SOL")),
     cost,
     err,
-    h("div", { class: "actions" }, go),
+    status,
+    actions,
   );
   const d = dialog("Top up player", form);
   input.focus();
@@ -199,10 +218,10 @@ export function openTopUp(app: App) {
     e.preventDefault();
     const lamports = update();
     if (lamports === null) return;
-    d.dlg.dataset.busy = "1";
+    d.setBusy(true);
     void busy(go, "Waiting for the wallet…", async () => {
       try {
-        const before = (await app.conns.er.getBalance(player, "confirmed")) ?? 0;
+        const before = await app.conns.er.getBalance(player, "confirmed");
         const ixs = [];
         // The local stack's e-SPL rent PDA is not pre-funded (MagicBlock clusters' is).
         if (isLocalRpc(app.cfg.baseRpc)) {
@@ -214,17 +233,28 @@ export function openTopUp(app: App) {
         await sendWithWallet(wallet, app.conns.base, await walletTx(app.conns.base, wallet.publicKey, ixs), { viaWallet: true });
         go.textContent = "Waiting for the rollup…";
         const t0 = Date.now();
-        while (Date.now() - t0 < 20_000) {
-          if ((await app.conns.er.getBalance(player, "confirmed")) >= before + lamports) break;
-          await sleep(100);
+        let credited = false;
+        while (!credited && Date.now() - t0 < 20_000) {
+          credited = (await app.conns.er.getBalance(player, "confirmed")) >= before + lamports;
+          if (!credited) await sleep(100);
         }
-        announce(`Topped up ${sol(lamports)} SOL.`);
-        delete d.dlg.dataset.busy;
-        d.close();
+        if (credited) {
+          announce(`Topped up ${sol(lamports)} SOL.`);
+          d.setBusy(false);
+          d.close();
+          return;
+        }
+        // Paid on base but not visible on the rollup yet: report it as pending.
+        status.textContent = `Sent: ${sol(lamports)} SOL is paid but the rollup hasn't credited it yet. It should appear in your player balance shortly.`;
+        announce(status.textContent);
+        const ok = h("button", { class: "btn", type: "button" }, "Close");
+        ok.addEventListener("click", d.close);
+        actions.replaceChildren(ok);
+        ok.focus();
       } catch (e) {
         err.textContent = errText(e);
       } finally {
-        delete d.dlg.dataset.busy;
+        d.setBusy(false);
       }
     });
   });
@@ -232,20 +262,24 @@ export function openTopUp(app: App) {
 
 const chunkLabel = (c: SponsoredChunk) => `(${c.cx}, ${c.cz}) in ${short(c.world)}`;
 
-/** Closes the plan's closable chunks one by one (session-signed); returns how many closed. */
-async function closeChunks(app: App, chunks: SponsoredChunk[], progress: (i: number, msg: string) => void): Promise<number> {
+type CloseResult = { closed: number; failed: null | { chunk: SponsoredChunk; message: string; session: boolean } };
+
+/** Closes the plan's closable chunks one by one (session-signed); stops at the first
+ *  failure. */
+async function closeChunks(app: App, chunks: SponsoredChunk[], progress: (i: number, msg: string) => void): Promise<CloseResult> {
   const { sender, session, player } = app.state;
-  if (!sender || !session || !player) throw new Error("Start a session first.");
+  if (!sender || !session || !player) return { closed: 0, failed: { chunk: chunks[0], message: "No play session.", session: true } };
   const auth = sessionAuth(session, player);
   let closed = 0;
   for (const [i, c] of chunks.entries()) {
     progress(i, `Closing ${chunkLabel(c)}…`);
     const view = await fetchChunkView(app.conns.er, app.cfg.programId, c.world, NBR_OFF.map(([dx, dz]) => [c.cx + dx, c.cz + dz]));
     const r = await sender.send(async () => [await closeChunkIx(app.program, auth, c.world, c.cx, c.cz, view)]);
-    if (r.status === "confirmed") closed++;
-    else if (r.status === "failed") progress(i, `${chunkLabel(c)}: ${r.error.name ?? r.error.message}`);
+    const msg = sendResultMessage(r, `Closing ${chunkLabel(c)}`);
+    if (msg !== null) return { closed, failed: { chunk: c, message: msg, session: r.status === "failed" && r.error.kind === "renewSession" } };
+    closed++;
   }
-  return closed;
+  return { closed, failed: null };
 }
 
 /** `withdraw_base` of everything above the Player's rent-exempt minimum; returns lamports. */
@@ -270,20 +304,53 @@ async function waitSettled(app: App, player: PublicKey, tick: (s: number) => voi
     tick(Math.round((Date.now() - t0) / 1000));
     await sleep(500);
   }
-  throw new Error("The rollup hasn't settled your player on the base layer yet. It will; reopen Withdraw in a minute to finish.");
+  throw new Error("The rollup hasn't settled your player on the base layer yet. It will; try again in a minute to finish.");
+}
+
+const withdrawSigKey = (player: PublicKey) => `magicraft.withdrawSig.${player.toBase58()}`;
+
+/** The current withdraw phase of the Player, from chain state (and our last `withdraw` sig). */
+export async function currentWithdrawPhase(app: App): Promise<WithdrawPhase> {
+  const player = app.state.player!;
+  const { base, er } = app.conns;
+  const [bi, ei] = await Promise.all([base.getAccountInfo(player, "confirmed"), er.getAccountInfo(player, "confirmed")]);
+  let spendable = 0;
+  if (bi?.owner.equals(app.cfg.programId)) spendable = bi.lamports - (await base.getMinimumBalanceForRentExemption(bi.data.length));
+  let landed = false;
+  let sig: string | null = null;
+  try {
+    sig = app.store?.getItem(withdrawSigKey(player)) ?? null;
+  } catch {
+    /* storage unavailable */
+  }
+  if (sig && bi && !bi.owner.equals(app.cfg.programId)) {
+    const st = (await er.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0];
+    landed = !!st && !st.err && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized");
+  }
+  return withdrawPhase({
+    programId: app.cfg.programId,
+    baseOwner: bi?.owner ?? null,
+    spendable,
+    // A delegated Player the ER serves as ours (owner = program) is still live there.
+    onEr: !!ei && ei.owner.equals(app.cfg.programId),
+    withdrawLanded: landed,
+  });
 }
 
 function planSummary(plan: WithdrawPlan, openChunks: number | null): HTMLElement {
   const li = (n: number, text: string, cls: string) => (n ? h("li", { class: cls }, h("strong", {}, String(n)), " ", text) : null);
+  const total = plan.closable.length + plan.edited.length + plan.spawn.length + plan.occupied.length;
+  const n = openChunks ?? total;
   return h(
     "div",
     { class: "plan" },
-    h("p", {}, `Your player sponsors ${openChunks ?? plan.closable.length + plan.edited.length + plan.occupied.length} open chunk${openChunks === 1 ? "" : "s"}.`),
+    h("p", {}, `Your player sponsors ${n} open chunk${n === 1 ? "" : "s"}.`),
     h(
       "ul",
       { class: "plan-list" },
       li(plan.closable.length, `untouched and empty: closing ${plan.closable.length === 1 ? "it" : "them"} refunds ${sol(plan.refund, 5)} SOL now.`, "ok"),
       li(plan.edited.length, "edited: their rent stays locked for good (the world keeps your changes).", "locked"),
+      li(plan.spawn.length, `spawn chunk${plan.spawn.length === 1 ? "" : "s"} (0, 0): every player arrives there, so ${plan.spawn.length === 1 ? "it stays" : "they stay"} open and the rent stays locked.`, "locked"),
       li(plan.occupied.length, "untouched but with someone listed inside: can't be closed right now.", "warn"),
     ),
     plan.closable.length || plan.occupied.length
@@ -292,71 +359,133 @@ function planSummary(plan: WithdrawPlan, openChunks: number | null): HTMLElement
   );
 }
 
-/** Withdraw dialog: plan → (close chunks) → withdraw → settlement → withdraw_base. */
+/** Withdraw dialog: plan → (close chunks) → withdraw → settlement → withdraw_base. Each
+ *  attempt re-derives its phase from the chain, so a retry (or a reopened dialog) resumes
+ *  where the last one stopped. `done()` runs once, when the dialog closes after any
+ *  attempt (the app then re-derives its screen). */
 export function openWithdraw(app: App, openChunks: number | null, done: () => void) {
-  const status = h("p", { class: "muted", role: "status" }, "Looking up the chunks your player sponsors…");
+  const status = h("p", { class: "muted", role: "status" }, "Checking your player…");
   const err = h("p", { class: "form-error", role: "alert" });
   const actions = h("div", { class: "actions" });
   const d = dialog("Withdraw", status, err, actions);
   const wallet = app.state.wallet!;
   const player = app.state.player!;
+  let attempted = false;
+  let finished = false;
+  d.dlg.addEventListener("close", () => {
+    if (attempted && !finished) {
+      finished = true;
+      done();
+    }
+  });
+  const button = (label: string, cls: string, onClick: () => void) => {
+    const b = h("button", { class: `btn ${cls}`, type: "button" }, label);
+    b.addEventListener("click", onClick);
+    actions.append(b);
+    return b;
+  };
 
-  const withdraw = async (closeFirst: WithdrawPlan["closable"]) => {
-    d.dlg.dataset.busy = "1";
+  /** Runs the remaining phases (after closing `closeFirst`). */
+  const run = async (closeFirst: SponsoredChunk[]) => {
+    attempted = true;
+    d.setBusy(true);
     clear(actions);
     err.textContent = "";
     try {
       if (closeFirst.length) {
-        const n = await closeChunks(app, closeFirst, (i, msg) => (status.textContent = `${msg} (${i + 1}/${closeFirst.length})`));
-        status.textContent = `Closed ${n} of ${closeFirst.length} chunks.`;
+        const r = await closeChunks(app, closeFirst, (i, msg) => (status.textContent = `${msg} (${i + 1}/${closeFirst.length})`));
+        if (r.failed) {
+          const rest = closeFirst.slice(closeFirst.indexOf(r.failed.chunk));
+          status.textContent = `Closed ${r.closed} of ${closeFirst.length} chunks, then stopped.`;
+          err.textContent = r.failed.message;
+          d.setBusy(false);
+          if (r.failed.session)
+            button("Renew session", "primary", () =>
+              void (async () => {
+                try {
+                  d.setBusy(true);
+                  await renewSession(app);
+                  await run(rest);
+                } catch (e) {
+                  d.setBusy(false);
+                  err.textContent = errText(e);
+                }
+              })(),
+            );
+          button("Withdraw anyway", r.failed.session ? "ghost" : "primary", () => void run([]));
+          (actions.firstElementChild as HTMLElement | null)?.focus();
+          return;
+        }
+        status.textContent = `Closed ${r.closed} chunk${r.closed === 1 ? "" : "s"}.`;
       }
-      status.textContent = "Approve the withdraw in your wallet…";
-      const er = app.conns.er;
-      const tx = await walletTx(er, wallet.publicKey, [await withdrawIx(app.program, wallet.publicKey)]);
-      await sendWithWallet(wallet, er, tx, { skipPreflight: true, timeoutMs: 30_000 });
-      await waitSettled(app, player, (s) => (status.textContent = `Settling on the base layer… ${s}s (the first settlement on a fresh rollup can take ~10 s)`));
-      status.textContent = "Approve the transfer to your wallet…";
-      const got = await withdrawBaseFlow(app);
-      status.textContent = `Done. ${sol(got, 6)} SOL is back in your wallet.`;
+      let phase = await currentWithdrawPhase(app);
+      if (phase === "withdraw") {
+        status.textContent = wallet.burner ? "Withdrawing…" : `Approve the withdraw in your wallet. ${ER_SIGN_NOTE}`;
+        const er = app.conns.er;
+        const tx = await walletTx(er, wallet.publicKey, [await withdrawIx(app.program, wallet.publicKey)]);
+        try {
+          await sendWithWallet(wallet, er, tx, {
+            skipPreflight: true,
+            timeoutMs: 30_000,
+            onSent: (sig) => {
+              try {
+                app.store?.setItem(withdrawSigKey(player), sig);
+              } catch {
+                /* storage unavailable: the ER state still tells */
+              }
+            },
+          });
+        } catch (e) {
+          // A timed-out withdraw may still have landed: re-derive before failing.
+          phase = await currentWithdrawPhase(app);
+          if (phase === "withdraw") throw e;
+        }
+        phase = "settling";
+      }
+      if (phase === "settling") {
+        await waitSettled(app, player, (s) => (status.textContent = `Settling on the base layer… ${s}s (the first settlement on a fresh rollup can take ~10 s)`));
+        phase = await currentWithdrawPhase(app);
+      }
+      let got = 0;
+      if (phase === "withdrawBase") {
+        status.textContent = wallet.burner ? "Transferring to your wallet…" : "Approve the transfer to your wallet…";
+        got = await withdrawBaseFlow(app);
+      }
+      try {
+        app.store?.removeItem(withdrawSigKey(player));
+      } catch {
+        /* storage unavailable */
+      }
+      status.textContent = got ? `Done. ${sol(got, 6)} SOL is back in your wallet.` : "Done. Your player is back on the base layer.";
       announce(status.textContent);
-      delete d.dlg.dataset.busy;
-      const ok = h("button", { class: "btn primary", type: "button" }, "Close");
-      ok.addEventListener("click", () => {
-        d.close();
-        done();
-      });
-      actions.append(ok);
-      d.dlg.addEventListener("close", done, { once: true });
-      ok.focus();
+      d.setBusy(false);
+      button("Close", "primary", d.close).focus();
     } catch (e) {
-      delete d.dlg.dataset.busy;
+      d.setBusy(false);
       err.textContent = errText(e);
-      const retry = h("button", { class: "btn", type: "button" }, "Try again");
-      retry.addEventListener("click", () => void withdraw([]));
-      actions.append(retry);
+      button("Try again", "primary", () => void run([])).focus();
     }
   };
 
-  void fetchWithdrawPlan(app.conns.er, app.cfg.programId, player).then(
-    (plan) => {
+  // A withdraw already under way (reload, earlier failure): resume it directly.
+  void currentWithdrawPhase(app)
+    .then(async (phase) => {
+      if (phase === "settling" || phase === "withdrawBase") {
+        status.textContent = "A withdraw is already under way.";
+        button("Finish withdraw", "primary", () => void run([])).focus();
+        return;
+      }
+      status.textContent = "Looking up the chunks your player sponsors…";
+      const plan = await fetchWithdrawPlan(app.conns.er, app.cfg.programId, player);
       status.before(planSummary(plan, openChunks));
       status.textContent = "";
-      if (plan.closable.length) {
-        const a = h("button", { class: "btn primary", type: "button" }, `Close ${plan.closable.length} and withdraw`);
-        a.addEventListener("click", () => void withdraw(plan.closable));
-        actions.append(a);
-      }
-      const b = h("button", { class: `btn${plan.closable.length ? " ghost" : " primary"}`, type: "button" }, plan.closable.length ? "Withdraw without closing" : "Withdraw everything");
-      b.addEventListener("click", () => void withdraw([]));
-      actions.append(b);
+      if (plan.closable.length) button(`Close ${plan.closable.length} and withdraw`, "primary", () => void run(plan.closable));
+      button(plan.closable.length ? "Withdraw without closing" : "Withdraw everything", plan.closable.length ? "ghost" : "primary", () => void run([]));
       (actions.firstElementChild as HTMLElement | null)?.focus();
-    },
-    (e) => {
+    })
+    .catch((e) => {
       status.textContent = "";
       err.textContent = `Couldn't list your chunks (${errText(e)}). You can still withdraw.`;
-      const b = h("button", { class: "btn primary", type: "button" }, "Withdraw anyway");
-      b.addEventListener("click", () => void withdraw([]));
-      actions.append(b);
-    },
-  );
+      button("Withdraw anyway", "primary", () => void run([]));
+    });
 }

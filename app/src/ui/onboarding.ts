@@ -1,11 +1,12 @@
 // Onboarding screens: connect a wallet → create + fund + delegate the Player (one wallet tx)
 // → start a session (one wallet tx; restored from storage when still valid onchain).
-import { LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { LAMPORTS_PER_SOL, Transaction } from "@solana/web3.js";
 import {
   CHUNK_TOTAL_RENT,
   ErSender,
   clearSession,
-  createSessionTx,
+  newSession as buildSession,
+  revokeSessionIx,
   ephemeralRent,
   PLAYER_LEN,
   loadSession,
@@ -75,18 +76,28 @@ export const forgetWallet = (app: App) => {
   }
 };
 
+let offWalletChange: (() => void) | null = null;
+
+/** Stops following the current wallet's account changes (disconnect / switch). */
+export function releaseWallet() {
+  offWalletChange?.();
+  offWalletChange = null;
+}
+
 /** Sets the connected wallet (and its Player PDA) and follows account switches. */
 function useWallet(app: App, w: AppWallet, next: () => void) {
+  releaseWallet();
   app.set({ wallet: w, player: playerPda(app.cfg.programId, w.publicKey), session: null, sender: null, world: null, sessionStale: false });
   remember(app, w.name);
-  w.onChange(() => {
+  offWalletChange = w.onChange(() => {
+    releaseWallet();
     app.set({ wallet: null, player: null, session: null, sender: null, world: null });
     next();
   });
   next();
 }
 
-const burnerOk = (app: App) => burnerAllowed(import.meta.env.PROD, app.cfg.baseRpc);
+const burnerOk = (app: App) => burnerAllowed(app.cfg.baseRpc, import.meta.env.VITE_BURNER);
 
 async function connectBurner(app: App): Promise<AppWallet> {
   const kp = burnerKeypair(app.store, app.cfg.baseRpc);
@@ -346,11 +357,20 @@ export async function restoreSession(app: App): Promise<Session | null> {
   return null;
 }
 
-/** Creates a new session (one wallet approval) and makes it active. */
-export async function newSession(app: App): Promise<Session> {
+/** Creates a new session (one wallet approval) and makes it active. With `revoke`, the
+ *  same tx revokes that old token if it still exists (rent back to the wallet). */
+export async function newSession(app: App, revoke: Session | null = null): Promise<Session> {
   const w = app.state.wallet!;
-  const { tx, session } = await createSessionTx(app.conns.base, app.cfg.programId, w.publicKey);
-  await sendWithWallet(w, app.conns.base, tx, { viaWallet: true });
+  const base = app.conns.base;
+  const { session, ix } = buildSession(app.cfg.programId, w.publicKey);
+  const tx = new Transaction();
+  if (revoke && revoke.authority.equals(w.publicKey) && (await base.getAccountInfo(revoke.token, "confirmed")))
+    tx.add(revokeSessionIx(revoke.token, w.publicKey));
+  tx.add(ix);
+  tx.feePayer = w.publicKey;
+  tx.recentBlockhash = (await base.getLatestBlockhash("confirmed")).blockhash;
+  tx.partialSign(session.kp);
+  await sendWithWallet(w, base, tx, { viaWallet: true });
   saveSession(app.store, session);
   useSession(app, session);
   return session;
@@ -395,7 +415,8 @@ export async function showSession(app: App, root: HTMLElement, next: () => void)
 
 /** Banner action: renew an expired / revoked session in place. */
 export async function renewSession(app: App): Promise<void> {
+  const old = app.state.session;
   clearSession(app.store, app.cfg.programId, app.state.wallet!.publicKey);
-  await newSession(app);
+  await newSession(app, old);
 }
 

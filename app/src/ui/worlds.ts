@@ -12,7 +12,7 @@ import {
 } from "../chain";
 import type { App } from "../state";
 import { createWorldPanel, progress } from "./createWorld";
-import { busy, clear, errText, focusHeading, h, short } from "./dom";
+import { busy, clear, errText, focusHeading, h, sendResultMessage, short } from "./dom";
 import { toForm } from "./params";
 import { fetchWorlds, visibleWorlds, type WorldEntry } from "./worldList";
 
@@ -41,13 +41,11 @@ export async function joinOrResume(app: App, world: PublicKey): Promise<{ accoun
   void dayCrankWatchdog(app, world, account).catch(() => {});
   if (pi) return { account, joined: false };
   const r = await app.state.sender!.send(async () => [await joinWorldIx(app.program, app.auth(), world)]);
-  if (r.status !== "confirmed") {
-    const f = r.status === "failed" ? r.error : null;
-    if (f?.kind === "topup") throw new Error("Your player needs more SOL to join. Top it up first.");
-    if (f?.kind === "renewSession") throw new Error("Your play session expired. Renew it (top bar), then join.");
+  const msg = sendResultMessage(r, "Join");
+  if (msg !== null) {
     // A timed-out join may have landed: check before failing.
     if (await er.getAccountInfo(pstatePda(app.cfg.programId, world, app.state.player!), "confirmed")) return { account, joined: true };
-    throw new Error(f?.message ?? "Join was superseded.");
+    throw new Error(msg);
   }
   return { account, joined: true };
 }
