@@ -188,6 +188,7 @@ pub mod magicraft {
     }
 
     /// Test hook (`localnet` builds only): cancels a chunk's tick task, header untouched.
+    #[cfg(feature = "localnet")]
     pub fn debug_cancel_tick(ctx: Context<DebugCancelTick>) -> Result<()> {
         instructions::crank::debug_cancel_tick(ctx)
     }

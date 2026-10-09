@@ -6,8 +6,19 @@
 //!
 //! # Chunk tick crank
 //! **Authority** = the Chunk PDA (seeds `["chunk", world, cx, cz, bump]`), task id
-//! `sha256("tick" ‖ chunk)` (`scheduler::task_id`, stored in the header by `create_chunk`).
-//! Same authority + id replaces, so every arm is idempotent in task count.
+//! `sha256("tick" ‖ chunk ‖ task_epoch)` (`scheduler::task_id`, stored in the header).
+//! Same authority + id replaces, so every arm is idempotent in task count. A **writable**
+//! arm that finds the crank armed but stale ([`prepare_arm`]) cancels the old id and moves
+//! to the next epoch, abandoning an id a foreign task may have squatted (residual risk: all
+//! 256 epochs squatted; re-check with Hydra, Task 28). Read-only arms (`move_player`) keep
+//! the epoch.
+//!
+//! **Untrusted lists:** `tick_chunk` is callable by anyone, so nothing it schedules is built
+//! from the passed accounts: renewals and repairs use [`derive_tick_ix`] (header bumps +
+//! mask), existing neighbors' presences must be their canonical PDAs, and a list that
+//! doesn't match triggers a repair re-arm at most once per `CRANK_STALE_MS`
+//! (`ChunkHeader::repair_s`), otherwise a no-op. Arming a neighbor from inside a tick is
+//! best effort (errors are logged, the tick continues).
 //!
 //! **Account list** ([`tick_ix`]): `[world (ro), chunk, presence, N, S, E, W chunks, N, S,
 //! E, W presences, magic_program (ro)]`, all chunk/presence accounts writable. A **missing
@@ -48,8 +59,8 @@
 //! ungated re-arms would let callers drive the tick rate (Task 16).
 //!
 //! **Never fails** on recoverable state: an inconsistent account list (wrong / duplicate
-//! accounts, a present neighbor with a bad presence, a missing neighbor that is not its
-//! PDA) makes the tick a no-op, never an error (the scheduler drops a task after ~26 s of
+//! accounts, a bad neighbor presence) makes the tick a (throttled) repair or a no-op,
+//! never an error (the scheduler drops a task after ~26 s of
 //! failures). The only error is a center chunk that no longer exists (closed: its task
 //! should have been cancelled; failing lets the scheduler drop it).
 
@@ -86,7 +97,7 @@ pub const DAY_CRANK_ITERATIONS: i64 = u32::MAX as i64;
 /// Schedules (or replaces) `tick_day(world)` every [`DAY_TICK_MS`] with the World PDA
 /// (`world_ai`, whose stored fields are `world`) as task authority. Returns the task id.
 pub fn arm_day_crank<'info>(world_ai: &AccountInfo<'info>, world: &World) -> Result<i64> {
-    let task_id = scheduler::task_id(DAY_TASK_TAG, world_ai.key);
+    let task_id = scheduler::task_id(DAY_TASK_TAG, world_ai.key, world.day_epoch);
     let tick = Instruction {
         program_id: crate::ID,
         accounts: vec![AccountMeta::new(world_ai.key(), false)],
@@ -108,25 +119,37 @@ pub fn arm_day_crank<'info>(world_ai: &AccountInfo<'info>, world: &World) -> Res
 
 #[derive(Accounts)]
 pub struct ScheduleDayCrank<'info> {
-    /// Task authority (signs the Magic-program CPI with its PDA seeds). Read-only.
+    /// Task authority (signs the Magic-program CPI with its PDA seeds). Writable: a re-arm
+    /// rotates the task id epoch (only when stale, so the write lock is rare).
+    #[account(mut)]
     pub world: Account<'info, World>,
     pub magic_program: Program<'info, MagicProgram>,
 }
 
 /// Re-arms the World's day crank **only if it looks stalled**
 /// ([`World::day_crank_stale`]); otherwise a no-op. `create_world` arms it; clients send
-/// this when they see `last_tick_ms` stale (e.g. the scheduler dropped the task). The task
-/// id is derived from the World PDA, so a re-arm replaces the task rather than adding one.
-/// The World is read-only here (`ScheduleTask` accepts a read-only signer at account 0),
-/// so a re-arm never write-locks it.
+/// this when they see `last_tick_ms` stale (e.g. the scheduler dropped the task, or its id
+/// was squatted). A stale re-arm cancels the old task and schedules under the next
+/// `day_epoch` (a new task id, see `scheduler::task_id`), so a squatted id is abandoned
+/// and a merely slow task is not duplicated.
 pub fn schedule_day_crank(ctx: Context<ScheduleDayCrank>) -> Result<()> {
-    let world = &ctx.accounts.world;
-    let now = world.chain_ms_ro(&Clock::get()?).ms;
-    if !world.day_crank_stale(now) {
+    let now = ctx.accounts.world.chain_ms_ro(&Clock::get()?).ms;
+    if !ctx.accounts.world.day_crank_stale(now) {
         msg!("day crank alive; not re-armed");
         return Ok(());
     }
-    arm_day_crank(&world.to_account_info(), world)?;
+    let world_ai = ctx.accounts.world.to_account_info();
+    let world = &mut ctx.accounts.world;
+    if world.day_task_id != 0 {
+        let (nonce, bump) = (world.nonce.to_le_bytes(), [world.bump]);
+        scheduler::cancel(
+            &world_ai,
+            &world_seeds(&world.creator, &nonce, &bump),
+            world.day_task_id,
+        )?;
+        world.day_epoch = world.day_epoch.wrapping_add(1);
+    }
+    world.day_task_id = arm_day_crank(&world_ai, world)?;
     Ok(())
 }
 
@@ -180,6 +203,28 @@ pub fn mark_armed(h: &mut ChunkHeader, now_ms: i64) {
     h.arm_tick = h.tick_count.get() as u8;
 }
 
+/// A writable arm of chunk `key`: if the crank was believed armed but is stale (dropped,
+/// or its id squatted by a foreign task), rotates `task_epoch` / `task_id` and returns the
+/// old id (the caller cancels it, so a merely slow task is not duplicated); then
+/// [`mark_armed`].
+pub fn prepare_arm(h: &mut ChunkHeader, key: &Pubkey, now_ms: i64) -> Option<i64> {
+    let old = (h.crank_armed == 1 && crank_stale(h, now_ms)).then(|| {
+        let old = h.task_id.get();
+        h.task_epoch = h.task_epoch.wrapping_add(1);
+        h.task_id
+            .set(scheduler::task_id(TICK_TASK_TAG, key, h.task_epoch));
+        old
+    });
+    mark_armed(h, now_ms);
+    old
+}
+
+/// Cancels task `id` of `chunk_ai` (the Chunk PDA signs).
+pub fn cancel_tick<'info>(chunk_ai: &AccountInfo<'info>, k: &CrankKeys, id: i64) -> Result<()> {
+    let (cxb, czb, b) = (k.cx.to_le_bytes(), k.cz.to_le_bytes(), [k.bump]);
+    scheduler::cancel(chunk_ai, &chunk_seeds(&k.world, &cxb, &czb, &b), id)
+}
+
 /// What is needed to rebuild a chunk's tick task (copied out of its header).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CrankKeys {
@@ -190,6 +235,9 @@ pub struct CrankKeys {
     pub presence_bump: u8,
     pub nbr_bumps: [u8; 8],
     pub nbr_mask: u8,
+    /// The current task id epoch (`ChunkHeader::task_epoch`) and the stored id.
+    pub epoch: u8,
+    pub task_id: i64,
 }
 
 impl CrankKeys {
@@ -202,6 +250,8 @@ impl CrankKeys {
             presence_bump: h.presence_bump,
             nbr_bumps: h.nbr_bumps,
             nbr_mask: h.nbr_mask,
+            epoch: h.task_epoch,
+            task_id: h.task_id.get(),
         }
     }
 
@@ -280,7 +330,7 @@ pub fn schedule_tick<'info>(
     scheduler::schedule(
         chunk_ai,
         &chunk_seeds(&k.world, &cxb, &czb, &b),
-        scheduler::task_id(TICK_TASK_TAG, chunk_ai.key),
+        scheduler::task_id(TICK_TASK_TAG, chunk_ai.key, k.epoch),
         interval_ms,
         TICK_ITERATIONS,
         ix,
@@ -306,10 +356,19 @@ pub fn maybe_arm_chunk<'info>(
         }
         CrankKeys::of(&h)
     };
-    let ix = derive_tick_ix(chunk_ai.key, &k)?;
-    if chunk_ai.is_writable {
-        mark_armed(&mut *chunk_header_mut(chunk_ai)?, now_ms);
+    let (k, old) = if chunk_ai.is_writable {
+        let mut h = chunk_header_mut(chunk_ai)?;
+        let old = prepare_arm(&mut h, chunk_ai.key, now_ms);
+        (CrankKeys::of(&h), old)
+    } else {
+        // Read-only (`move_player`): no epoch rotation; the writable watchdogs
+        // (`arm_chunk`, edits, neighbor changes) rotate a squatted id.
+        (k, None)
+    };
+    if let Some(old) = old {
+        cancel_tick(chunk_ai, &k, old)?;
     }
+    let ix = derive_tick_ix(chunk_ai.key, &k)?;
     schedule_tick(chunk_ai, &k, tick_interval_ms(&world.params), ix)?;
     msg!("tick crank armed");
     Ok(true)
@@ -321,8 +380,9 @@ pub fn maybe_arm_chunk<'info>(
 pub struct ArmChunk<'info> {
     /// Read-only: chain time, tick interval.
     pub world: Account<'info, World>,
-    /// CHECK: a chunk of `world` (owner, discriminator, stored world); read-only (task
-    /// authority, signs with its seeds).
+    /// CHECK: a chunk of `world` (owner, discriminator, stored world); task authority
+    /// (signs with its seeds). Writable: a stale re-arm rotates the task id epoch.
+    #[account(mut)]
     pub chunk: UncheckedAccount<'info>,
     pub magic_program: Program<'info, MagicProgram>,
 }
@@ -345,6 +405,7 @@ pub fn arm_chunk(ctx: Context<ArmChunk>) -> Result<()> {
 
 // ---------- debug_cancel_tick (localnet builds only) ----------
 
+#[cfg(feature = "localnet")]
 #[derive(Accounts)]
 pub struct DebugCancelTick<'info> {
     pub world: Account<'info, World>,
@@ -353,11 +414,11 @@ pub struct DebugCancelTick<'info> {
     pub magic_program: Program<'info, MagicProgram>,
 }
 
-/// **Test hook, `localnet` builds only** (`Unauthorized` otherwise): cancels the chunk's
-/// tick task without touching its header, simulating a task the scheduler dropped (the
-/// watchdog test).
+/// **Test hook, compiled into `localnet` builds only**: cancels the chunk's tick task
+/// without touching its header, simulating a task the scheduler dropped (the watchdog
+/// test).
+#[cfg(feature = "localnet")]
 pub fn debug_cancel_tick(ctx: Context<DebugCancelTick>) -> Result<()> {
-    require!(cfg!(feature = "localnet"), MagicraftError::Unauthorized);
     let chunk_ai = ctx.accounts.chunk.to_account_info();
     let k = {
         let h = chunk_header(&chunk_ai)?;
@@ -368,12 +429,7 @@ pub fn debug_cancel_tick(ctx: Context<DebugCancelTick>) -> Result<()> {
         );
         CrankKeys::of(&h)
     };
-    let (cxb, czb, b) = (k.cx.to_le_bytes(), k.cz.to_le_bytes(), [k.bump]);
-    scheduler::cancel(
-        &chunk_ai,
-        &chunk_seeds(&k.world, &cxb, &czb, &b),
-        scheduler::task_id(TICK_TASK_TAG, chunk_ai.key),
-    )
+    cancel_tick(&chunk_ai, &k, k.task_id)
 }
 
 // ---------- tick_chunk (crank target, permissionless) ----------
@@ -422,8 +478,8 @@ struct TickOut {
     repair: bool,
     idle: bool,
     renew: bool,
-    /// Neighbors (N, S, E, W) to arm: their keys.
-    arm: [Option<CrankKeys>; 4],
+    /// Neighbors (N, S, E, W) to arm: their keys and an old (rotated) task id to cancel.
+    arm: [Option<(CrankKeys, Option<i64>)>; 4],
 }
 
 /// One crank tick (module docs). Never fails except when the center chunk is gone.
@@ -461,33 +517,28 @@ pub fn tick_chunk(ctx: Context<TickChunk>) -> Result<()> {
         return Ok(());
     }
     if out.idle {
-        let (cxb, czb, b) = (k.cx.to_le_bytes(), k.cz.to_le_bytes(), [k.bump]);
-        scheduler::cancel(
-            &chunk_ai,
-            &chunk_seeds(&k.world, &cxb, &czb, &b),
-            scheduler::task_id(TICK_TASK_TAG, chunk_ai.key),
-        )?;
+        cancel_tick(&chunk_ai, k, k.task_id)?;
         msg!("tick: idle, crank cancelled");
     } else if out.renew {
-        let keys = |v: &[AccountInfo; 4]| [*v[0].key, *v[1].key, *v[2].key, *v[3].key];
-        // The passed list was validated by `run_tick` against `nbr_mask` (existing
-        // neighbors and presences by stored identity, placeholders by key), so it is
-        // reused as is.
-        let ix = tick_ix(
-            &k.world,
-            chunk_ai.key,
-            presence_ai.key,
-            &keys(&nbr),
-            &keys(&pres),
-        );
-        schedule_tick(&chunk_ai, k, interval, ix)?;
+        // The canonical list (derived from the header), never the passed accounts.
+        schedule_tick(&chunk_ai, k, interval, derive_tick_ix(chunk_ai.key, k)?)?;
         msg!("tick: crank renewed");
     }
-    for (i, nk) in out.arm.iter().enumerate() {
-        if let Some(nk) = nk {
-            let ix = derive_tick_ix(nbr[i].key, nk)?;
-            schedule_tick(&nbr[i], nk, interval, ix)?;
-            msg!("tick: armed neighbor {}", i);
+    for (i, arm) in out.arm.iter().enumerate() {
+        if let Some((nk, old)) = arm {
+            // Best effort: a neighbor that can't be armed must not fail this tick (its
+            // watchdogs re-arm it). Errors returned to us are logged; a failure inside the
+            // Magic program itself would still abort the tx (Solana CPI semantics).
+            let r = (|| -> Result<()> {
+                if let Some(old) = old {
+                    cancel_tick(&nbr[i], nk, *old)?;
+                }
+                schedule_tick(&nbr[i], nk, interval, derive_tick_ix(nbr[i].key, nk)?)
+            })();
+            match r {
+                Ok(()) => msg!("tick: armed neighbor {}", i),
+                Err(e) => msg!("tick: arming neighbor {} failed: {:?}", i, e),
+            }
         }
     }
     Ok(())
@@ -582,12 +633,21 @@ fn run_tick(
     }
     let keys = CrankKeys::of(&ch);
     let (cx, cz) = (keys.cx, keys.cz);
-    let repair = TickOut {
-        keys,
-        repair: true,
-        idle: false,
-        renew: false,
-        arm: [None; 4],
+    // The passed list doesn't match the header: re-arm with the canonical list, at most
+    // once per CRANK_STALE_MS (chain-seconds stamp), else a plain no-op.
+    let mut repair = || {
+        let now_s = (now.max(0) as u64 / 1000) as u16;
+        if now_s.wrapping_sub(ch.repair_s.get()) < (CRANK_STALE_MS / 1000) as u16 {
+            return None;
+        }
+        ch.repair_s.set(now_s);
+        Some(TickOut {
+            keys,
+            repair: true,
+            idle: false,
+            renew: false,
+            arm: [None; 4],
+        })
     };
 
     // Neighbors and presence lists (checked against `nbr_mask`).
@@ -597,13 +657,23 @@ fn run_tick(
     lists[0] = Some(presence_of(presence, chunk.key).ok()?.1);
     for i in 0..4 {
         let Some(slot) = neighbor(&nbr[i], chunk.key, &keys, i) else {
-            return Some(repair);
+            return repair();
         };
-        if keys.has(i) == (pres[i].key == presence.key) {
-            return Some(repair); // presence slot doesn't match the mask
+        let pres_ok = if keys.has(i) {
+            // The neighbor's canonical presence PDA (stored bump), not just any list
+            // whose stored `chunk` matches.
+            presence_key(nbr[i].key, keys.nbr_bumps[4 + i]).is_ok_and(|k| k == *pres[i].key)
+        } else {
+            pres[i].key == presence.key
+        };
+        if !pres_ok {
+            return repair();
         }
         if let Some((h, b)) = slot {
-            lists[i + 1] = Some(presence_of(&pres[i], nbr[i].key).ok()?.1);
+            let Ok((_, list)) = presence_of(&pres[i], nbr[i].key) else {
+                return repair();
+            };
+            lists[i + 1] = Some(list);
             heads[i] = Some(h);
             blocks[i] = Some(b);
         }
@@ -642,7 +712,7 @@ fn run_tick(
     );
 
     // Fluid.
-    let mut arm: [Option<CrankKeys>; 4] = [None; 4];
+    let mut arm: [Option<(CrankKeys, Option<i64>)>; 4] = [None; 4];
     let fluid_due = p.fluid_tick_ms as i64 == interval
         || period(now, p.fluid_tick_ms) > period(last, p.fluid_tick_ms);
     if fluid_due && ch.fluid_has_work() {
@@ -670,8 +740,8 @@ fn run_tick(
                 if r.touched_neighbors & (1 << (i + 1)) != 0 {
                     h.set_fluid_queue(&qs[i + 1]);
                     if h.fluid_has_work() && crank_stale(h, now) {
-                        mark_armed(h, now);
-                        arm[i] = Some(CrankKeys::of(h));
+                        let old = prepare_arm(h, nbr[i].key, now);
+                        arm[i] = Some((CrankKeys::of(h), old));
                     }
                 }
             }
@@ -785,7 +855,7 @@ mod tests {
         CHUNK_FULL_LEN, GEN_DONE, PRESENCE_ENTRY_SIZE, PRESENCE_HEADER_SIZE,
     };
     use anchor_lang::Discriminator;
-    use magicraft_core::fluid::{EAST, WEST};
+    use magicraft_core::fluid::{EAST, NORTH, WEST};
     use magicraft_core::mobs::{KIND_PIG, KIND_ZOMBIE};
     use magicraft_core::physics as phys;
 
@@ -833,7 +903,8 @@ mod tests {
             chunk_count: 5,
             clock: TimeAnchor::default(),
             day_ticks: 0,
-            _reserved: [0; 18],
+            day_epoch: 0,
+            _reserved: [0; 17],
         };
         let mut data = World::DISCRIMINATOR.to_vec();
         w.serialize(&mut data).unwrap();
@@ -845,25 +916,53 @@ mod tests {
         }
     }
 
-    /// A ready chunk `(cx, cz)` of `world` with a stone floor (feet at y = 10).
+    /// A ready chunk `(cx, cz)` of `world` at its PDA, with real stored bumps and a stone
+    /// floor (feet at y = 10).
     fn chunk_acc(world: &Pubkey, cx: i32, cz: i32, mask: u8) -> Acc {
+        let (key, bump) = Pubkey::find_program_address(
+            &[
+                crate::state::CHUNK_SEED,
+                world.as_ref(),
+                &cx.to_le_bytes(),
+                &cz.to_le_bytes(),
+            ],
+            &crate::ID,
+        );
+        let pb =
+            Pubkey::find_program_address(&[crate::state::PRESENCE_SEED, key.as_ref()], &crate::ID)
+                .1;
         let mut data = vec![0u8; CHUNK_FULL_LEN];
         {
             let h =
-                init_chunk_header(&mut data, Pubkey::new_unique(), *world, cx, cz, 255).unwrap();
+                init_chunk_header(&mut data, Pubkey::new_unique(), *world, cx, cz, bump).unwrap();
             h.gen_stage = GEN_DONE;
             h.nbr_mask = mask;
+            h.presence_bump = pb;
+            h.nbr_bumps = crate::instructions::chunk::neighbor_pdas(world, cx, cz).1;
+            h.task_id.set(scheduler::task_id(TICK_TASK_TAG, &key, 0));
         }
         data[CHUNK_BLOCKS_OFFSET..CHUNK_BLOCKS_OFFSET + FLOOR * 256].fill(3);
         Acc {
-            key: Pubkey::new_unique(),
+            key,
             owner: crate::ID,
             lamports: 1,
             data,
         }
     }
 
+    /// The presence list of `chunk` at its PDA.
     fn presence_acc(chunk: &Pubkey, entries: &[([i32; 3], i64)]) -> Acc {
+        let mut a = presence_at(chunk, entries);
+        a.key = Pubkey::find_program_address(
+            &[crate::state::PRESENCE_SEED, chunk.as_ref()],
+            &crate::ID,
+        )
+        .0;
+        a
+    }
+
+    /// A presence list of `chunk` at a random address (not its PDA).
+    fn presence_at(chunk: &Pubkey, entries: &[([i32; 3], i64)]) -> Acc {
         let mut data = vec![0u8; presence_len(entries.len())];
         init_presence_header(&mut data, *chunk, 255).unwrap();
         data[42..44].copy_from_slice(&(entries.len() as u16).to_le_bytes());
@@ -1083,6 +1182,99 @@ mod tests {
             moved.is_some_and(|m| m.pos[0] >= 16 * B),
             "pig in the east chunk"
         );
+    }
+
+    #[test]
+    fn neighbor_presence_must_be_canonical_and_valid() {
+        let mut w = world_acc();
+        let n_bit = 1u8 << (NORTH - 1);
+        // A presence that stores the right chunk but sits at another address: repair.
+        let mut c = chunk_acc(&w.key, 0, 0, n_bit);
+        let mut p = presence_acc(&c.key, &[]);
+        let mut n = chunk_acc(&w.key, 0, -1, 0);
+        let mut fake = presence_at(&n.key, &[]);
+        let r = tick(
+            &mut w,
+            &mut c,
+            &mut p,
+            [Some((&mut n, &mut fake)), None, None, None],
+            NOW,
+        );
+        assert_eq!(r, Some((true, false, false)));
+        // The canonical presence with broken data (count mismatch): repair, not a silent
+        // no-op (3 s later: repairs are throttled).
+        let mut np = presence_acc(&n.key, &[]);
+        np.data[42] = 5;
+        let r = tick(
+            &mut w,
+            &mut c,
+            &mut p,
+            [Some((&mut n, &mut np)), None, None, None],
+            NOW + 3_000,
+        );
+        assert_eq!(r, Some((true, false, false)));
+        // The correct list runs (idle: nothing to do).
+        np.data[42] = 0;
+        let r = tick(
+            &mut w,
+            &mut c,
+            &mut p,
+            [Some((&mut n, &mut np)), None, None, None],
+            NOW + 3_500,
+        );
+        assert_eq!(r, Some((false, true, false)));
+    }
+
+    #[test]
+    fn repairs_are_throttled() {
+        let mut w = world_acc();
+        let mut c = chunk_acc(&w.key, 0, 0, 1);
+        let mut p = presence_acc(&c.key, &[]);
+        assert_eq!(
+            tick(&mut w, &mut c, &mut p, [None, None, None, None], NOW),
+            Some((true, false, false))
+        );
+        // Within 3 s: plain no-op (no re-arm), however often it is called.
+        for dt in [500, 1_000, 2_999] {
+            assert_eq!(
+                tick(&mut w, &mut c, &mut p, [None, None, None, None], NOW + dt),
+                None
+            );
+        }
+        assert_eq!(
+            tick(
+                &mut w,
+                &mut c,
+                &mut p,
+                [None, None, None, None],
+                NOW + 3_000
+            ),
+            Some((true, false, false))
+        );
+    }
+
+    #[test]
+    fn stale_writable_arm_rotates_the_task_id() {
+        let key = Pubkey::new_unique();
+        let mut h: ChunkHeader = bytemuck::Zeroable::zeroed();
+        h.task_id.set(scheduler::task_id(TICK_TASK_TAG, &key, 0));
+        // Never armed: no rotation.
+        assert_eq!(prepare_arm(&mut h, &key, NOW), None);
+        assert_eq!((h.task_epoch, h.crank_armed), (0, 1));
+        // Armed and alive: no rotation.
+        assert_eq!(prepare_arm(&mut h, &key, NOW + CRANK_STALE_MS), None);
+        // Armed but stale (dropped or squatted): next epoch, old id returned for cancel.
+        let old = h.task_id.get();
+        let t = NOW + 3 * CRANK_STALE_MS;
+        assert_eq!(prepare_arm(&mut h, &key, t), Some(old));
+        assert_eq!(h.task_epoch, 1);
+        assert_eq!(h.task_id.get(), scheduler::task_id(TICK_TASK_TAG, &key, 1));
+        assert_ne!(h.task_id.get(), old);
+        assert_eq!(CrankKeys::of(&h).epoch, 1);
+        // Idle-cancelled (crank_armed 0): re-armed under the same id.
+        h.crank_armed = 0;
+        assert_eq!(prepare_arm(&mut h, &key, t + 10 * CRANK_STALE_MS), None);
+        assert_eq!(h.task_epoch, 1);
     }
 
     #[test]

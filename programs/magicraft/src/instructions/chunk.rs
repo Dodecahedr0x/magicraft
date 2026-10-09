@@ -24,8 +24,8 @@ use session_keys::{session_auth_or, Session, SessionError, SessionTokenV2};
 use crate::auth::{chunk_seeds, player_seeds, presence_seeds};
 use crate::errors::MagicraftError;
 use crate::instructions::crank::{
-    chunk_key, derive_tick_ix, mark_armed, maybe_arm_chunk, schedule_tick, tick_interval_ms,
-    CrankKeys, NBR_OFF, TICK_TASK_TAG,
+    cancel_tick, chunk_key, derive_tick_ix, maybe_arm_chunk, prepare_arm, schedule_tick,
+    tick_interval_ms, CrankKeys, NBR_OFF, TICK_TASK_TAG,
 };
 use crate::scheduler;
 use magicraft_core::consts::CHUNK_VOL;
@@ -118,9 +118,13 @@ fn relink_neighbors<'info>(
             if h.crank_armed == 0 {
                 continue;
             }
-            mark_armed(&mut h, now_ms);
-            CrankKeys::of(&h)
+            let old = prepare_arm(&mut h, ai.key, now_ms);
+            (CrankKeys::of(&h), old)
         };
+        let (keys, old) = keys;
+        if let Some(old) = old {
+            cancel_tick(ai, &keys, old)?;
+        }
         schedule_tick(ai, &keys, interval_ms, derive_tick_ix(ai.key, &keys)?)?;
         msg!("neighbor {} crank re-armed", i);
     }
@@ -273,7 +277,8 @@ pub fn create_chunk(mut ctx: Context<CreateChunk>, cx: i32, cz: i32) -> Result<(
             cz,
             ctx.bumps.chunk,
         )?;
-        h.task_id.set(scheduler::task_id(TICK_TASK_TAG, &chunk_key));
+        h.task_id
+            .set(scheduler::task_id(TICK_TASK_TAG, &chunk_key, 0));
         h.presence_bump = ctx.bumps.presence;
         h.nbr_bumps = nbr_bumps;
         h.nbr_mask = (0..4).fold(0, |m, i| m | ((exists[i] as u8) << i));

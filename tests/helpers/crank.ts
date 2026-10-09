@@ -8,12 +8,13 @@ import { chunkData } from "./chunk";
 const programId = erProgram.programId;
 const CRANK = new web3.PublicKey("Crank11111111111111111111111111111111111111");
 
-/** Tick-crank task id: first 8 bytes of sha256("tick" ‖ chunk), LE, masked
- *  positive (set by create_chunk). */
-export function tickTaskId(chunk: web3.PublicKey): bigint {
+/** Tick-crank task id: first 8 bytes of sha256("tick" ‖ chunk ‖ epoch u8),
+ *  LE, masked positive (epoch 0 at create_chunk; a stale writable re-arm bumps it). */
+export function tickTaskId(chunk: web3.PublicKey, epoch = 0): bigint {
   const h = createHash("sha256")
     .update(Buffer.from("tick"))
     .update(chunk.toBuffer())
+    .update(Buffer.from([epoch]))
     .digest();
   const id = h.readBigInt64LE(0) & 0x7fff_ffff_ffff_ffffn;
   return id === 0n ? 1n : id;
@@ -24,6 +25,7 @@ export function crankState(d: Buffer) {
   return {
     armed: d[83],
     taskId: d.readBigInt64LE(84),
+    taskEpoch: d[765],
     lastTickMs: Number(d.readBigInt64LE(92)),
     tickCount: Number(d.readBigUInt64LE(100)),
   };

@@ -51,11 +51,13 @@ export function worldPda(creator: web3.PublicKey, nonce: BN): web3.PublicKey {
   )[0];
 }
 
-/** Day-crank task id: first 8 bytes of sha256("day" ‖ world), LE, masked positive. */
-export function dayTaskId(world: web3.PublicKey): bigint {
+/** Day-crank task id: first 8 bytes of sha256("day" ‖ world ‖ epoch u8), LE,
+ *  masked positive (epoch 0 at create_world; a stale re-arm bumps it). */
+export function dayTaskId(world: web3.PublicKey, epoch = 0): bigint {
   const h = createHash("sha256")
     .update(Buffer.from("day"))
     .update(world.toBuffer())
+    .update(Buffer.from([epoch]))
     .digest();
   const id = h.readBigInt64LE(0) & 0x7fff_ffff_ffff_ffffn;
   return id === 0n ? 1n : id;

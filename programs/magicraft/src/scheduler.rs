@@ -20,10 +20,16 @@ use ephemeral_rollups_sdk::consts::MAGIC_PROGRAM_ID;
 use magicblock_magic_program_api::args::ScheduleTaskArgs;
 use magicblock_magic_program_api::instruction::MagicBlockInstruction;
 
-/// Collision-free task id for the crank `tag` of `key`: the first 8 bytes of
-/// `sha256(tag ‖ key)` as LE i64, masked positive, never 0 (0 = "not scheduled").
-pub fn task_id(tag: &[u8], key: &Pubkey) -> i64 {
-    let h = solana_sha256_hasher::hashv(&[tag, key.as_ref()]).to_bytes();
+/// Collision-free task id for the crank `tag` of `key` at `epoch`: the first 8 bytes of
+/// `sha256(tag ‖ key ‖ epoch)` as LE i64, masked positive, never 0 (0 = "not scheduled").
+///
+/// **Squatting:** ids are global per validator and a foreign authority's live task with our
+/// id makes our schedule a silent no-op. The ids are predictable, so anyone could pre-schedule
+/// them; the owners bump `epoch` when a crank they armed goes stale (the stale watchdogs), which
+/// abandons a squatted id. Residual risk: an attacker can squat all 256 epochs of a key (256
+/// live tasks of theirs); re-check with Hydra (Task 28), whose ids may be per authority.
+pub fn task_id(tag: &[u8], key: &Pubkey, epoch: u8) -> i64 {
+    let h = solana_sha256_hasher::hashv(&[tag, key.as_ref(), &[epoch]]).to_bytes();
     let id = i64::from_le_bytes(h[..8].try_into().unwrap()) & i64::MAX;
     if id == 0 {
         1
@@ -93,11 +99,15 @@ mod tests {
     fn task_ids_are_positive_and_tagged() {
         for _ in 0..64 {
             let k = Pubkey::new_unique();
-            let day = task_id(b"day", &k);
-            let tick = task_id(b"tick", &k);
+            let day = task_id(b"day", &k, 0);
+            let tick = task_id(b"tick", &k, 0);
             assert!(day > 0 && tick > 0);
             assert_ne!(day, tick);
-            assert_eq!(day, task_id(b"day", &k));
+            assert_eq!(day, task_id(b"day", &k, 0));
+            // Epochs rotate the id (all 256 distinct for a key).
+            let ids: std::collections::HashSet<i64> =
+                (0..=255u8).map(|e| task_id(b"tick", &k, e)).collect();
+            assert_eq!(ids.len(), 256);
         }
     }
 }

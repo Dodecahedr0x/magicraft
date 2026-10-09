@@ -64,23 +64,20 @@ function firstDiff(a: Buffer, b: Buffer): number {
   return -1;
 }
 
-function expectMobs(d: Buffer, ref: RefChunk, cx: number, cz: number) {
+/** Mob slots after populate: same kinds in the same slots as magicraft-core's
+ *  spawns. Positions are not compared: populate arms the chunk's tick crank
+ *  and animals may already have taken a step. */
+function expectMobs(d: Buffer, ref: RefChunk) {
   const mobs = chunkHeader(d).mobs;
   for (let i = 0; i < 8; i++) {
     const m = mobs.subarray(i * 32, i * 32 + 32);
     const s = ref.spawns[i];
     if (!s) {
-      expect(
-        m.every((b) => b === 0),
-        `mob slot ${i} empty`
-      ).to.equal(true);
+      expect(m[0], `mob slot ${i} empty`).to.equal(0);
       continue;
     }
     expect(m[0], `mob ${i} kind`).to.equal(s.kind);
     expect(m[1], `mob ${i} hp`).to.be.greaterThan(0);
-    expect(m.readInt32LE(4)).to.equal((cx * 16 + s.x) * FP + FP / 2);
-    expect(m.readInt32LE(8)).to.equal(s.y * FP);
-    expect(m.readInt32LE(12)).to.equal((cz * 16 + s.z) * FP + FP / 2);
   }
 }
 
@@ -99,8 +96,23 @@ describe("chunks", () => {
   /** A fresh 0-lamport fee payer (permissionless ixs). */
   const stranger = () => web3.Keypair.generate();
 
+  /** First k ≥ 1 with animals in (k, 0) (the passive-animal close test). */
+  let animalK = 0;
+
   before(async () => {
-    tw = await setupWorld({ depositSol: 0.05 });
+    // A world whose (k, 0) animal chunk is near (k ≤ 6), picked with the local
+    // reference generator before any chunk is created (bounded retries).
+    let owner: TestPlayer | undefined;
+    for (let attempt = 0; ; attempt++) {
+      tw = await setupWorld(owner ? { player: owner } : { depositSol: 0.05 });
+      owner = tw.p;
+      refs.clear();
+      animalK = 0;
+      for (let k = 1; k <= 6 && !animalK; k++)
+        if (ref(k, 0).spawns.length) animalK = k;
+      if (animalK) break;
+      expect(attempt, "a world with animals in (1..6, 0)").to.be.below(20);
+    }
     ({ p, world } = tw);
     ref(0, 0); // builds the gen example once (cargo) before the timed tests
   });
@@ -197,7 +209,7 @@ describe("chunks", () => {
     const r = ref(0, 0);
     expect(chunkHeader(d).genStage).to.equal(GEN_DONE);
     expect(firstDiff(blocksOf(d), r.blocks), "final blocks").to.equal(-1);
-    expectMobs(d, r, 0, 0);
+    expectMobs(d, r);
     expect((await fetchWorld(world))!.acc.spawnSet).to.equal(false);
 
     const ss = await sendEr([await setSpawnIx(world)], [stranger()]);
@@ -308,7 +320,7 @@ describe("chunks", () => {
     console.log(`    CU populate_chunk (1,0) ${(await ixCus(sig)).ixs[0]}`);
     const d = (await chunkData(c10()))!;
     expect(firstDiff(blocksOf(d), ref(1, 0).blocks)).to.equal(-1);
-    expectMobs(d, ref(1, 0), 1, 0);
+    expectMobs(d, ref(1, 0));
     expect((await fetchWorld(world))!.acc.spawn).to.deep.equal(spawn);
   });
 
@@ -322,17 +334,13 @@ describe("chunks", () => {
 
   it("a chunk with passive animals closes (exact refund); regenerating brings them back", async () => {
     // First chunk along +x (from (1,0)) whose populate spawns animals.
-    let k = 1;
-    while (ref(k, 0).spawns.length === 0) {
-      k++;
-      if (k > 30) throw new Error("no chunk with animals in (1..30, 0)");
-    }
+    const k = animalK;
     for (let i = 2; i <= k; i++) {
       await createAndGrow(p, world, i, 0);
       await populate(world, i, 0);
     }
     const ck = chunkPda(world, k, 0);
-    expectMobs((await chunkData(ck))!, ref(k, 0), k, 0);
+    expectMobs((await chunkData(ck))!, ref(k, 0));
     const opened = await openChunks(p);
     const count = await chunkCount(world);
     const before = await erLamports(p.player);
@@ -357,7 +365,7 @@ describe("chunks", () => {
     await populate(world, k, 0);
     const d = (await chunkData(ck))!;
     expect(firstDiff(blocksOf(d), ref(k, 0).blocks)).to.equal(-1);
-    expectMobs(d, ref(k, 0), k, 0);
+    expectMobs(d, ref(k, 0));
   });
 
   it("a stage-1 chunk closes with an exact refund; regenerating it is byte-identical", async () => {
@@ -377,6 +385,6 @@ describe("chunks", () => {
     await populate(world, -1, 0);
     const d = (await chunkData(chunkPda(world, -1, 0)))!;
     expect(firstDiff(blocksOf(d), ref(-1, 0).blocks)).to.equal(-1);
-    expectMobs(d, ref(-1, 0), -1, 0);
+    expectMobs(d, ref(-1, 0));
   });
 });

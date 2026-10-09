@@ -46,6 +46,7 @@ import {
   cuStats,
   debugCancelTickIx,
   tickRate,
+  tickTaskId,
   tickTxs,
 } from "./helpers/crank";
 
@@ -296,6 +297,23 @@ describe("chunk tick crank", () => {
     logCus(
       "tick_chunk (animals, nobody near)",
       txs.map((t) => t.cu)
+    );
+
+    // A task that dies while believed armed (dropped, or its id squatted): once
+    // stale, the writable watchdog cancels it and re-arms under the next epoch.
+    expect((await crankOf(ck))!.taskId).to.equal(tickTaskId(ck, 0));
+    await sendEr([await debugCancelTickIx(world, ck)], [stranger()]);
+    await sleep(3_500);
+    const sig = await sendEr([await armChunkIx(world, ck)], [stranger()]);
+    expect(armed(await logsOf(sig)), "stale → re-armed").to.equal(true);
+    logCus("arm_chunk (stale: cancel + rotate + schedule)", [
+      (await ixCus(sig)).ixs[0],
+    ]);
+    const st = (await crankOf(ck))!;
+    expect(st.taskId, "rotated id").to.equal(tickTaskId(ck, 1));
+    await sleep(1_000);
+    expect((await crankOf(ck))!.tickCount, "ticking again").to.be.above(
+      st.tickCount
     );
   });
 

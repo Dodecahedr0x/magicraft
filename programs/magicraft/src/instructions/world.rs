@@ -100,7 +100,8 @@ pub fn create_world(
         chunk_count: 0,
         clock: TimeAnchor::new(clock.slot, clock.unix_timestamp),
         day_ticks: 0,
-        _reserved: [0; 18],
+        day_epoch: 0,
+        _reserved: [0; 17],
     };
     world.day_task_id = arm_day_crank(&world_ai, &world)?;
     world.try_serialize(&mut &mut world_ai.try_borrow_mut_data()?[..])?;

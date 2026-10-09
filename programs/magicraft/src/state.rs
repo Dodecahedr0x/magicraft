@@ -48,7 +48,8 @@
 //! | 199 | `chunk_count` | u32 |
 //! | 203 | `clock` | [`TimeAnchor`]: `anchor_slot` u64 @203, `anchor_ms` i64 @211, `ms_per_slot` u32 @219, `base_ms_per_slot` u32 @223, `sync_slot` u64 @227, `sync_ms` i64 @235 |
 //! | 243 | `day_ticks` | u32 (wrapping count of `tick_day` executions; diagnostics) |
-//! | 247 | `_reserved` | [u8; 18] |
+//! | 247 | `day_epoch` | u8 (day-crank task id epoch, bumped by a stale re-arm) |
+//! | 248 | `_reserved` | [u8; 17] |
 //!
 //! # `PlayerState` (ephemeral), PDA `["pstate", world, player]`, 432 bytes
 //! | off | field | type |
@@ -96,7 +97,8 @@
 //! | 755 | `nbr_bumps` | [u8; 8] (bumps of the N, S, E, W chunk PDAs, then of their presence PDAs; `create_chunk`) |
 //! | 763 | `arm_tick` | u8 (low byte of `tick_count` at the last (re)arm with a write) |
 //! | 764 | `nbr_mask` | u8 (bit `i` set ⇔ neighbor `i` (N, S, E, W) exists; `create_chunk` / `close_chunk`) |
-//! | 765 | `_reserved` | [u8; 3] |
+//! | 765 | `task_epoch` | u8 (epoch mixed into `task_id`; bumped by a stale re-arm with a write) |
+//! | 766 | `repair_s` | u16 (chain seconds mod 2^16 of the last list repair; throttle) |
 //! | 768 | blocks | [u8; 16 384] |
 //!
 //! # `ChunkPresence` (ephemeral), PDA `["presence", chunk]`, `48 + 56·n` bytes
@@ -424,7 +426,10 @@ pub struct World {
     pub clock: TimeAnchor,
     /// Wrapping count of `tick_day` executions (diagnostics: crank liveness / rate).
     pub day_ticks: u32,
-    pub _reserved: [u8; 18],
+    /// Epoch mixed into the day crank's task id (`scheduler::task_id`); a stale re-arm
+    /// bumps it, so a squatted id is abandoned.
+    pub day_epoch: u8,
+    pub _reserved: [u8; 17],
 }
 
 // `create_world` creates the World in one CPI (≤ 10 240 bytes).
@@ -656,7 +661,11 @@ pub struct ChunkHeader {
     /// Bit `i` set ⇔ neighbor `i` (N, S, E, W) exists (any generation stage); the tick
     /// crank's account list depends on it (missing neighbors are placeholders).
     pub nbr_mask: u8,
-    pub _reserved: [u8; 3],
+    /// Epoch mixed into the tick crank's task id; bumped when a writable arm finds the
+    /// crank armed but stale (abandons a possibly squatted id).
+    pub task_epoch: u8,
+    /// Chain seconds (mod 2^16) of the last account-list repair (≤ 1 per 3 s).
+    pub repair_s: LeU16,
 }
 
 const _: () = {
@@ -680,7 +689,8 @@ const _: () = {
     assert!(core::mem::offset_of!(ChunkHeader, nbr_bumps) == 755);
     assert!(core::mem::offset_of!(ChunkHeader, arm_tick) == 763);
     assert!(core::mem::offset_of!(ChunkHeader, nbr_mask) == 764);
-    assert!(core::mem::offset_of!(ChunkHeader, _reserved) == 765);
+    assert!(core::mem::offset_of!(ChunkHeader, task_epoch) == 765);
+    assert!(core::mem::offset_of!(ChunkHeader, repair_s) == 766);
     // The header must fit the creation size; the whole chunk must fit one resize.
     assert!(CHUNK_HEADER_SIZE <= CHUNK_INITIAL_LEN);
     assert!(CHUNK_FULL_LEN - CHUNK_INITIAL_LEN <= 10_240);
@@ -1199,7 +1209,8 @@ mod tests {
                 sync_ms: 15,
             },
             day_ticks: 16,
-            _reserved: [0; 18],
+            day_epoch: 0,
+            _reserved: [0; 17],
         };
         let mut b = World::DISCRIMINATOR.to_vec();
         b.extend(borsh(&w));
@@ -1433,7 +1444,8 @@ mod tests {
             chunk_count: 0,
             clock: TimeAnchor::default(),
             day_ticks: 0,
-            _reserved: [0; 18],
+            day_epoch: 0,
+            _reserved: [0; 17],
         }
     }
 

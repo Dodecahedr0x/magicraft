@@ -827,3 +827,22 @@ Decisions:
   wandered; its water-break check accepts water already flowing in.
 - Not covered: a fluid-heavy tick (the scouted breaks fill one hole; core's estimate for the worst
   tick is ≤ ~130k, within the 400k crank budget).
+
+### Hardening (review follow-up)
+
+- Renewals and repairs schedule the **canonical** list (`derive_tick_ix` from the header), never
+  the accounts a (permissionless) caller passed; an existing neighbor's presence must be its PDA
+  (stored bump; ≈ 1.5k CU per existing neighbor per tick) and a broken one triggers a repair.
+- Repairs are throttled to one per 3 s (`ChunkHeader::repair_s`, chain seconds mod 2^16).
+- **Task-id squatting:** ids are `sha256(tag ‖ key ‖ epoch u8)`; `ChunkHeader::task_epoch` /
+  `World::day_epoch`. A writable stale re-arm of a crank believed armed (`arm_chunk`, edits,
+  neighbor changes, `schedule_day_crank`, which now takes the World writable) cancels the old
+  id and moves to the next epoch (tested: `arm_chunk` after `debug_cancel_tick` → id of epoch 1,
+  ticking again). `move_player` arms read-only and keeps the epoch. Residual risk: ids are
+  predictable, so an attacker can squat all 256 epochs of a key (256 live tasks); re-check with
+  Hydra (Task 28), whose task ids may be per authority.
+- Neighbor arming inside a tick is best effort (errors returned to us are logged); a failure
+  inside the Magic program would still abort the tx (Solana CPI semantics).
+- `debug_cancel_tick` exists only in `localnet` builds (`#[cfg(feature = "localnet")]`).
+- 12-chunk picks a world whose first animal chunk along +x is within 6 chunks (reference
+  generator, ≤ 20 worlds) and compares mob kinds per slot, not positions.
