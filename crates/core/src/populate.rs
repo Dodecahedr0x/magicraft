@@ -7,10 +7,13 @@
 //! neighborhood and written only into local voxels, so a feature's voxels on both sides of
 //! a border are exactly what a single-buffer generation of the whole world would give.
 //!
+//! **Inputs onchain:** the chunk stores its 256 biome bytes (`Chunk` header
+//! `biomes: [u8; 256]`, written by stage 1); `populate_chunk` rebuilds [`Stage1Info`] with
+//! [`stage1_info_from_blocks`](crate::terrain::stage1_info_from_blocks) (heights re-derived
+//! by scanning columns of the still-stage-1 blocks; tested equal to `generate_stage1`'s).
+//!
 //! # Steps (in order)
-//! 1. **Caves** — [`carve_caves`]; rule in [`crate::caves`].
-//!    Never touches bedrock, the surface block or anything above it, or any voxel with a
-//!    wet (water/ice) 6-neighbor.
+//! 1. **Caves** — [`carve_caves`]; rule, entrances and work cap in [`crate::caves`].
 //! 2. **Ores** ([`place_ores`]) — chunk-local blobs: [`ORES`] lists `(block, clusters,
 //!    y_max exclusive)`: coal ×8 y<50, iron ×4 y<32, diamond ×1 y<12. Each blob is a random
 //!    walk of 2–4 steps (axis-aligned ±1) from a hashed start; a voxel becomes ore only if
@@ -20,54 +23,57 @@
 //!    candidate becomes a tree if its column's biome is Forest (`roll < 176/256`, ≈ 4.1 trees
 //!    per forest chunk) or Plains (`roll < 20/256`, ≈ 0.5 per chunk) and its stage-1 surface
 //!    is Grass (`h > SEA_LEVEL + 1`; Plains/Forest surfaces above the beach line are always
-//!    Grass). Trunk `y = h+1 ..= h+t`, `t ∈ 4..=6` (Log); leaves at `h+t−1` and `h+t` in a
-//!    5×5 square without its corners, and a plus at `h+t+1` (canopy radius 2). Writes are
-//!    clipped to `y < 64` and to voxels strictly above their column's stage-1 surface; a
-//!    log goes into Air or Leaves, leaves only into Air. Because logs win over leaves and
-//!    nothing else is ever overwritten, overlapping trees give the same result in any
-//!    replay order.
+//!    Grass, and caves never open them). Trunk `y = h+1 ..= h+t`, `t ∈ 4..=6` (Log); leaves
+//!    at `h+t−1` and `h+t` in a 5×5 square without its corners, and a plus at `h+t+1`
+//!    (canopy radius 2). Writes are clipped to `y < 64` and to voxels strictly above their
+//!    column's stage-1 surface; a log goes into Air or Leaves, leaves only into Air. Logs
+//!    win over leaves and nothing else is overwritten, so overlapping trees give the same
+//!    result in any replay order.
 //!
 //!    Neighbor replay: candidates of the 8 neighbor chunks are first filtered by position
-//!    (their canopy must reach this chunk: local column in `-2..=17` on both axes), then by
-//!    biome ([`biome_at`], ≈ 500 ops) and roll, and only then the base height is looked up
-//!    in [`HeightWindow`] (lazy [`heights_chunk`] of that neighbor, ≈ 35k ops, shared with
-//!    the cave rule). The slow [`height_at`](crate::terrain::height_at) (≈ 50k ops per
-//!    column) is never called.
+//!    (canopy must reach this chunk: local column in `-2..=17` on both axes), then by biome
+//!    ([`biome_at`]) and roll; only then is the base height read from [`HeightWindow`]
+//!    (2-column strips / 2×2 corners via [`heights_cols`]). The slow
+//!    [`height_at`](crate::terrain::height_at) is never called.
 //! 4. **Cacti** ([`place_cacti`]) — chunk-local: [`CACTUS_CANDIDATES`] hashed columns, half
-//!    accepted, in Desert columns with a Sand surface at `h > SEA_LEVEL` (dry); 1–3 tall,
-//!    only into Air.
+//!    accepted, in Desert columns whose live surface block is Sand at `h > SEA_LEVEL`
+//!    (so never on an opened cave entrance); 1–3 tall, only into Air.
 //! 5. **Animals** ([`spawn_animals`]) — 0–3 attempts per chunk at hashed columns; a spawn
 //!    succeeds in Plains/Forest columns whose surface block is still Grass with two Air
 //!    blocks above (so never under a tree). Output [`MobSpawn`] in **chunk-local** block
 //!    coordinates: `(x, z)` = column, `y` = the feet block (`h + 1`).
 //!
-//! # Cost estimate (SBF ops ≈ CU)
-//! Caves ≈ 16k replay + ≈ 60–150k carving (see [`crate::caves`]); ores 13 blobs × ~4
-//! voxels ≈ 3k; trees: 54 candidate hashes ≈ 2k + ≈ 6 neighbor `biome_at` ≈ 3k + writes
-//! (≈ 4 trees × ~60 voxels × ~15 ops) ≈ 4k; cacti/animals < 1k. Lazy neighbor heights:
-//! one [`heights_chunk`] per loaded neighbor (≈ 45% of a stage 1 by native time, ≈ 45–50k);
-//! up to 8 but measured avg 2.8, max 5 over 1000 chunks (only neighbors whose border voxels
-//! a sub-sea-level cave reaches, or that host a tree whose canopy reaches this chunk).
+//! (Snowy sea ice is placed by stage 1; stage 2 has no ice step.)
 //!
-//! Measured (`bench_stage2`, native release, 1000 chunks): stage 2 ≈ 2.8× stage 1 on
-//! average and ≈ 4.6× for the worst chunk. With stage 1 estimated at 100–120k CU that is
-//! ≈ 280–340k typical and ≈ 460–560k worst — under the 700k target. Hard upper bound
-//! (2 worms × 40 spheres × 9 chunks all inside the chunk is impossible geometrically, but
-//! 8 neighbor loads ≈ 400k + ≈ 200k carving) ≈ 650k.
+//! # Cost: hard bound (modeled SBF ops ≈ CU)
+//! A chunk whose `populate_chunk` exceeded the budget would be stuck at `gen_stage 1`
+//! forever, so every term is bounded by construction; [`STAGE2_OPS_BOUND`] sums them and
+//! is const-asserted ≤ 800k: ix overhead 30k (assumed) + Stage1Info rebuild 73k + worm
+//! replay 57k + column ceilings 15k + neighbor heights 158k (4 strips × 25k + 4 corners ×
+//! 14.5k) + trees 69k + misc 4k + caves ≤ [`CAVE_OPS_CAP`] 380k = **786k**. The op
+//! constants are hand counts of the inner loops, not SBF measurements; the cave cap is
+//! a true hard limit on modeled ops, the other terms are worst-case loop counts.
+//!
+//! Measured: `scan_cave_tail` (10^6 chunks) — cave demand mean 55k, p99 163k, p99.999
+//! 288k, max 340k (cap never hit); side strips loaded avg 3.93 (max 4), corners avg 0.07
+//! (p99.999 3, max 4). `bench_stage2` (native release): stage 2 ≈ 1.6× stage 1 on average,
+//! ≈ 2.2–2.7× worst chunk; one strip ≈ 20% of a stage 1 (≈ 20–25k est.). Caveat: native
+//! time ratios only approximate SBF CU ratios (different ISA, no bounds-check elision
+//! guarantees, 64-bit multiply cost); measure real CU once `populate_chunk` exists.
 //!
 //! # SBF stack (4 KB per frame)
-//! [`generate_stage2`] frame ≈ 0.5 KB ([`HeightWindow`] is 420 B); [`HeightWindow`]'s
-//! loader frame ≈ 1.1 KB (a 256 × i32 buffer) + [`heights_chunk`]'s own ≈ 1.9 KB frame;
-//! [`carve_caves`], [`place_trees`], [`place_ores`], [`place_cacti`], [`spawn_animals`] are
+//! [`generate_stage2`] frame ≈ 0.5 KB ([`HeightWindow`] is 420 B); [`carve_caves`] ≈ 1.2 KB;
+//! the window loader ≈ 0.2 KB + [`heights_cols`] ≈ 0.4 KB + its lattice-sum frame ≈ 1.9 KB;
+//! [`place_trees`], [`place_ores`], [`place_cacti`], [`spawn_animals`] are
 //! `#[inline(never)]` with < 0.3 KB each. The caller provides the 16 KB block buffer, the
-//! [`Stage1Info`] and the mob output array.
+//! [`Stage1Info`] (1.25 KB) and the mob output array.
 
 use crate::blocks::Block;
-use crate::caves::carve_caves;
+use crate::caves::{carve_caves, CaveStats, CAVE_OPS_CAP, MAX_WORMS, SEGS};
 use crate::consts::{CHUNK_H, CHUNK_VOL, SEA_LEVEL};
 use crate::coords::block_index;
 use crate::hash::{rand_range, splitmix_next, Seed};
-use crate::terrain::{biome_at, heights_chunk, Biome, Stage1Info};
+use crate::terrain::{biome_at, heights_cols, Biome, Stage1Info, MAX_HEIGHT};
 
 pub const SALT_ORE: u32 = 0x04E5_0011;
 pub const SALT_TREE: u32 = 0x76EE_0012;
@@ -101,6 +107,40 @@ pub const MOB_SHEEP: u8 = 3;
 /// Spawn attempts per chunk are `0..=MAX_SPAWNS`.
 pub const MAX_SPAWNS: usize = 3;
 
+/// # Worst-case op bound (modeled SBF ops; see module docs, "Cost")
+/// Ix overhead (Anchor, account checks) — an assumption.
+pub const OPS_IX_OVERHEAD: u32 = 30_000;
+/// [`stage1_info_from_blocks`](crate::terrain::stage1_info_from_blocks): ≤ 57 probes × 5 ops
+/// per column.
+pub const OPS_STAGE1_INFO: u32 = 256 * MAX_HEIGHT as u32 * 5;
+/// Worm replay: 9 chunks × (≤ 2 worms × ≤ 24 segments × 125 ops (3 draws, step, walls,
+/// bbox clip + bound) + 300 ops of worm setup).
+pub const OPS_WORM_REPLAY: u32 = 9 * (MAX_WORMS as u32 * SEGS.1 as u32 * 125 + 300);
+/// Per-column carve ceilings: 256 × (4 window reads + mins).
+pub const OPS_COL_LIMITS: u32 = 256 * 60;
+/// [`heights_cols`] fixed part (3 `fbm_grid9` 2-octave ≈ 9.7k + 81 classifications ≈ 2k +
+/// box sums ≈ 1.4k) and per column (3-octave `fbm_2d` ≈ 315 + blend ≈ 60).
+pub const OPS_LATTICE: u32 = 13_000;
+pub const OPS_COLUMN: u32 = 375;
+/// 4 side strips (2×16) + 4 corners (2×2).
+pub const OPS_NEIGHBOR_HEIGHTS: u32 =
+    4 * (OPS_LATTICE + 32 * OPS_COLUMN) + 4 * (OPS_LATTICE + 4 * OPS_COLUMN);
+/// Trees: 54 candidate hashes × 40 + ≤ 48 neighbor `biome_at` × 650 + writes × 20 ops
+/// (6 own trees × ≤ 53 voxels; a neighbor tree reaches ≤ 2 columns in: ≤ 30 voxels).
+pub const OPS_TREES: u32 = 54 * 40 + 48 * 650 + (6 * 53 + 48 * 30) * 20;
+/// Ores, cacti, animals.
+pub const OPS_MISC: u32 = 4_000;
+/// Total modeled worst case of `populate_chunk` (caves capped at [`CAVE_OPS_CAP`]).
+pub const STAGE2_OPS_BOUND: u32 = OPS_IX_OVERHEAD
+    + OPS_STAGE1_INFO
+    + OPS_WORM_REPLAY
+    + OPS_COL_LIMITS
+    + OPS_NEIGHBOR_HEIGHTS
+    + OPS_TREES
+    + OPS_MISC
+    + CAVE_OPS_CAP;
+const _: () = assert!(STAGE2_OPS_BOUND <= 800_000);
+
 /// An animal spawned by populate. Chunk-local block coordinates: `x, z ∈ 0..16` is the
 /// column, `y` the block the feet occupy (first air above the grass).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -117,8 +157,8 @@ const MARGIN: i32 = 2;
 
 /// Stage-1 surface heights of the chunk's columns plus a 2-column margin
 /// (local `-2..18` on both axes). Own columns come from [`Stage1Info`]; each of the 8
-/// neighbor chunks is loaded on first access with one [`heights_chunk`] (exact stage-1
-/// heights, bit-equal to the neighbor's own stage 1).
+/// neighbor parts (2×16 side strip or 2×2 corner) is computed on first access with one
+/// [`heights_cols`] (exact stage-1 heights, bit-equal to the neighbor's own stage 1).
 pub struct HeightWindow {
     seed: Seed,
     cx: i32,
@@ -174,26 +214,38 @@ impl HeightWindow {
         self.loaded.count_ones() - 1
     }
 
+    /// Loads the window cells of neighbor `(dx, dz)`: a 2×16 / 16×2 strip for a side, a 2×2
+    /// block for a corner, via [`heights_cols`] (bit-exact with that chunk's stage 1).
     #[inline(never)]
     fn load(&mut self, dx: i32, dz: i32) {
-        let mut t = [0i32; 256];
-        heights_chunk(&self.seed, self.cx + dx, self.cz + dz, &mut t);
-        // Window cells of this neighbor: local range intersected with -2..18.
-        let range = |d: i32| -> (i32, i32) {
+        // Neighbor-local start and length per axis.
+        let span = |d: i32| -> (usize, usize) {
             match d {
-                -1 => (-MARGIN, -1),
-                0 => (0, 15),
-                _ => (16, 15 + MARGIN),
+                -1 => (16 - MARGIN as usize, MARGIN as usize),
+                0 => (0, 16),
+                _ => (0, MARGIN as usize),
             }
         };
-        let ((x0, x1), (z0, z1)) = (range(dx), range(dz));
-        for lz in z0..=z1 {
-            for lx in x0..=x1 {
-                let (nx, nz) = (lx - dx * 16, lz - dz * 16);
-                self.h[Self::idx(lx, lz)] = t[(nz * 16 + nx) as usize] as u8;
+        let ((x0, w), (z0, d)) = (span(dx), span(dz));
+        let mut t = [0i32; 16 * MARGIN as usize];
+        let (ncx, ncz) = (self.cx.wrapping_add(dx), self.cz.wrapping_add(dz));
+        heights_cols(&self.seed, ncx, ncz, x0, z0, w, d, &mut t);
+        for j in 0..d {
+            for i in 0..w {
+                let (lx, lz) = ((x0 + i) as i32 + dx * 16, (z0 + j) as i32 + dz * 16);
+                self.h[Self::idx(lx, lz)] = t[j * w + i] as u8;
             }
         }
     }
+}
+
+/// Work counters of one [`generate_stage2`] call (bench / CU accounting).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2Stats {
+    pub caves: CaveStats,
+    /// Neighbor chunks whose window heights were computed (side strips + corners).
+    pub sides_loaded: u32,
+    pub corners_loaded: u32,
 }
 
 /// Stage-2 generation of chunk `(cx, cz)`. `blocks` must hold the chunk's stage-1 output
@@ -208,12 +260,32 @@ pub fn generate_stage2(
     info: &Stage1Info,
     mobs: &mut [MobSpawn; MAX_SPAWNS],
 ) -> usize {
+    generate_stage2_stats(seed, cx, cz, blocks, info, mobs).0
+}
+
+/// [`generate_stage2`] that also returns its [`Stage2Stats`].
+#[inline(never)]
+pub fn generate_stage2_stats(
+    seed: &Seed,
+    cx: i32,
+    cz: i32,
+    blocks: &mut [u8; CHUNK_VOL],
+    info: &Stage1Info,
+    mobs: &mut [MobSpawn; MAX_SPAWNS],
+) -> (usize, Stage2Stats) {
     let mut win = HeightWindow::new(seed, cx, cz, &info.heights);
-    carve_caves(seed, cx, cz, blocks, &mut win);
+    let caves = carve_caves(seed, cx, cz, blocks, &info.biomes, &mut win);
     place_ores(seed, cx, cz, blocks);
     place_trees(seed, cx, cz, blocks, info, &mut win);
     place_cacti(seed, cx, cz, blocks, info);
-    spawn_animals(seed, cx, cz, blocks, info, mobs)
+    let n = spawn_animals(seed, cx, cz, blocks, info, mobs);
+    let corners = (win.loaded & 0b101_000_101).count_ones();
+    let stats = Stage2Stats {
+        caves,
+        sides_loaded: win.neighbors_loaded() - corners,
+        corners_loaded: corners,
+    };
+    (n, stats)
 }
 
 /// Ore blobs (step 2).
@@ -284,7 +356,8 @@ pub fn place_trees(
     for dz in -1..=1 {
         for dx in -1..=1 {
             for i in 0..TREE_CANDIDATES {
-                let (tx, tz, roll, trunk) = tree_candidate(seed, cx + dx, cz + dz, i);
+                let (ncx, ncz) = (cx.wrapping_add(dx), cz.wrapping_add(dz));
+                let (tx, tz, roll, trunk) = tree_candidate(seed, ncx, ncz, i);
                 let (lx, lz) = (tx + dx * 16, tz + dz * 16);
                 if !reach.contains(&lx) || !reach.contains(&lz) {
                     continue;
@@ -292,7 +365,9 @@ pub fn place_trees(
                 let biome = if dx == 0 && dz == 0 {
                     info.biomes[(lz * 16 + lx) as usize]
                 } else {
-                    biome_at(seed, (cx + dx) * 16 + tx, (cz + dz) * 16 + tz)
+                    // Wrapping, as terrain does: unreachable for any bounded world.
+                    let wx = ncx.wrapping_mul(16).wrapping_add(tx);
+                    biome_at(seed, wx, ncz.wrapping_mul(16).wrapping_add(tz))
                 };
                 if !tree_accepts(biome, roll) {
                     continue;
@@ -418,7 +493,7 @@ mod tests {
     use super::*;
     use crate::caves::{is_wet_u8, worms_for_chunk};
     use crate::consts::FP;
-    use crate::terrain::{generate_stage1, height_at};
+    use crate::terrain::{generate_stage1, height_at, heights_chunk};
     use std::collections::HashMap;
 
     fn seed(tag: u32) -> Seed {
@@ -499,7 +574,8 @@ mod tests {
             generate_stage2(s, cx, cz, &mut b, &info, &mut mobs)
         } else {
             let mut win = HeightWindow::new(s, cx, cz, &info.heights);
-            carve_caves(s, cx, cz, &mut b, &mut win);
+            let st = carve_caves(s, cx, cz, &mut b, &info.biomes, &mut win);
+            assert_eq!(st.skipped, 0, "cave cap hit in a reference-tested chunk");
             0
         };
         (s1, b, info, mobs[..n].to_vec())
@@ -600,7 +676,16 @@ mod tests {
                                 }
                                 let (x, y, z) = (x as i32, y as i32, z as i32);
                                 let Some(i) = r.idx(x, y, z) else { continue };
-                                if y < 1 || y >= hts[&(x, z)] {
+                                let h = hts[&(x, z)];
+                                let own = x.div_euclid(16) == ocx && z.div_euclid(16) == ocz;
+                                let grassy =
+                                    matches!(r.biomes[&(x, z)], Biome::Plains | Biome::Forest);
+                                let top = if sp.entrance && own && !grassy && h >= SEA_LEVEL {
+                                    h
+                                } else {
+                                    h - 1
+                                };
+                                if y < 1 || y > top {
                                     continue;
                                 }
                                 if NB6
@@ -679,14 +764,49 @@ mod tests {
     }
 
     #[test]
+    fn cave_cap_is_hard_and_deterministic() {
+        use crate::caves::carve_caves_capped;
+        let s = seed(3);
+        let (mut skipped, mut total) = (0, 0);
+        for (cx, cz) in [(0, 0), (5, -2), (-9, 14), (30, 30)] {
+            let (s1, _, info, _) = gen_chunk(&s, cx, cz, false);
+            let run = |cap: u32| {
+                let mut b = s1.clone();
+                let mut win = HeightWindow::new(&s, cx, cz, &info.heights);
+                let st = carve_caves_capped(&s, cx, cz, &mut b, &info.biomes, &mut win, cap);
+                (b, st)
+            };
+            let (full, st) = run(CAVE_OPS_CAP);
+            assert!(st.ops <= CAVE_OPS_CAP && st.ops == st.demand && st.skipped == 0);
+            for cap in [0, 5_000, 20_000] {
+                let (a, sa) = run(cap);
+                let (b, sb) = run(cap);
+                assert!(a == b && sa == sb);
+                assert!(sa.ops <= cap && sa.demand == st.demand);
+                // Capped output only ever carves a subset of the uncapped output.
+                assert!(a
+                    .iter()
+                    .zip(full.iter())
+                    .zip(s1.iter())
+                    .all(|((&a, &f), &o)| a == o || a == f));
+                skipped += sa.skipped;
+            }
+            total += st.demand;
+        }
+        assert!(skipped > 0 && total > 0);
+        println!("bound {STAGE2_OPS_BOUND} (caves cap {CAVE_OPS_CAP})");
+    }
+
+    #[test]
     fn caves_exist_and_avoid_water_and_bedrock() {
-        let mut total = 0;
+        let (mut total, mut total_entrances) = (0, 0);
         for (tag, bx, bz) in [(7, 0, 0), (8, -12, 20), (9, 33, -2)] {
             let s = seed(tag);
             let r = region(&s, bx, bz, 4, true, &row_major(4));
             let hts = ring_heights(&s, bx, bz, 4);
             let mut carved = 0;
             let mut near_sea = 0;
+            let mut entrances = 0;
             for y in 0..64 {
                 for z in r.zs() {
                     for x in r.xs() {
@@ -699,7 +819,19 @@ mod tests {
                             continue;
                         }
                         carved += 1;
-                        assert!(y < hts[&(x, z)], "carved surface at {x},{y},{z}");
+                        let h = hts[&(x, z)];
+                        assert!(y <= h, "carved above surface at {x},{y},{z}");
+                        if y == h {
+                            // Entrance: never in grass biomes, never under water, and
+                            // nothing (tree, cactus, animal) stands on it.
+                            entrances += 1;
+                            let b = r.biomes[&(x, z)];
+                            assert!(!matches!(b, Biome::Plains | Biome::Forest), "{b:?}");
+                            assert!(h >= SEA_LEVEL);
+                            let above = r.s2[r.idx(x, y + 1, z).unwrap()];
+                            assert!(above != Block::Log as u8 && above != Block::Cactus as u8);
+                            assert!(!r.mobs.iter().any(|m| (m.1, m.3) == (x, z)));
+                        }
                         for (a, b, c) in NB6 {
                             assert!(
                                 !wet(&r, &hts, x + a, y + b, z + c),
@@ -710,11 +842,15 @@ mod tests {
                     }
                 }
             }
-            println!("seed {tag}: carved {carved} ({near_sea} at y <= sea level)");
+            println!(
+                "seed {tag}: carved {carved} ({near_sea} at y <= sea level, {entrances} surface)"
+            );
             assert!(carved > 300, "no caves for seed {tag}");
             total += carved;
+            total_entrances += entrances;
         }
         assert!(total > 2000);
+        assert!(total_entrances > 0, "no cave entrances");
     }
 
     #[test]
@@ -884,24 +1020,23 @@ mod tests {
         let mut out = [0u8; CHUNK_VOL];
         let mut info = Stage1Info::EMPTY;
         let mut mobs = [MobSpawn::default(); MAX_SPAWNS];
-        let (mut t1, mut t2, mut tc) = (
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-        );
-        let (mut acc, mut loads, mut max_loads) = (0u64, 0u32, 0u32);
+        let (mut t1, mut t2) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         let mut worst = std::time::Duration::ZERO;
+        let (mut acc, mut sides, mut corners) = (0u64, 0u32, 0u32);
         for rep in 0..REPS {
             let (cx, cz) = (rep % 40 - 20, rep / 40 - 12);
             let t = std::time::Instant::now();
             generate_stage1(&s, cx, cz, &mut out, &mut info);
             t1 += t.elapsed();
-            let mut copy = out;
+            let copy = out;
             let t = std::time::Instant::now();
-            acc += generate_stage2(&s, cx, cz, &mut out, &info, &mut mobs) as u64;
+            let (n, st) = generate_stage2_stats(&s, cx, cz, &mut out, &info, &mut mobs);
             let mut best = t.elapsed();
             t2 += best;
-            // Worst chunk: min of 3 reruns per chunk filters scheduler noise.
+            acc += n as u64 + out[7000] as u64;
+            sides += st.sides_loaded;
+            corners += st.corners_loaded;
+            // Worst chunk: min of 3 runs filters scheduler noise.
             for _ in 0..2 {
                 let mut again = copy;
                 let t = std::time::Instant::now();
@@ -909,24 +1044,89 @@ mod tests {
                 best = best.min(t.elapsed());
             }
             worst = worst.max(best);
-            let t = std::time::Instant::now();
-            let mut win = HeightWindow::new(&s, cx, cz, &info.heights);
-            carve_caves(&s, cx, cz, &mut copy, &mut win);
-            place_trees(&s, cx, cz, &mut copy, &info, &mut win);
-            tc += t.elapsed();
-            loads += win.neighbors_loaded();
-            max_loads = max_loads.max(win.neighbors_loaded());
-            acc += out[7000] as u64 + copy[9000] as u64;
         }
+        let t = std::time::Instant::now();
+        let mut h = [0i32; 32];
+        for rep in 0..REPS {
+            heights_cols(&s, rep, 3, 14, 0, 2, 16, &mut h);
+            acc += h[5] as u64;
+        }
+        let strip = t.elapsed() / REPS as u32;
         let n = REPS as u32;
         println!(
-            "stage1 {:?}/chunk  stage2 {:?}/chunk  (caves+trees {:?})  ratio {:.2}  \
-             worst stage2 {worst:?}  neighbor height loads avg {:.2} max {max_loads}  (acc {acc})",
+            "stage1 {:?}/chunk  stage2 {:?}/chunk  ratio {:.2}  worst stage2 {worst:?}  \
+             strip load {strip:?}  loads/chunk sides {:.2} corners {:.2}  (acc {acc})",
             t1 / n,
             t2 / n,
-            tc / n,
             t2.as_secs_f64() / t1.as_secs_f64(),
-            loads as f64 / REPS as f64,
+            sides as f64 / REPS as f64,
+            corners as f64 / REPS as f64,
         );
+    }
+
+    /// Tail scan for the CU bound: cave bbox-test demand and neighbor loads over 10^6
+    /// chunks (4 seeds × 500×500), multi-threaded.
+    #[test]
+    #[ignore]
+    fn scan_cave_tail() {
+        const SIDE: i32 = 500;
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let mut all: Vec<(u32, u32, u32, u32)> = Vec::new(); // demand, tests, sides, corners
+        let rows: Vec<(u32, i32)> = (0..4u32)
+            .flat_map(|t| (0..SIDE).map(move |z| (t, z)))
+            .collect();
+        let chunks: Vec<&[(u32, i32)]> = rows.chunks(rows.len().div_ceil(threads)).collect();
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = chunks
+                .iter()
+                .map(|part| {
+                    sc.spawn(move || {
+                        let mut v = Vec::new();
+                        let mut b = Box::new([0u8; CHUNK_VOL]);
+                        let mut info = Stage1Info::EMPTY;
+                        let mut mobs = [MobSpawn::default(); MAX_SPAWNS];
+                        for &(tag, z) in part.iter() {
+                            let s = seed(1000 + tag);
+                            for x in 0..SIDE {
+                                let (cx, cz) = (x - SIDE / 2 + tag as i32 * 7919, z - SIDE / 2);
+                                generate_stage1(&s, cx, cz, &mut b, &mut info);
+                                let (_, st) =
+                                    generate_stage2_stats(&s, cx, cz, &mut b, &info, &mut mobs);
+                                v.push((
+                                    st.caves.demand,
+                                    st.caves.ops,
+                                    st.sides_loaded,
+                                    st.corners_loaded,
+                                ));
+                            }
+                        }
+                        v
+                    })
+                })
+                .collect();
+            for h in hs {
+                all.extend(h.join().unwrap());
+            }
+        });
+        let n = all.len();
+        let pick = |f: fn(&(u32, u32, u32, u32)) -> u32| {
+            let mut v: Vec<u32> = all.iter().map(f).collect();
+            v.sort_unstable();
+            let p = |q: f64| v[((n as f64 - 1.0) * q) as usize];
+            (
+                v.iter().map(|&x| x as u64).sum::<u64>() as f64 / n as f64,
+                p(0.99),
+                p(0.99999),
+                v[n - 1],
+            )
+        };
+        let capped = all.iter().filter(|r| r.0 > r.1).count();
+        println!("chunks {n}  capped {capped}");
+        println!(
+            "cave demand (modeled ops): mean/p99/p99.999/max {:?}",
+            pick(|r| r.0)
+        );
+        println!("side loads:   mean/p99/p99.999/max {:?}", pick(|r| r.2));
+        println!("corner loads: mean/p99/p99.999/max {:?}", pick(|r| r.3));
     }
 }

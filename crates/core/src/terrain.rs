@@ -21,7 +21,7 @@
 //! Mountains samples, giving a continuous mountain weight `w ∈ 0..=1`.
 //!
 //! Detail: `n` = 3-octave fbm (cells 32/16/8) remapped from
-//! [`SPREAD_3OCT`](crate::noise::SPREAD_3OCT) to `nn ∈ -512..=512` (clamped); the ridged
+//! [`SPREAD_3OCT`] to `nn ∈ -512..=512` (clamped); the ridged
 //! variant is `ridge = 384 − 3|nn|/2 ∈ -384..=384` (sharp crests where `nn ≈ 0`; slope 1.5×
 //! the rolling noise, which keeps mountain steps ≤ 6). Detail is
 //! `d = (1 − w)·nn + w·ridge`, so mountains get ridges and everything else stays rolling, and
@@ -53,10 +53,11 @@
 //! The heavy functions are `#[inline(never)]` so their locals never pile up in one frame.
 //! Estimated frames: [`fbm_chunk`] ≈ 1.5 KB (17×17 corner table + axis tables),
 //! [`fbm_grid9`] ≈ 1.3 KB, [`biomes_chunk`] ≈ 2.1 KB (two 256 × i32 buffers),
-//! [`heights_chunk`] ≈ 1.9 KB (three 81 × i32 lattice grids + box-sum tables),
+//! `chunk_sums` ≈ 1.9 KB (three 81 × i32 lattice grids + box-sum tables) under
+//! [`heights_chunk`] / [`heights_cols`] ≈ 0.4 KB each,
 //! [`generate_stage1`] < 0.2 KB ([`Stage1Info`], 1.25 KB, is caller-provided).
 
-use crate::blocks::Block;
+use crate::blocks::{is_fluid_u8, Block};
 use crate::consts::{CHUNK_H, CHUNK_VOL, SEA_LEVEL};
 use crate::hash::Seed;
 use crate::noise::{fbm_2d, fbm_chunk, fbm_grid9, SPREAD_3OCT};
@@ -130,6 +131,21 @@ pub enum Biome {
     Desert = 2,
     Snowy = 3,
     Mountains = 4,
+}
+
+impl Biome {
+    /// Biome from its stored byte; out-of-range bytes map to Plains (fail soft: the byte
+    /// array is program-written, so this never happens for a valid chunk).
+    #[inline]
+    pub fn from_u8(v: u8) -> Biome {
+        match v {
+            1 => Biome::Forest,
+            2 => Biome::Desert,
+            3 => Biome::Snowy,
+            4 => Biome::Mountains,
+            _ => Biome::Plains,
+        }
+    }
 }
 
 /// Per-column results of stage 1, needed by later stages (index `lz * 16 + lx`).
@@ -300,14 +316,12 @@ pub fn height_at(seed: &Seed, x: i32, z: i32) -> i32 {
     height_from(b, a, w, n)
 }
 
-/// [`height_at`] for all 256 columns of chunk `(cx, cz)` (index `lz * 16 + lx`).
+/// Blended `(base, amp, mountain)` sums at the chunk's 5×5 interpolation lattice points.
 ///
 /// Samples the 9×9 lattice covering the chunk + box margin with one [`fbm_grid9`] per
-/// channel, box-sums separably into the 5×5 interpolation points, then interpolates per
-/// column. Frame ≈ 1.9 KB.
+/// channel and box-sums separably. Frame ≈ 1.9 KB (three 81 × i32 grids + sum tables).
 #[inline(never)]
-pub fn heights_chunk(seed: &Seed, cx: i32, cz: i32, out: &mut [i32; 256]) {
-    let (ox, oz) = (cx.wrapping_mul(16), cz.wrapping_mul(16));
+fn chunk_sums(seed: &Seed, ox: i32, oz: i32) -> [[Sums; NI]; NI] {
     // Lattice origin: chunk's first lattice point minus the box margin.
     let (li, lj) = ((ox >> LAT) - BOX_R as i32, (oz >> LAT) - BOX_R as i32);
     let (mut t, mut m, mut r) = ([0i32; 81], [0i32; 81], [0i32; 81]);
@@ -347,21 +361,73 @@ pub fn heights_chunk(seed: &Seed, cx: i32, cz: i32, out: &mut [i32; 256]) {
             }
         }
     }
+    sums
+}
 
+/// Height of local column `(lx, lz)` from the chunk sums and raw detail noise `n`.
+#[inline(always)]
+fn column_height(sums: &[[Sums; NI]; NI], lx: usize, lz: usize, n: i32) -> i32 {
+    let (a, fx) = (lx >> 2, (lx & 3) as i32);
+    let (b, fz) = (lz >> 2, (lz & 3) as i32);
+    let c = [
+        sums[b][a],
+        sums[b][a + 1],
+        sums[b + 1][a],
+        sums[b + 1][a + 1],
+    ];
+    let (base, amp, w) = blend(c, fx, fz);
+    height_from(base, amp, w, n)
+}
+
+/// [`height_at`] for all 256 columns of chunk `(cx, cz)` (index `lz * 16 + lx`).
+/// `chunk_sums` + one 3-octave [`fbm_chunk`] for the detail. Frame ≈ 0.4 KB (+ callees).
+#[inline(never)]
+pub fn heights_chunk(seed: &Seed, cx: i32, cz: i32, out: &mut [i32; 256]) {
+    let (ox, oz) = (cx.wrapping_mul(16), cz.wrapping_mul(16));
+    let sums = chunk_sums(seed, ox, oz);
     fbm_chunk(seed, ox, oz, HEIGHT_OCT, HEIGHT_CELL, SALT_HEIGHT, out);
     for lz in 0..16 {
-        let (b, fz) = (lz >> 2, (lz & 3) as i32);
         for lx in 0..16 {
-            let (a, fx) = (lx >> 2, (lx & 3) as i32);
-            let c = [
-                sums[b][a],
-                sums[b][a + 1],
-                sums[b + 1][a],
-                sums[b + 1][a + 1],
-            ];
-            let (base, amp, w) = blend(c, fx, fz);
             let o = &mut out[lz * 16 + lx];
-            *o = height_from(base, amp, w, *o);
+            *o = column_height(&sums, lx, lz, *o);
+        }
+    }
+}
+
+/// [`height_at`] for the `w × d` columns of chunk `(cx, cz)` starting at local
+/// `(lx0, lz0)` (`lx0 + w ≤ 16`, `lz0 + d ≤ 16`, `w · d ≤ out.len()`), written to
+/// `out[(lz − lz0) · w + (lx − lx0)]`. Bit-exact with [`heights_chunk`] (same lattice sums;
+/// the detail is per-column [`fbm_2d`], which `fbm_chunk` equals exactly).
+///
+/// For thin strips: cost ≈ `chunk_sums` (≈ 13k ops: 3 `fbm_grid9` + 81 classifications +
+/// box sums) + ≈ 300 ops per column (3-octave `fbm_2d` + blend), vs ≈ 13k + 256 × ~100 for
+/// [`heights_chunk`]. Frame ≈ 0.4 KB (+ callees).
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn heights_cols(
+    seed: &Seed,
+    cx: i32,
+    cz: i32,
+    lx0: usize,
+    lz0: usize,
+    w: usize,
+    d: usize,
+    out: &mut [i32],
+) {
+    debug_assert!(lx0 + w <= 16 && lz0 + d <= 16 && w * d <= out.len());
+    let (ox, oz) = (cx.wrapping_mul(16), cz.wrapping_mul(16));
+    let sums = chunk_sums(seed, ox, oz);
+    for lz in lz0..lz0 + d {
+        for lx in lx0..lx0 + w {
+            let n = fbm_2d(
+                seed,
+                ox.wrapping_add(lx as i32),
+                oz.wrapping_add(lz as i32),
+                HEIGHT_OCT,
+                HEIGHT_CELL,
+                SALT_HEIGHT,
+            );
+            out[(lz - lz0) * w + lx - lx0] = column_height(&sums, lx, lz, n);
         }
     }
 }
@@ -384,6 +450,32 @@ fn surface_of(b: Biome, h: i32) -> (Block, Block) {
         Biome::Mountains if h > SNOW_LINE => (Block::Snow, Block::Stone),
         Biome::Mountains if h >= STONE_LINE => (Block::Stone, Block::Stone),
         Biome::Mountains => (Block::Grass, Block::Dirt),
+    }
+}
+
+/// Rebuilds [`Stage1Info`] for `populate_chunk` from a chunk's **stage-1** blocks and the
+/// 256 biome bytes the chunk stores (index `lz * 16 + lx`). Heights are re-derived by
+/// scanning each column down from `MAX_HEIGHT` to the first block that is not air, water
+/// or ice — exactly the stage-1 surface (stage 1 puts only air above `max(h, SEA_LEVEL)`,
+/// water/ice in `h+1..=SEA_LEVEL`, and a solid surface at `h ≥ MIN_HEIGHT`).
+/// Cost ≤ 256 × 57 × ~5 ≈ 73k ops (typically ≈ 256 × 25 × 5 ≈ 32k). Frame < 0.1 KB.
+#[inline(never)]
+pub fn stage1_info_from_blocks(
+    blocks: &[u8; CHUNK_VOL],
+    biomes: &[u8; 256],
+    info: &mut Stage1Info,
+) {
+    for c in 0..256 {
+        info.biomes[c] = Biome::from_u8(biomes[c]);
+        let mut y = MAX_HEIGHT as usize;
+        while y > MIN_HEIGHT as usize {
+            let b = blocks[y * 256 + c];
+            if b != Block::Air as u8 && !is_fluid_u8(b) && b != Block::Ice as u8 {
+                break;
+            }
+            y -= 1;
+        }
+        info.heights[c] = y as i32;
     }
 }
 
@@ -553,6 +645,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn heights_cols_match_chunk() {
+        let s = seed(9);
+        let mut full = [0i32; 256];
+        let mut out = [0i32; 64];
+        for &(cx, cz) in &CHUNKS {
+            heights_chunk(&s, cx, cz, &mut full);
+            for (lx0, lz0, w, d) in [
+                (14, 0, 2, 16),
+                (0, 0, 2, 16),
+                (0, 14, 16, 2),
+                (0, 0, 2, 2),
+                (14, 14, 2, 2),
+                (3, 5, 4, 7),
+            ] {
+                heights_cols(&s, cx, cz, lx0, lz0, w, d, &mut out);
+                for lz in lz0..lz0 + d {
+                    for lx in lx0..lx0 + w {
+                        assert_eq!(out[(lz - lz0) * w + lx - lx0], full[lz * 16 + lx]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stage1_info_roundtrip_and_wet_predicate() {
+        // `stage1_info_from_blocks` reproduces generate_stage1's info, and stage-1 wetness
+        // (water or ice) is exactly `h < y <= SEA_LEVEL` — the predicate populate uses for
+        // out-of-chunk neighbors (no water/ice above SEA_LEVEL or at/below the surface).
+        let s = seed(11);
+        let mut out = [0u8; CHUNK_VOL];
+        let mut wet_cols = 0;
+        for cz in -12..12 {
+            for cx in -12..12 {
+                let info = gen(&s, cx, cz, &mut out);
+                let bytes: [u8; 256] = core::array::from_fn(|i| info.biomes[i] as u8);
+                let mut back = Stage1Info::EMPTY;
+                stage1_info_from_blocks(&out, &bytes, &mut back);
+                assert_eq!(back, info, "chunk {cx},{cz}");
+                for c in 0..256 {
+                    let h = info.heights[c];
+                    wet_cols += (h < SEA_LEVEL) as u32;
+                    for y in 0..CHUNK_H as i32 {
+                        let b = out[y as usize * 256 + c];
+                        let wet = is_fluid_u8(b) || b == Block::Ice as u8;
+                        assert_eq!(wet, h < y && y <= SEA_LEVEL, "{cx},{cz} col {c} y {y}");
+                    }
+                }
+            }
+        }
+        assert!(wet_cols > 0);
     }
 
     #[test]

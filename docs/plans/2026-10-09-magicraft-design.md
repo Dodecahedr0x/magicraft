@@ -89,12 +89,17 @@ Deterministic integer math on `hash(world.seed, …)`; independent of chunk crea
 - **Ores:** fixed per-chunk cluster counts (≈8 coal y<50, 4 iron y<32, 1 diamond y<12).
 - **Trees / cactus:** neighborhood replay, may cross chunk borders.
 - **Passive animals:** 0–3 spawned in grass biomes during populate.
-- **Stage 2 details** (`crates/core/src/caves.rs`, `populate.rs`): worm spheres are clamped to
-  their chunk's 3×3 neighborhood, so 3×3 replay equals a single-buffer world carve. Caves
-  carve only `1 ≤ y < surface` and never next to water or ice (exact across borders via lazily
-  computed neighbor heights). Trees/canopies write only above stage-1 surfaces (logs over
-  air/leaves, leaves over air → order-free). Measured ≈ 2.8× stage-1 cost on average, ≈ 4.6×
-  worst (≈ 300k / ≈ 550k CU est.), so `populate_chunk` fits its own 1.4M-CU tx.
+- **Stage 2 details** (`crates/core/src/caves.rs`, `populate.rs`): worms have 12–24 segments
+  (step = radius) and are clamped to their chunk's 3×3 neighborhood, so 3×3 replay equals a
+  single-buffer world carve. Caves carve `1 ≤ y < surface`, never next to water or ice (exact
+  across borders via 2-column neighbor height strips); 1 in 4 worms is an entrance worm that may
+  also open the surface in its own chunk's non-Plains/Forest columns above sea level. Trees and
+  canopies write only above stage-1 surfaces (logs over air/leaves, leaves over air → order-free).
+- **Stage 2 cost bound:** a chunk over budget would be stuck at `gen_stage 1`, so populate is
+  bounded by construction: cave carving stops taking spheres at a modeled 380k ops (measured over
+  10^6 chunks: p99.999 288k, max 340k — never hit), and the const `STAGE2_OPS_BOUND` (≈ 786k
+  modeled ops incl. 30k ix overhead) is asserted ≤ 800k. Native timing: stage 2 ≈ 1.6× stage 1
+  on average (native ratios only approximate SBF CU; re-measure onchain).
 
 Generation is compute-heavy: anything computed per block costs ≥ ~7 CU per byte (measured:
 16 384 computed bytes ≈ 115k CU above baseline; bulk fills/copies are nearly free), so generation
@@ -106,9 +111,12 @@ Steps, sent back to back by the client:
    `ChunkPresence`; `open_chunks += 1`.
 2. `grow_chunk(cx, cz)` — requires `gen_stage == 0` and data length 10 240 (so a repeat is
    rejected, never double-resized); resize `Chunk` to full size (same tx as 1), then biome,
-   heightmap, column fill if it fits the budget (otherwise a separate stage-1 ix/tx).
+   heightmap, column fill if it fits the budget (otherwise a separate stage-1 ix/tx), and
+   stores the 256 biome bytes in the `Chunk` header (`biomes: [u8; 256]`) for stage 2.
    `gen_stage = 1`. Authorized for the chunk's payer (wallet or session key).
-3. `populate_chunk` — requires `gen_stage == 1`; caves, ores, trees, cactus, ice, animals. Sets
+3. `populate_chunk` — requires `gen_stage == 1`; rebuilds `Stage1Info` from the stored biomes +
+   a column scan of the stage-1 blocks (`stage1_info_from_blocks`), then caves, ores, trees,
+   cactus, animals (`generate_stage2`; sea ice is already placed by stage 1). Sets
    `gen_stage = DONE`.
 
 Every other ix that takes a chunk (moves, edits, ticks, mobs) rejects it (`ChunkNotReady`; ticks

@@ -4,61 +4,81 @@
 //! # Worms
 //! Chunk `(cx, cz)` owns 0–2 worms ([`MAX_WORMS`]), drawn from one splitmix stream seeded by
 //! `seed.h64(cx, cz, 0, SALT_WORM)`. A worm starts at a random block inside its chunk at
-//! `y ∈ WORM_Y` and runs 20–40 segments. Positions are world fixed point (1/[`FP`] block,
-//! `i64`, so any `i32` chunk coordinate is safe). Direction is a yaw angle on a 256-step
-//! circle (quarter sine table, ×256) plus a vertical step `dy`; each segment the yaw drifts
-//! by ±12 steps and `dy` by ±24 (clamped to ±80, i.e. ≤ 0.31 block/segment). The step length
-//! is `(r + 1)/2` blocks, so consecutive spheres always overlap. Per-segment radius is the
-//! worm's base radius (1–3) ±1, clamped to 1..=3.
+//! `y ∈ WORM_Y` and runs [`SEGS`] = 12–24 segments (fewer than the design's 20–40 but with
+//! longer steps, so tunnels stay ≈ as long while the per-chunk work tail halves). Positions
+//! are world fixed point (1/[`FP`] block, `i64`, so any `i32` chunk coordinate is safe).
+//! Direction is a yaw on a 256-step circle (quarter sine table, ×256) plus a vertical step
+//! `dy`; each segment the yaw drifts by ±12 steps and `dy` by ±24 (clamped to ±80, ≤ 0.31
+//! block/segment). The step is `r` blocks, so consecutive spheres always overlap. Radius
+//! is the worm's base radius (1–3) ±1, clamped to 1..=3. One worm in [`ENTRANCE_ONE_IN`] is
+//! an *entrance* worm (a draw from the worm's own stream).
 //!
-//! Containment: sphere centres are kept within `[origin − 13, origin + 29]` blocks (x and z,
+//! Containment: sphere centres stay within `[origin − 13, origin + 29]` blocks (x and z,
 //! `origin` = the worm's chunk origin; the yaw mirrors off a wall) and `y ∈ 4..=52`. With
-//! `r ≤ 3`, no voxel whose centre is inside a sphere lies outside the worm's own 3×3 chunk
-//! neighborhood, so replaying the 3×3 neighborhood of a chunk finds **every** sphere that can
-//! touch it. That makes per-chunk carving equal to a single-buffer carve of the whole world.
+//! `r ≤ 3` no carved voxel lies outside the worm's own 3×3 chunk neighborhood
+//! (const-asserted), so replaying a chunk's 3×3 neighborhood finds **every** sphere that can
+//! touch it and per-chunk carving equals a single-buffer carve of the world (tested).
+//! (Narrower bounds would concentrate worms in fewer chunks and raise the per-chunk tail.)
 //!
 //! # Carving rule ([`carve_caves`])
 //! A voxel is inside a sphere when its centre is within `r` blocks of the sphere centre
-//! (`dx² + dy² + dz² ≤ (r·FP)²` in fixed point). It is turned into air iff
-//! - `1 ≤ y < h(column)` — never bedrock, never the surface block or anything above it
-//!   (so caves never open to the sky: trees, cacti and animals always keep the stage-1
-//!   surface under them, and tree placement stays a pure function of stage-1 data), and
-//! - none of its 6 neighbors is *wet* in stage 1. Wet = water (any level) **or ice**: ice
-//!   only ever caps sea water at `SEA_LEVEL`, and carving next to it would expose a cave
-//!   wall to a frozen sea that a later melt / break would flood, so it is treated as water.
+//! (`dx² + dy² + dz² ≤ (r·FP)²`). It becomes air iff `1 ≤ y ≤ top(column)` and no 6-neighbor
+//! is *wet* in stage 1 (water of any level, **or ice** — ice only caps sea water, so it is
+//! treated as water). `top = h − 1` (the surface and everything above stay), except for an
+//! entrance worm's spheres in **its own chunk's** columns that are not Plains/Forest and
+//! have `h ≥ SEA_LEVEL`, where `top = h` (the surface may open; nothing wet is above it).
+//! Trees and animals need Plains/Forest grass and cacti check the live Sand block, so
+//! nothing ever stands on an opened surface, and tree placement stays a pure function of
+//! stage-1 data.
 //!
-//! Wetness of in-chunk neighbors is read from the buffer (carving only ever writes air,
-//! never touches a wet voxel, so the buffer's wet set equals stage 1's). Out-of-chunk
-//! neighbors use the exact stage-1 rule: column `n` is wet at `y` iff
-//! `h(n) < y ≤ SEA_LEVEL` (water fills `h+1..=SEA_LEVEL`, ice at `SEA_LEVEL` only where
-//! `h < SEA_LEVEL`). The neighbor height comes from [`HeightWindow`], which runs
-//! [`heights_chunk`](crate::terrain::heights_chunk) for a neighbor chunk lazily, only the
-//! first time an edge voxel needs it. So the rule is exact on both sides of every border:
-//! no carved voxel anywhere is adjacent to water or ice.
+//! Stage-1 wetness is columnar: column `n` is wet at `y` iff `h(n) < y ≤ SEA_LEVEL`
+//! (tested in `terrain`). For `y ≤ top ≤ h` the voxel itself and the ones above/below are
+//! never wet, so the rule reduces to per-column ceilings: carvable iff
+//! `y ≤ min(top, h of the 4 lateral neighbors)` or `SEA_LEVEL < y ≤ top`. Out-of-chunk
+//! neighbor heights come from [`HeightWindow`] (2-column side strips, exact stage-1
+//! heights), loaded once the first sphere touches the chunk. So the rule is exact on both
+//! sides of every border.
 //!
-//! # Cost (SBF ops ≈ CU)
-//! Replaying 9 chunks ≈ 9 worms × 30 segments × ~60 ops (draws + step + bbox reject) ≈ 16k.
-//! Spheres that hit the chunk: ≈ 3 worms × 30 = 90 × bbox (r=2: 125 voxels) × ~8 ops for
-//! the row-pruned distance test ≈ 90k, plus ≈ 30 ops of rule checks per first-time carve.
-//! Lazy neighbor heights: ≈ 35k per side loaded (0–4 typically).
+//! # Cost (modeled SBF ops ≈ CU) and the hard cap
+//! Each sphere's work is bounded before carving by [`BBox::ops_bound`]: bbox rows ×
+//! [`OPS_ROW`] + bbox voxels × [`OPS_TEST`] + min(voxels, [`MAX_HITS`]`[r]`) × [`OPS_HIT`]
+//! (`MAX_HITS` = 8/40/136 is exact, asserted exhaustively). Spheres are replayed in a fixed
+//! order and one whose bound would push the chunk's total past [`CAVE_OPS_CAP`] (380k) is
+//! skipped, so carving work is ≤ 380k modeled ops **by construction**; skipping is
+//! deterministic and order-independent (a skipped sphere would only leave a seam).
+//! Unconstrained, the worst case would be 9 chunks × 2 worms × 24 spheres of r=3 all inside
+//! one chunk ≈ 3M ops. Measured over 10^6 chunks (4 seeds × 500², `scan_cave_tail`):
+//! demand mean 55k, p99 163k, p99.999 288k, max 340k — the cap never triggered.
 //!
 //! # SBF stack
-//! [`carve_caves`] frame ≈ 0.2 KB (a [`Worms`] iterator, 100 B); neighbor heights are loaded
-//! in [`HeightWindow`]'s own `#[inline(never)]` frame.
+//! [`carve_caves`] frame ≈ 1.2 KB (the two 512 B ceiling tables in an `Option`, a [`Worms`]
+//! iterator ≈ 100 B); `col_limits` and [`HeightWindow`]'s loader have their own
+//! `#[inline(never)]` frames.
 
 use crate::blocks::{is_fluid_u8, Block};
 use crate::consts::{CHUNK_H, CHUNK_VOL, FP, SEA_LEVEL};
-use crate::coords::block_index;
 use crate::hash::{rand_range, splitmix_next, Seed};
 use crate::populate::HeightWindow;
+use crate::terrain::Biome;
 
 pub const SALT_WORM: u32 = 0xCA7E_0010;
 /// Worms per chunk: `0..=MAX_WORMS`.
 pub const MAX_WORMS: i32 = 2;
 /// Segments per worm (inclusive).
-pub const SEGS: (i32, i32) = (20, 40);
+pub const SEGS: (i32, i32) = (12, 24);
 /// Sphere radius in blocks (inclusive).
 pub const RADIUS: (i32, i32) = (1, 3);
+/// One in this many worms is an entrance worm.
+pub const ENTRANCE_ONE_IN: i32 = 4;
+/// Hard cap on modeled carve ops per chunk (see module docs, "Cost").
+pub const CAVE_OPS_CAP: u32 = 380_000;
+/// Modeled SBF ops per bbox row, per bbox voxel test, and extra per in-sphere voxel.
+pub const OPS_ROW: u32 = 12;
+pub const OPS_TEST: u32 = 8;
+pub const OPS_HIT: u32 = 16;
+/// Exact maximum number of voxel centres inside a radius-`r` sphere over all fixed-point
+/// centre offsets (asserted exhaustively by `max_hits_exact`); index = radius.
+pub const MAX_HITS: [u32; 4] = [0, 8, 40, 136];
 /// Worm start height (inclusive).
 pub const WORM_Y: (i32, i32) = (8, 48);
 /// Sphere centre height bounds (inclusive, blocks).
@@ -108,6 +128,8 @@ pub struct Sphere {
     pub y: i64,
     pub z: i64,
     pub r: i32,
+    /// The worm is an entrance worm (may carve surface blocks of its own chunk).
+    pub entrance: bool,
 }
 
 /// Heap-free iterator over all spheres of all worms of one chunk (see module docs).
@@ -124,6 +146,7 @@ pub struct Worms {
     yaw: i32,
     dy: i32,
     base_r: i32,
+    entrance: bool,
 }
 
 #[inline(always)]
@@ -148,6 +171,7 @@ pub fn worms_for_chunk(seed: &Seed, cx: i32, cz: i32) -> Worms {
         yaw: 0,
         dy: 0,
         base_r: 1,
+        entrance: false,
     }
 }
 
@@ -169,6 +193,7 @@ impl Iterator for Worms {
             self.dy = draw(rng, -48, 48);
             self.base_r = draw(rng, RADIUS.0, RADIUS.1);
             self.segs_left = draw(rng, SEGS.0, SEGS.1);
+            self.entrance = draw(rng, 0, ENTRANCE_ONE_IN - 1) == 0;
         }
         self.segs_left -= 1;
         let r = (self.base_r + draw(rng, -1, 1)).clamp(RADIUS.0, RADIUS.1);
@@ -177,9 +202,10 @@ impl Iterator for Worms {
             y: self.y,
             z: self.z,
             r,
+            entrance: self.entrance,
         };
-        // Advance: step (r + 1)/2 blocks along the yaw, plus dy.
-        let step = (r as i64 + 1) * FPL / 2;
+        // Advance: step r blocks along the yaw, plus dy.
+        let step = r as i64 * FPL;
         self.x += cos256(self.yaw) * step / 256;
         self.z += sin256(self.yaw) * step / 256;
         self.y += self.dy as i64;
@@ -209,95 +235,196 @@ pub fn is_wet_u8(b: u8) -> bool {
     is_fluid_u8(b) || b == Block::Ice as u8
 }
 
-/// Carves caves into chunk `(cx, cz)` (stage-1 blocks in `blocks`) from the worms of its
-/// 3×3 neighborhood, following the rule in the module docs. `win` supplies (and lazily
-/// loads) neighbor column heights.
+/// Work counters of one [`carve_caves`] call, in modeled SBF ops (see module docs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaveStats {
+    /// Modeled ops of the spheres carved (≤ [`CAVE_OPS_CAP`]).
+    pub ops: u32,
+    /// Modeled ops demanded by all spheres touching the chunk, including skipped ones.
+    pub demand: u32,
+    /// Spheres skipped because they would exceed [`CAVE_OPS_CAP`].
+    pub skipped: u32,
+}
+
+/// Per-column carve ceilings: `y` is carvable iff `y ≤ lo[c] || (SEA_LEVEL < y ≤ top[c])`
+/// (`1 ≤ y` is guaranteed by the bbox clip).
+struct Lim {
+    lo: [u8; 256],
+    top: [u8; 256],
+}
+
+/// Ceilings for normal and entrance spheres (see module docs). Loads the 4 side strips.
+#[inline(never)]
+fn col_limits(win: &mut HeightWindow, biomes: &[Biome; 256], out: &mut [Lim; 2]) {
+    for (c, biome) in biomes.iter().enumerate() {
+        let (x, z) = ((c % 16) as i32, (c / 16) as i32);
+        let h = win.own(x as usize, z as usize);
+        let mut nmin = h;
+        for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+            nmin = nmin.min(win.get(nx, nz));
+        }
+        let grassy = matches!(biome, Biome::Plains | Biome::Forest);
+        let top_e = if !grassy && h >= SEA_LEVEL { h } else { h - 1 };
+        for (l, top) in out.iter_mut().zip([h - 1, top_e]) {
+            l.top[c] = top as u8;
+            l.lo[c] = top.min(nmin) as u8;
+        }
+    }
+}
+
+/// Carves caves into chunk `(cx, cz)` (stage-1 blocks in `blocks`, stage-1 biomes in
+/// `biomes`) from the worms of its 3×3 neighborhood, following the rule in the module
+/// docs. `win` supplies neighbor column heights (the 4 side strips are loaded once the
+/// first sphere touches the chunk).
 #[inline(never)]
 pub fn carve_caves(
     seed: &Seed,
     cx: i32,
     cz: i32,
     blocks: &mut [u8; CHUNK_VOL],
+    biomes: &[Biome; 256],
     win: &mut HeightWindow,
-) {
+) -> CaveStats {
+    carve_caves_capped(seed, cx, cz, blocks, biomes, win, CAVE_OPS_CAP)
+}
+
+/// [`carve_caves`] with an explicit ops cap (tests).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn carve_caves_capped(
+    seed: &Seed,
+    cx: i32,
+    cz: i32,
+    blocks: &mut [u8; CHUNK_VOL],
+    biomes: &[Biome; 256],
+    win: &mut HeightWindow,
+    cap: u32,
+) -> CaveStats {
+    let mut lim: Option<[Lim; 2]> = None;
+    let mut st = CaveStats::default();
     let (ox, oz) = (cx as i64 * 16 * FPL, cz as i64 * 16 * FPL);
     for dz in -1..=1 {
         for dx in -1..=1 {
-            for s in worms_for_chunk(seed, cx + dx, cz + dz) {
-                carve_sphere(blocks, win, s.x - ox, s.y, s.z - oz, s.r);
+            let own = dx == 0 && dz == 0;
+            let worms = worms_for_chunk(seed, cx.wrapping_add(dx), cz.wrapping_add(dz));
+            for s in worms {
+                let Some(bb) = clip_bbox(s.x - ox, s.y, s.z - oz, s.r) else {
+                    continue;
+                };
+                let w = bb.ops_bound(s.r);
+                st.demand += w;
+                if st.ops + w > cap {
+                    st.skipped += 1;
+                    continue;
+                }
+                st.ops += w;
+                let lim = lim.get_or_insert_with(|| {
+                    let mut l = [EMPTY_LIM, EMPTY_LIM];
+                    col_limits(win, biomes, &mut l);
+                    l
+                });
+                let ctx = Carve {
+                    lx: s.x - ox,
+                    ly: s.y,
+                    lz: s.z - oz,
+                    r2: (s.r as i64 * FPL).pow(2),
+                };
+                carve_sphere(blocks, &lim[(own && s.entrance) as usize], &ctx, &bb);
             }
         }
     }
+    st
 }
 
-/// Carves one sphere given chunk-local fixed-point centre.
+const EMPTY_LIM: Lim = Lim {
+    lo: [0; 256],
+    top: [0; 256],
+};
+
+/// Sphere bbox clipped to the chunk and `y ∈ 1..=62` (voxel indices, inclusive).
+#[derive(Clone, Copy, Debug)]
+pub struct BBox {
+    x0: i64,
+    x1: i64,
+    y0: i64,
+    y1: i64,
+    z0: i64,
+    z1: i64,
+}
+
+impl BBox {
+    #[inline(always)]
+    pub fn volume(&self) -> u32 {
+        self.rows() * (self.x1 - self.x0 + 1) as u32
+    }
+
+    /// `(y, z)` rows of the bbox.
+    #[inline(always)]
+    pub fn rows(&self) -> u32 {
+        ((self.y1 - self.y0 + 1) * (self.z1 - self.z0 + 1)) as u32
+    }
+
+    /// Upper bound on the modeled ops of carving a radius-`r` sphere in this bbox:
+    /// rows · [`OPS_ROW`] + voxels · [`OPS_TEST`] + min(voxels, [`MAX_HITS`]`[r]`) ·
+    /// [`OPS_HIT`]. (Every row runs once, every bbox voxel is tested once, and only voxels
+    /// whose centre is inside the sphere run the carve path.)
+    #[inline(always)]
+    pub fn ops_bound(&self, r: i32) -> u32 {
+        let v = self.volume();
+        self.rows() * OPS_ROW + v * OPS_TEST + v.min(MAX_HITS[r as usize]) * OPS_HIT
+    }
+}
+
+/// Clipped bbox of a sphere with chunk-local fixed-point centre: `floor((c ± r) / FP)`
+/// covers every voxel whose centre (`v·FP + FP/2`) can be within `r`. At most `(2r+1)³`.
 #[inline(always)]
-fn carve_sphere(
-    blocks: &mut [u8; CHUNK_VOL],
-    win: &mut HeightWindow,
+pub fn clip_bbox(lx: i64, ly: i64, lz: i64, r: i32) -> Option<BBox> {
+    let rf = r as i64 * FPL;
+    let b = BBox {
+        x0: ((lx - rf) >> 8).max(0),
+        x1: ((lx + rf) >> 8).min(15),
+        y0: ((ly - rf) >> 8).max(1),
+        y1: ((ly + rf) >> 8).min(CHUNK_H as i64 - 2),
+        z0: ((lz - rf) >> 8).max(0),
+        z1: ((lz + rf) >> 8).min(15),
+    };
+    (b.x0 <= b.x1 && b.z0 <= b.z1 && b.y0 <= b.y1).then_some(b)
+}
+
+struct Carve {
     lx: i64,
     ly: i64,
     lz: i64,
-    r: i32,
-) {
-    let rf = r as i64 * FPL;
-    // Bounding box (voxel centres at v·FP + FP/2): floor((c ± r) / FP) covers every voxel
-    // whose centre can be within r.
-    let x0 = ((lx - rf) >> 8).max(0);
-    let x1 = ((lx + rf) >> 8).min(15);
-    let z0 = ((lz - rf) >> 8).max(0);
-    let z1 = ((lz + rf) >> 8).min(15);
-    if x0 > x1 || z0 > z1 {
-        return;
-    }
-    let y0 = ((ly - rf) >> 8).max(1);
-    let y1 = ((ly + rf) >> 8).min(CHUNK_H as i64 - 2);
-    let r2 = rf * rf;
-    for y in y0..=y1 {
-        let ddy = y * FPL + FPL / 2 - ly;
-        let ry = r2 - ddy * ddy;
+    r2: i64,
+}
+
+#[inline(always)]
+fn carve_sphere(blocks: &mut [u8; CHUNK_VOL], lim: &Lim, k: &Carve, bb: &BBox) {
+    for y in bb.y0..=bb.y1 {
+        let ddy = y * FPL + FPL / 2 - k.ly;
+        let ry = k.r2 - ddy * ddy;
         if ry < 0 {
             continue;
         }
-        for z in z0..=z1 {
-            let ddz = z * FPL + FPL / 2 - lz;
+        for z in bb.z0..=bb.z1 {
+            let ddz = z * FPL + FPL / 2 - k.lz;
             let rz = ry - ddz * ddz;
             if rz < 0 {
                 continue;
             }
-            for x in x0..=x1 {
-                let ddx = x * FPL + FPL / 2 - lx;
-                if ddx * ddx <= rz {
-                    carve_voxel(blocks, win, x as i32, y as i32, z as i32);
+            for x in bb.x0..=bb.x1 {
+                let ddx = x * FPL + FPL / 2 - k.lx;
+                if ddx * ddx > rz {
+                    continue;
+                }
+                let c = (z * 16 + x) as usize & 255;
+                let yy = y as u8;
+                if yy <= lim.lo[c] || (y > SEA_LEVEL as i64 && yy <= lim.top[c]) {
+                    blocks[(y as usize * 256 + c) & (CHUNK_VOL - 1)] = Block::Air as u8;
                 }
             }
         }
     }
-}
-
-#[inline(always)]
-fn carve_voxel(blocks: &mut [u8; CHUNK_VOL], win: &mut HeightWindow, x: i32, y: i32, z: i32) {
-    let i = block_index(x as usize, y as usize, z as usize);
-    // y < h implies stage-1 solid (never water/ice/air); air here means already carved.
-    if blocks[i] == Block::Air as u8 || y >= win.own(x as usize, z as usize) {
-        return;
-    }
-    if is_wet_u8(blocks[i + 256]) || is_wet_u8(blocks[i - 256]) {
-        return;
-    }
-    const NB: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
-    for (nx, nz) in NB {
-        let (nx, nz) = (x + nx, z + nz);
-        let wet = if (0..16).contains(&nx) && (0..16).contains(&nz) {
-            is_wet_u8(blocks[block_index(nx as usize, y as usize, nz as usize)])
-        } else {
-            y <= SEA_LEVEL && y > win.get(nx, nz)
-        };
-        if wet {
-            return;
-        }
-    }
-    blocks[i] = Block::Air as u8;
 }
 
 #[cfg(test)]
@@ -310,6 +437,43 @@ mod tests {
             *v = (i as u8).wrapping_mul(53).wrapping_add(tag);
         }
         Seed::new(&b)
+    }
+
+    /// MAX_HITS is the exact max of voxel centres within `r` of an integer fixed-point
+    /// centre (offsets 0..=128 per axis suffice by mirror symmetry, sorted by permutation
+    /// symmetry).
+    #[test]
+    fn max_hits_exact() {
+        for r in 1..=3i64 {
+            let r2 = (r * FPL).pow(2);
+            let axis = |o: i64| -> Vec<i64> {
+                (-r - 1..=r + 1)
+                    .map(|i| (i * FPL + FPL / 2 - o).pow(2))
+                    .collect()
+            };
+            let axes: Vec<Vec<i64>> = (0..=128).map(axis).collect();
+            let mut best = 0;
+            for a in 0..=128usize {
+                for b in a..=128 {
+                    for c in b..=128 {
+                        let mut n = 0;
+                        for &dx in &axes[a] {
+                            for &dy in &axes[b] {
+                                if dx + dy > r2 {
+                                    continue;
+                                }
+                                for &dz in &axes[c] {
+                                    n += (dx + dy + dz <= r2) as u32;
+                                }
+                            }
+                        }
+                        best = best.max(n);
+                    }
+                }
+            }
+            println!("r={r}: max hits {best}");
+            assert_eq!(best, MAX_HITS[r as usize], "r={r}");
+        }
     }
 
     #[test]
