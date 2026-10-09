@@ -1,11 +1,14 @@
 // Game entry: receives the joined world, keeps the PlayerState subscription in app state,
-// and runs the world view (chunk store + renderer + auto-create, world/world.ts) on the
-// game canvas. The "entering world" overlay stays until the first chunk mesh is on screen.
-// (Player controller and gameplay UI: Tasks 25–27.)
+// and runs the world view (chunk store + renderer + auto-create, world/world.ts) and the
+// player (controller + move sync, player/controller.ts; needs the core wasm) on the game
+// canvas. The "entering world" overlay stays until the first chunk mesh is on screen.
+// (Gameplay UI, death screen: Tasks 26–27.)
 import type { PublicKey } from "@solana/web3.js";
 import { decodePlayerState, FP, pstatePda, type PlayerStateAccount, type WorldAccount } from "./chain";
 import type { App } from "./state";
-import { clear, focusHeading, h } from "./ui/dom";
+import { startPlayer, type PlayerSession } from "./player/controller";
+import { clear, focusHeading, h, sendResultMessage } from "./ui/dom";
+import { loadCore } from "./wasm";
 import { startWorld } from "./world/world";
 
 export type GameHandle = { stop(): void };
@@ -30,23 +33,50 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
     info.textContent = `Health ${s.health}/20 · Food ${s.food}/20 · at ${x}, ${y}, ${z}`;
     bar.querySelector(".game-pos")!.textContent = `Player at ${x}, ${y}, ${z}`;
   };
+  let player: PlayerSession | null = null;
+  let lastData: Uint8Array | null = null;
   const apply = (data: Uint8Array) => {
+    let s: PlayerStateAccount;
     try {
-      show(decodePlayerState(data));
+      s = decodePlayerState(data);
     } catch {
-      /* not created yet */
+      return; /* not created yet */
     }
+    lastData = data;
+    show(s);
+    player?.onPlayerState(data);
+    dead.hidden = s.health > 0;
+    if (s.health > 0 && player) player.controller.frozen = false;
   };
+  // Placeholder until the death screen (Task 26).
+  const dead = h("div", { class: "game-dead", role: "alert", hidden: true }, h("h2", {}, "You died"), h("p", {}, "Respawning comes with the next update."));
   const view = startWorld(app, canvas, world, account, () => {
     overlay.hidden = true;
     bar.append(leave);
   });
-  root.querySelector(".screen.game")!.append(bar, view.ui);
+  root.querySelector(".screen.game")!.append(bar, view.ui, dead);
+  let stopped = false;
+  loadCore().then(
+    () => {
+      if (stopped) return;
+      player = startPlayer(app, view, world, account, canvas, {
+        onDead: () => (dead.hidden = false),
+        onIssue: (f) => view.toast(sendResultMessage({ status: "failed", error: f }, "Move") ?? f.message, "warn"),
+      });
+      if (lastData) player.onPlayerState(lastData);
+    },
+    (e) => {
+      console.error("core wasm failed to load", e);
+      info.textContent = "Could not load the game engine (wasm). Reload to retry.";
+    },
+  );
   void app.conns.er.getAccountInfo(pstate, "confirmed").then((i) => i && apply(i.data), () => {});
   const sub = app.conns.er.onAccountChange(pstate, (i) => apply(i.data), { commitment: "confirmed" });
 
   const handle: GameHandle = {
     stop() {
+      stopped = true;
+      player?.stop();
       view.stop();
       void app.conns.er.removeAccountChangeListener(sub).catch(() => {});
       app.set({ world: null, playerState: null });

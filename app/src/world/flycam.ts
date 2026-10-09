@@ -1,12 +1,14 @@
-// Free-fly debug camera (until the player controller, Task 25; afterwards debug mode
-// only): drag with the mouse to look, WASD to move, Space up, C or Q down, Shift faster.
-// Keys are ignored while typing in a form field.
+// Free-fly debug camera (debug mode only; toggled with F, the player controller drives the
+// camera otherwise): drag with the mouse to look, WASD to move, Space up, C or Q down,
+// Shift faster. Keys are ignored while typing in a form field; pointer input is ignored
+// while `enabled` is false.
 import type { PerspectiveCamera } from "three";
 
 export class FlyCam {
   yaw = 0;
   pitch = -0.35;
   speed = 10;
+  enabled = true;
   private keys = new Set<string>();
   private drag: { x: number; y: number } | null = null;
   private off: (() => void)[] = [];
@@ -28,7 +30,7 @@ export class FlyCam {
     on(window, "keyup", (e) => this.keys.delete(e.code));
     on(window, "blur", () => this.keys.clear());
     on(el, "pointerdown", (e) => {
-      if (e.button !== 0) return;
+      if (e.button !== 0 || !this.enabled) return;
       this.drag = { x: e.clientX, y: e.clientY };
       el.setPointerCapture(e.pointerId);
     });

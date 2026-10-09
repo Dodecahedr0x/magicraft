@@ -1,5 +1,6 @@
 // World session glue: chunk store → mesher workers → renderer, the chunk auto-creator, the
-// debug fly camera, and the in-game chunk panel (auto-create toggle, cost, toasts).
+// debug fly camera (toggled with F in debug mode; the player controller drives the camera
+// and the focus otherwise), and the in-game chunk panel (auto-create toggle, cost, toasts).
 import { LAMPORTS_PER_SOL, type PublicKey } from "@solana/web3.js";
 import {
   breakBlockIx,
@@ -36,13 +37,20 @@ export type WorldHandle = {
   store: ChunkStore;
   renderer: WorldRenderer;
   auto: AutoCreator;
-  /** The free-fly debug camera drives the focus (debug mode only). */
+  /** The free-fly debug camera exists (debug mode: dev build or `?debug`). */
   readonly debugCam: boolean;
+  /** The debug camera is active (it then drives the camera and the focus). */
+  readonly flying: boolean;
+  /** Switches the debug camera on / off (no-op outside debug mode); returns the state. */
+  setFly(on: boolean): boolean;
   /** Moves the load / auto-create focus to world position (x, y, z) (block units). The
-   *  debug camera calls it every frame; otherwise the player (Task 25) does. */
+   *  player controller calls it every frame; the debug camera while flying. */
   setFocus(x: number, y: number, z: number): void;
-  /** Called with every PlayerState update (own chunk; focus + camera when not in debug). */
+  /** Runs `cb(dt seconds)` before each render; returns an unsubscribe. */
+  onFrame(cb: (dt: number) => void): () => void;
+  /** Called with every PlayerState update (own chunk for auto-create; first camera spot). */
   onPlayerState(s: PlayerStateAccount): void;
+  toast(msg: string, kind?: "info" | "warn"): void;
   /** The chunk panel + toasts (append into the game screen). */
   ui: HTMLElement;
   stop(): void;
@@ -73,6 +81,9 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
   const pool = new MeshPool();
   const debugCam = isDebug();
   const cam = debugCam ? new FlyCam(renderer.camera, canvas) : null;
+  let flying = false;
+  if (cam) cam.enabled = false;
+  const frameCbs = new Set<(dt: number) => void>();
   let firstMesh = false;
 
   const store: ChunkStore = new ChunkStore({
@@ -159,8 +170,12 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     totals,
     askBox,
   );
-  const help = cam ? h("p", { class: "fly-help" }, "Debug camera: drag to look · WASD move · Space up · C / Q down · Shift faster") : null;
-  const ui = h("div", { class: "world-ui" }, panel, help ?? h("span"), toasts);
+  const help = h(
+    "p",
+    { class: "fly-help" },
+    "Click to look around (Esc releases) · WASD move · Space jump / swim · Shift sprint" + (cam ? " · F debug fly camera (drag to look, Space up, C / Q down)" : ""),
+  );
+  const ui = h("div", { class: "world-ui" }, panel, help, toasts);
 
   toggle.addEventListener("change", () => {
     store_.set(AUTO_KEY, toggle.checked ? "on" : "off");
@@ -315,10 +330,25 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
   }
 
   const onFrame = (dt: number) => {
-    if (!cam) return;
-    cam.update(dt);
-    const p = renderer.camera.position;
-    setFocus(p.x, p.y - EYE, p.z);
+    if (cam && flying) {
+      cam.update(dt);
+      const p = renderer.camera.position;
+      setFocus(p.x, p.y - EYE, p.z);
+    }
+    for (const cb of frameCbs) cb(dt);
+  };
+  const setFly = (on: boolean) => {
+    if (!cam) return false;
+    flying = on;
+    cam.enabled = on;
+    if (on) {
+      // Start from the current view.
+      const r = renderer.camera.rotation;
+      cam.yaw = r.y;
+      cam.pitch = r.x;
+      cam.setPosition(renderer.camera.position.x, renderer.camera.position.y, renderer.camera.position.z);
+    }
+    return flying;
   };
   renderer.start(onFrame);
   auto.start();
@@ -354,6 +384,7 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     placeBlock: (x: number, y: number, z: number, slot: number) => sendEdit(() => placeBlockIx(app.program, app.auth(), world, [x, y, z], slot, store)),
     cam,
     setFocus,
+    setFly,
     goto: (x: number, y: number, z: number, yaw = cam?.yaw ?? 0, pitch = cam?.pitch ?? 0) => {
       if (!cam) return renderer.camera.position.set(x, y, z);
       cam.yaw = yaw;
@@ -370,14 +401,26 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     auto,
     ui,
     debugCam,
+    get flying() {
+      return flying;
+    },
+    setFly,
     setFocus,
+    onFrame(cb) {
+      frameCbs.add(cb);
+      return () => frameCbs.delete(cb);
+    },
+    toast,
     onPlayerState(s) {
       auto.setOwn(Math.floor(s.move.pos[0] / (16 * FP)), Math.floor(s.move.pos[2] / (16 * FP)));
-      if (!placed || !cam) placeAt(s);
-      if (!cam) setFocus(s.move.pos[0] / FP, s.move.pos[1] / FP, s.move.pos[2] / FP);
+      if (!placed) {
+        placeAt(s);
+        setFocus(s.move.pos[0] / FP, s.move.pos[1] / FP, s.move.pos[2] / FP);
+      }
     },
     stop() {
       if (batchTimer !== null) clearTimeout(batchTimer);
+      frameCbs.clear();
       auto.dispose();
       store.dispose();
       pool.dispose();

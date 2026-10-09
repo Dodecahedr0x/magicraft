@@ -885,8 +885,35 @@ fieldset.plain {
 }
 
 .game-overlay[hidden],
+.game-dead[hidden],
 .chunk-halt[hidden] {
   display: none;
+}
+/* Placeholder death notice (death screen: Task 26). */
+.game-dead {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  text-align: center;
+  background: rgb(80 10 10 / 0.55);
+  color: #fff;
+}
+/* Crosshair (pointer-lock aim). */
+.screen.game::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  pointer-events: none;
+  background:
+    linear-gradient(rgb(255 255 255 / 0.85), rgb(255 255 255 / 0.85)) center / 2px 14px no-repeat,
+    linear-gradient(rgb(255 255 255 / 0.85), rgb(255 255 255 / 0.85)) center / 14px 2px no-repeat;
+  mix-blend-mode: difference;
 }
 
 /* ------------------------------------------------------------ world view */

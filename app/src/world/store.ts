@@ -119,6 +119,13 @@ export class ChunkStore implements ChunkView {
     return e.blocks[(y * 16 + (z - cz * 16)) * 16 + (x - cx * 16)];
   }
 
+  /** Block bytes of a ready chunk (`gen_stage == DONE`, full size), else null: what
+   *  `move_player` may be passed (physics pre-validation, Task 25). */
+  readyBlocks(cx: number, cz: number): Uint8Array | null {
+    const e = this.get(cx, cz);
+    return e?.blocks && e.genStage === GEN_DONE && this.ready(cx, cz) ? e.blocks : null;
+  }
+
   /** Mesher input for `key` (copies), or null when it has no blocks. */
   meshInput(key: string): { blocks: Uint8Array; borders: (Uint8Array | null)[] } | null {
     const e = this.map.get(key);
