@@ -1,5 +1,10 @@
 # Spikes and environment findings
 
+> **2026-10-09, Task 6:** the spike instructions (`spike.rs`) and spike tests (`01-04-spike-*`) were
+> removed; they remain in git history (last at commit `965c661`). `tests/helpers/spike.ts` became
+> `tests/helpers/player.ts` (no chunk setup). Decisions below are folded into the design doc and
+> implementation plan.
+
 ## 2026-10-09: Local ephemeral rollup harness (Task 2)
 
 Source: MagicBlock "Local development" guide

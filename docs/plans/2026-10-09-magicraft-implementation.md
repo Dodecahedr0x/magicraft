@@ -6,7 +6,7 @@
 
 **Architecture:** A pure, deterministic Rust crate (`magicraft-core`) holds all game logic (terrain, fluids, mobs, movement checks, recipes) and is unit-tested without a validator. A thin Anchor program (`magicraft`) wraps it with accounts, ephemeral-account sponsorship, session-key auth, VRF and cranks. A Vite + TypeScript + Three.js client renders chunks read directly from ER accounts.
 
-**Tech Stack:** Rust (Anchor 1.0.x, `ephemeral-rollups-sdk` 0.17.x with `anchor,vrf` features, `session-keys` 3.x, `magicblock-magic-program-api` 0.14.x), TypeScript (Vite, Three.js 0.186, `@coral-xyz/anchor`, `@solana/web3.js` 1.x, `@magicblock-labs/ephemeral-rollups-sdk`, `@magicblock-labs/gum-sdk`), Vitest, Mocha (anchor test), `@magicblock-labs/ephemeral-validator` for local ER.
+**Tech Stack:** Rust (Anchor 1.0.x, `ephemeral-rollups-sdk` 0.17.x with `anchor,vrf` features, `session-keys` 3.x, `magicblock-magic-program-api` 0.14.x), TypeScript (Vite, Three.js 0.186, `@anchor-lang/core` 1.0 (Anchor 1.x's rename of `@coral-xyz/anchor`), `@solana/web3.js` 1.x, `@magicblock-labs/ephemeral-rollups-sdk`; session-key ixs hand-built, no `@magicblock-labs/gum-sdk`), Vitest, Mocha (anchor test), `@magicblock-labs/ephemeral-validator` for local ER.
 
 **Ground rules for every task**
 - Read the design doc first. It is the source of truth; if a task conflicts with it, stop and report.
@@ -98,6 +98,12 @@ docs/plans, docs/notes
 1. Update the design doc's "Open risks" with resolved answers (link `docs/notes/spikes.md`).
 2. Delete spike instructions and spike tests (keep helpers). `anchor build` passes.
 3. Commit `chore: remove spikes, record decisions`.
+
+Done: spike findings are folded into the design doc and Tasks 15–28 below. Kept: `init_player`,
+`deposit`, `delegate_player`, `errors.rs` (`MagicraftError`, offset 6100), `tests/01-player.spec.ts`,
+`tests/helpers/{env,session,player}.ts`. Program deps `magicblock-magic-program-api` 0.14 + `bincode`
+stay for cranks. The spike code is in git history (commits `spike: …`) as reference for the
+`ScheduleTask`/`CancelTask` CPI, ephemeral create/resize/close, VRF with a PDA payer, and commit.
 
 ---
 
@@ -209,14 +215,21 @@ Commit `feat(core): inventory and recipes`.
 
 Use `magicraft-core` for all logic; the program only (de)serializes, authorizes, sponsors, and schedules. Use zero-copy (`#[account(zero_copy)]` or manual byte layout) for `Chunk` — the 16 KB array must not be Borsh-deserialized each call. Ephemeral accounts are `AccountInfo` (per docs); write a manual header layout with `bytemuck`.
 
+Spike-derived rules (see design doc and `docs/notes/spikes.md`; the spike code is in git history, `git show 965c661:programs/magicraft/src/instructions/spike.rs`):
+- Create/resize/close ephemeral accounts with `ephemeral_rollups_sdk::ephemeral_accounts::EphemeralAccount` directly (sponsor = `Account<Player>` with `mut, seeds, bump = player.bump, has_one = authority`; signer seeds from `player.bump` / `ctx.bumps.*`; declare `#[account(address = EPHEMERAL_VAULT_ID)] vault` and `magic_program` yourself). Not `#[ephemeral_accounts]`: its generated methods can't use `#[instruction]` args in seeds.
+- Accounts > 10 240 bytes: create at ≤ 10 240, resize in a second top-level ix (same tx OK).
+- Program errors: one `#[error_code(offset = 6100)] MagicraftError` in `errors.rs`; 6000–6003 belong to `session_keys::SessionError`.
+- Tests use `sendEr` (polls `getSignatureStatuses`) for ER txs and `tests/helpers/player.ts` (`setupPlayer`, `waitForEr`, `until`) for setup.
+
 ### Task 15: State, errors, auth helpers, Player lifecycle
 
-**Files:** `programs/magicraft/src/{state,errors,auth}.rs`, `instructions/player.rs`, `tests/10-player.spec.ts`.
+**Files:** `programs/magicraft/src/{state,errors,auth}.rs`, `instructions/player.rs`, extend `tests/01-player.spec.ts`.
 
 - `state.rs`: `Player`, `WorldHeader` (+`WorldParams` mirror with `From<core::WorldParams>`), `ChunkHeader` (payer, cx, cz, edited, gen_stage, task_id, tick state, FluidQueue, mobs[8]) + `CHUNK_BLOCKS_OFFSET`, `PresenceEntry { player, pos, last_seen_ms, pending_damage }`, `PlayerState` (MoveState + health + food + Inventory + cooldowns). Byte-layout helpers `chunk_header_mut(&AccountInfo)`, `chunk_blocks_mut`.
-- `errors.rs`: all codes from design.
-- Instructions: `init_player`, `deposit`, `delegate_player`, `withdraw(lamports)` (on ER: commit+undelegate via `commit_and_undelegate_accounts`; then base-layer `withdraw_base(lamports)` keeping rent-exempt min).
-- Test: full lifecycle on local ER: init → deposit → delegate → (ER) read lamports → withdraw → base balance restored minus fees.
+- `errors.rs`: extend `MagicraftError` (offset 6100) with all codes from design.
+- `Player`: add a count of open sponsored accounts (chunks) out of `_reserved` so `withdraw` can refuse (or the client can warn) while chunks are open: their rent would be stranded on the ER until re-delegation.
+- Instructions: `init_player`, `deposit` (initial funding only, before delegation), `delegate_player` (exist), `withdraw` (on ER: commit+undelegate via `ephem::commit_and_undelegate_accounts`, only `magic_context`/`magic_program` extra; then base-layer `withdraw_base(lamports)` keeping rent-exempt min). No top-up ix: top-ups are the client-side `lamportsDelegatedTransferIx` (npm SDK, e-SPL). Settlement is delta-based: base = base + ER delta since last commit.
+- Test: full lifecycle on local ER: init+deposit+delegate (one tx) → top-up with `lamportsDelegatedTransferIx` (fresh 32-byte salt; locally fund the e-SPL rent PDA `["rent"]` of `SPLxh1…` with 1 SOL first) → ER balance +amount within ~1 s → withdraw → base balance = deposit + top-up − ER spend, minus fees. Withdraw with an open chunk is refused (once Task 17 exists).
 
 Commit `feat(program): player lifecycle`.
 
@@ -224,10 +237,11 @@ Commit `feat(program): player lifecycle`.
 
 **Files:** `instructions/world.rs`, `instructions/crank.rs` (day part), `tests/11-world.spec.ts`.
 
-- `create_world(nonce: u64, name: [u8;32], params: WorldParams)` (ER, session-auth, sponsor = Player): eph `World` PDA `["world", player.authority, nonce]`; validate params; seed zeroed.
-- `request_seed` (`#[vrf]`, ephemeral queue) and `callback_seed(randomness)` (`#[vrf_callback]`, writes seed if zero).
-- `schedule_day_crank` → `tick_day(world)` every 1000 ms with large iteration count; `tick_day` advances `time_of_day` modulo `day_length_secs*1000`. Use findings from Task 4 for payer/cancel.
-- Tests: invalid params rejected; seed becomes non-zero ≤ 10 s; `time_of_day` advances; second callback can't overwrite.
+- `create_world(nonce: u64, name: [u8;32], params: WorldParams)` (ER, session-auth, sponsor = Player): eph `World` PDA `["world", player.authority, nonce]` created via `EphemeralAccount` (keep `World` ≤ 10 240 bytes so one ix suffices); validate params; seed zeroed, `seed_set = false`.
+- `request_seed` (`#[vrf]`, `oracle_queue` constrained `address = DEFAULT_EPHEMERAL_QUEUE`, with a cargo feature switching to `DEFAULT_EPHEMERAL_TEST_QUEUE` for localnet). Payer = the creator's delegated Player PDA: build with `create_request_randomness_ix` (the scoped request in 0.17.3; `accounts_metas` = World writable) and call `invoke_signed` yourself with account infos `[player, program_identity, oracle_queue, system_program, slot_hashes]` and **both** seed sets (`["identity", bump]` and the Player seeds). Don't use `invoke_signed_vrf` (identity seed only) or the legacy builders.
+- `callback_seed(randomness)` (`#[vrf_callback]`; `vrf_program_identity` is injected as the first account): typed `Account<World>` with seeds/bump, `require!(!world.seed_set)`, copy the 32 bytes, nothing else (≈ 260k CU available; no generation here).
+- `schedule_day_crank` → `tick_day(world)` every 1000 ms with large iteration count. ScheduleTask CPI (`magicblock-magic-program-api` 0.14 `MagicBlockInstruction::ScheduleTask`, bincode) signed by the creator's Player PDA (`invoke_signed`); `task_id` = collision-free id derived from the World PDA (e.g. first 8 bytes of `hash("day" ‖ world)` masked positive, non-zero), stored in `World`. `tick_day` is permissionless (no signer), advances `time_of_day` modulo `day_length_secs*1000`, and must not return errors on recoverable state (the scheduler drops a task after ~26 s of failures). It later doubles as the chunk-crank watchdog (Task 20).
+- Tests: invalid params rejected; seed becomes non-zero ≤ 10 s (expect ~110 ms); forged callback signer rejected (`ConstraintAddress`); second callback can't overwrite; `time_of_day` advances; rescheduling the day crank (same id) replaces rather than duplicates (tick rate unchanged).
 
 Commit `feat(program): worlds, vrf seed, day crank`.
 
@@ -235,10 +249,11 @@ Commit `feat(program): worlds, vrf seed, day crank`.
 
 **Files:** `instructions/chunk.rs`, `tests/12-chunk.spec.ts`.
 
-- `create_chunk(cx, cz)`: requires seed set; adjacency rule (existing neighbor chunk passed as optional account, or `(cx,cz)` == player's current chunk, or world has 0 chunks and `(0,0)`); creates `Chunk` + `ChunkPresence` (empty, header only) eph accounts sponsored by Player; runs `core::terrain::generate_stage1`; `gen_stage = 1`.
-- `populate_chunk(cx, cz)`: `generate_stage2`; place animals in mob slots; `gen_stage = DONE`; if `(0,0)` and world spawn unset → compute spawn.
-- `close_chunk`: payer only; `!edited`, no mobs, presence empty; `close_ephemeral_*` both.
-- Test: generate (0,0) → spawn set; generated bytes equal `magicraft-core` output for the same seed (expose a tiny test-only wasm? simpler: a Rust test binary `crates/core/examples/gen.rs <seed_hex> cx cz` writes blocks to stdout; TS test spawns it and compares); non-adjacent create rejected; close refunds; regenerate identical. **Log CU for both stages; if either > 1.2M, split further and note.**
+- `create_chunk(cx, cz)`: requires seed set; adjacency rule (existing neighbor chunk passed as optional account, or `(cx,cz)` == player's current chunk, or world has 0 chunks and `(0,0)`); creates `Chunk` at **10 240 bytes** + `ChunkPresence` (empty, header only) via `EphemeralAccount`, sponsored by Player; writes the header (payer, cx, cz).
+- `grow_chunk(cx, cz)`: resize `Chunk` to full size (header + 16 384), then `core::terrain::generate_stage1`; `gen_stage = 1`. Sent in the same tx as `create_chunk`, preceded by `ComputeBudgetProgram.setComputeUnitLimit(1_400_000)` (the tx budget is shared by all its ixs). If stage 1 doesn't fit next to the create/resize, move it to its own ix/tx.
+- `populate_chunk(cx, cz)`: own tx with ComputeBudget 1.4M; `generate_stage2`; place animals in mob slots; `gen_stage = DONE`; if `(0,0)` and world spawn unset → compute spawn.
+- `close_chunk`: payer only; `!edited`, no mobs, presence empty; cancel the chunk's tick crank (`CancelTask`, authority = payer Player PDA); close both via `EphemeralAccount` (rent refunded to the Player on the ER, settles to base on the next commit). Requires the payer Player to be delegated.
+- Test: generate (0,0) → spawn set; generated bytes equal `magicraft-core` output for the same seed (expose a tiny test-only wasm? simpler: a Rust test binary `crates/core/examples/gen.rs <seed_hex> cx cz` writes blocks to stdout; TS test spawns it and compares); Player ER lamports drop by exactly `(chunk_len + 60) * 32 + (presence_len + 60) * 32`; non-adjacent create rejected; close refunds; regenerate identical. **Log CU for every stage (expect ≥ ~7 CU per computed byte, i.e. > 115k for stage 1 alone); if any tx > 1.2M, split further and note.** Note absolute CU varies by ~3k between runs from `find_program_address` bump searches on random keys; prefer stored bumps.
 
 Commit `feat(program): chunk generation and reclaim`.
 
@@ -246,10 +261,10 @@ Commit `feat(program): chunk generation and reclaim`.
 
 **Files:** `instructions/play.rs` (join/move), `programs/magicraft/src/presence.rs`, `tests/13-move.spec.ts`.
 
-- Session-auth pattern for all gameplay ixs: `#[derive(Accounts, Session)]`, `#[session(signer = signer, authority = player.authority.key())] session_token: Option<Account<SessionToken>>`, `#[session_auth_or(player.authority.key() == signer.key(), MagicraftError::Unauthorized)]`.
+- Session-auth pattern for all gameplay ixs (verified in the Task 5 spike): `use session_keys::{session_auth_or, Session, SessionError, SessionTokenV2};` (the macro uses `SessionError` unqualified), `#[derive(Accounts, Session)]`, `#[session(signer = signer, authority = player.authority.key())] session_token: Option<Account<'info, SessionTokenV2>>`, `#[session_auth_or(ctx.accounts.player.authority == ctx.accounts.signer.key(), MagicraftError::Unauthorized)]` (the expression must go through `ctx.accounts.…`). `player` is a seeded `Account<Player>` (`seeds = [PLAYER_SEED, player.authority.as_ref()], bump = player.bump`) so the session authority comes from a validated account. The session key signs and pays fees on the ER with 0 lamports. Use `tests/helpers/session.ts` (`createSessionIx`, `revokeSessionIx`, `sessionTokenPda`, `SESSION_ERRORS`) in tests.
 - `join_world`: eph `PlayerState` at spawn.
-- `move_player(pos, vel, on_ground)`: accounts: world, player_state, chunk(s) for current (and previous if crossed), presence(s); runs `core::physics::check_move` with a `BlockAccess` over passed chunks; applies `pending_damage` from presence entry; hunger; presence add/update/remove (resize via `resize_ephemeral_*`, sponsor = Player; refunds on shrink); prunes stale entries (≤ 4 per call). Re-arms chunk tick crank if not running (Task 20 helper; stub now).
-- Tests: valid walk accepted; teleport rejected; walking into stone rejected; crossing a border moves presence entry and rent nets to ~0; stale entry pruned; fall damage applied; session key signer works, random signer rejected.
+- `move_player(pos, vel, on_ground)`: accounts: world, player_state, chunk(s) for current (and previous if crossed), presence(s); runs `core::physics::check_move` with a `BlockAccess` over passed chunks; applies `pending_damage` from presence entry; hunger; presence add/update/remove (resize via `EphemeralAccount::resize`, sponsor = Player; refunds on shrink); prunes stale entries (≤ 4 per call). Re-arms the current chunk's tick crank if not running or its `last_tick` has stalled (Task 20 helper; stub now).
+- Tests: valid walk accepted; teleport rejected; walking into stone rejected; crossing a border moves presence entry and rent nets to ~0; stale entry pruned; fall damage applied; session key signer (0 lamports) works; random signer without token → `Unauthorized` (6100); random signer with someone else's token → `InvalidToken` (6001); expired/revoked token rejected.
 
 Commit `feat(program): join, presence, movement`.
 
@@ -266,9 +281,11 @@ Commit `feat(program): block edits, crafting, combat`.
 
 **Files:** `instructions/crank.rs`, `tests/15-crank.spec.ts`.
 
-- `tick_chunk` accounts `[world, chunk, presence, n,s,e,w chunks, n,s,e,w presences]` (self placeholders allowed). Each tick: `fluid::step` (budget 32), step all mobs (move across borders into neighbor free slots; damage → presence entries), zombie spawn attempt, idle detection.
-- `arm_chunk_crank(chunk)` helper used by move/edits/spawn: schedules if `task_id == 0` or expired; `create_chunk` cancels+reschedules existing neighbors with running cranks.
-- Tests: pour water (place source on a flat area) → after 2 s water spread observed; zombie spawned at night (create world with short `day_length_secs`) near a joined player and `pending_damage` grows; idle chunk crank stops.
+- `tick_chunk` accounts `[world, chunk, presence, n,s,e,w chunks, n,s,e,w presences]` (self placeholders allowed). **Permissionless**: no user signer (the only signer the scheduler allows in a cranked ix is the crank-executor PDA `["crank-executor", authority]` of `Crank1111…`; don't require it). Each tick: `fluid::step` (budget 32), step all mobs (move across borders into neighbor free slots; damage → presence entries), zombie spawn attempt, idle detection, `last_tick = now`. Never return an error on recoverable state (missing/closed neighbor, full queue): ~26 s of continuous failures makes the scheduler drop the task silently.
+- `arm_chunk_crank(chunk)` helper used by move/edits/spawn/watchdog: CPI `ScheduleTask` with `task_id` derived collision-free from the chunk PDA (stored in `ChunkHeader`; ids are global per validator) and **authority = the chunk's payer Player PDA** (`invoke_signed` with its seeds; the account must be passed and delegated). Same authority + same id **replaces** the task, so arming is idempotent and `create_chunk` simply re-arms existing neighbors with the new account list (no cancel). A different authority reusing an id is rejected silently, which is why the authority is the stable payer, not the caller.
+- Watchdog: `tick_day` and `move_player` re-arm chunk cranks whose `last_tick` is older than a few intervals while work exists (a schedule tx succeeding doesn't prove the task runs).
+- Hydra: the SDK marks these Magic-program crank CPIs deprecated in favour of Hydra (not in the local stack). Keep the CPI behind one helper so it can be swapped; re-check before devnet (Task 28).
+- Tests: pour water (place source on a flat area) → after 2 s water spread observed; zombie spawned at night (create world with short `day_length_secs`) near a joined player and `pending_damage` grows; idle chunk crank stops; re-arming twice doesn't double the tick rate; a crank stalled by cancelling it directly is re-armed by the watchdog; closing a chunk cancels its crank.
 
 Commit `feat(program): chunk tick crank`.
 
@@ -276,7 +293,7 @@ Commit `feat(program): chunk tick crank`.
 
 **Files:** `tests/99-e2e.spec.ts`.
 
-Full path: wallet → player → delegate → session → create world → VRF → chunk (0,0) → join → move around creating 8 chunks → break/craft/place → water flow → night zombie damage → death → respawn → close an unedited chunk → withdraw. Commit `test: end-to-end gameplay`.
+Full path: wallet → player → delegate → session → create world → VRF → chunk (0,0) → join → move around creating 8 chunks → top up (`lamportsDelegatedTransferIx`) → break/craft/place → water flow → night zombie damage → death → respawn → close the player's unedited chunks → withdraw (assert base balance reflects ER spend). Commit `test: end-to-end gameplay`.
 
 ---
 
@@ -284,19 +301,20 @@ Full path: wallet → player → delegate → session → create world → VRF �
 
 ### Task 22: Client scaffold + chain layer
 
-**Files:** `app/{package.json,vite.config.ts,index.html,src/main.ts}`, `app/src/chain/{config,connections,program,session,sender,pdas,layout}.ts`, `app/src/chain/*.test.ts`.
+**Files:** `app/{package.json,vite.config.ts,index.html,src/main.ts}`, `app/src/chain/{config,connections,program,session,sender,pdas,layout,player}.ts`, `app/src/chain/*.test.ts`.
 
 - Vite + TS strict + Three.js + Vitest. Copy IDL from `target/idl` via a `predev` script.
 - `pdas.ts` mirrors all seeds. `layout.ts` decodes `ChunkHeader`, blocks, mobs, presence, `PlayerState` from raw bytes (zero-copy layout) — tests decode fixtures produced by `crates/core/examples/gen.rs` and a hand-built header.
-- `sender.ts`: ER tx sender signing with session keypair, fire-and-forget, latest-wins coalescing per key (`move`), error-code mapping callback. Test with a mocked connection.
-- `session.ts`: create/restore session (keypair in `localStorage`, guarded try/catch) using gum session SDK.
+- `sender.ts`: ER tx sender signing with session keypair (also the fee payer; needs 0 lamports on the ER), fire-and-forget, latest-wins coalescing per key (`move`), error-code mapping callback: program errors from the IDL (6100+) plus `SessionError` 6000 `ValidityTooLong`, 6001 `InvalidToken`, 6002 `NoToken`, 6003 `InvalidAuthority` (not in the IDL; copy `SESSION_ERRORS`). Generation txs prepend `ComputeBudgetProgram.setComputeUnitLimit(1_400_000)`. Confirm by polling `getSignatureStatuses` (like `tests/helpers/env.ts` `sendEr`), not `confirmTransaction`. Test with a mocked connection.
+- `session.ts`: create/restore/revoke session (keypair in `localStorage`, guarded try/catch) by porting `tests/helpers/session.ts` (hand-built `create_session_v2`/`revoke_session_v2`, `sessionTokenPda`; no gum SDK, which pulls `@coral-xyz/anchor` 0.30). No top-up by default; `valid_until` ≤ now + 7 days.
+- `player.ts`: builders for the onboarding tx (`init_player` + `deposit` + `delegate_player`, see `tests/helpers/player.ts`) and top-up via `lamportsDelegatedTransferIx` from `@magicblock-labs/ephemeral-rollups-sdk` (fresh random 32-byte salt per call).
 - Commit `feat(app): scaffold and chain layer`.
 
 ### Task 23: Onboarding and world picker UI
 
 **Files:** `app/src/ui/{onboarding,worlds,createWorld,hud}.ts`, `app/src/style.css`.
 
-Wallet connect (Wallet Standard via `@solana/wallet-standard` / injected Phantom/Backpack), create+fund+delegate Player (1 tx), create session, list worlds (`getProgramAccounts` on ER filtered by World discriminator), create world form with `WorldParams` (defaults prefilled, ranges validated client-side), progress through VRF seed + chunk (0,0) + crank. Top-up and withdraw buttons. Commit `feat(app): onboarding and worlds`.
+Wallet connect (Wallet Standard via `@solana/wallet-standard` / injected Phantom/Backpack), create+fund+delegate Player (1 tx), create session (base tx; may share the onboarding tx or follow it; works while the Player is delegated), list worlds (`getProgramAccounts` on ER filtered by World discriminator), create world form with `WorldParams` (defaults prefilled, ranges validated client-side), progress through VRF seed + chunk (0,0) + crank. Top-up button (`lamportsDelegatedTransferIx`, ER balance updates in ~100 ms; show the 300 000-lamport setup charge) and withdraw button (closes the player's unedited chunks first and warns that rent of edited/occupied ones stays stranded on the ER until re-delegation). Commit `feat(app): onboarding and worlds`.
 
 ### Task 24: Chunk store, meshing, rendering
 
@@ -326,4 +344,4 @@ Box-model mobs (pig/cow/sheep/zombie) interpolated between account updates; othe
 
 **Files:** `docs/notes/deploy.md`, `app/.env.example`.
 
-Deploy program to devnet; configure ER endpoint (devnet ER from docs), VRF ephemeral queue, session program. Run the app (`pnpm -C app dev`), complete the onboarding flow with a devnet wallet, create a world, play 5 minutes; record issues. Commit `docs: devnet deploy notes`.
+Deploy program to devnet (build without the localnet VRF-queue feature); configure ER endpoint (devnet ER from docs) and pin its validator identity in `delegate_player`, VRF ephemeral queue, session program. Before playing, re-check the remaining risks from the design doc: Magic-program crank CPIs vs Hydra; the deployed VRF program's fee exemption for `DEFAULT_EPHEMERAL_QUEUE` (a Player-PDA payer needs it; fallback wallet payer); e-SPL global rent PDA funded (top-ups); ER fees still 0 (session keys with 0 lamports). Run the app (`pnpm -C app dev`), complete the onboarding flow with a devnet wallet, create a world, play 5 minutes; record issues. Commit `docs: devnet deploy notes`.
