@@ -8,6 +8,7 @@ pub mod fluid;
 pub mod hash;
 pub mod items;
 pub mod noise;
+pub mod physics;
 pub mod populate;
 pub mod terrain;
 
