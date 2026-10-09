@@ -128,3 +128,17 @@ export const cuStats = (v: number[]) =>
         [...v].sort((a, b) => a - b)[v.length >> 1]
       }, max ${Math.max(...v)} (${v.length})`
     : "none";
+
+/** Localnet-only: puts a mob of `kind` (full hp) at FP feet `pos` into a free
+ *  slot of the chunk holding it and arms that chunk's crank. */
+export async function debugSpawnMobIx(
+  world: web3.PublicKey,
+  chunk: web3.PublicKey,
+  kind: number,
+  pos: number[]
+) {
+  return erProgram.methods
+    .debugSpawnMob(kind, pos as [number, number, number])
+    .accountsPartial({ world, chunk })
+    .instruction();
+}

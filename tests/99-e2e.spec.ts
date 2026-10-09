@@ -6,9 +6,11 @@
 // (short day, zombies) + VRF seed → (0,0) + spawn → join → walk ≥ 8 chunks,
 // creating chunks ahead of the path → top-up (e-SPL) → break next to water,
 // water flows in → logs, crafting, place a table, shovel → gather blocks →
-// night: zombie damage → death (zombies, or a lethal fall from a pillar) →
-// respawn → close the reclaimable chunks → withdraw → base settles by the ER
-// delta. The route is planned over magicraft-core reference blocks
+// night: a zombie (placed by the localnet `debug_spawn_mob` hook) hits →
+// death (zombies, or a lethal fall from a pillar) → respawn → create a fresh
+// chunk, close every reclaimable chunk → withdraw → base settles by the ER
+// delta. The seed is VRF output, so worlds can't be pre-screened before paying
+// for them (create_world + request_seed ≈ 10 k lamports each). The route is planned over magicraft-core reference blocks
 // (`helpers/scout.ts`; worlds are retried until one fits).
 import { expect } from "chai";
 import { web3 } from "@anchor-lang/core";
@@ -45,18 +47,9 @@ import {
   nextClientMs,
   pstatePda,
 } from "./helpers/play";
-import {
-  Col,
-  Plan,
-  scoutTour,
-  scoutWork,
-  Terrain,
-  V3,
-  walkTree,
-} from "./helpers/scout";
+import { Col, Plan, scoutTour, scoutWork, Terrain, V3 } from "./helpers/scout";
 import {
   breakIx,
-  chunkMobs,
   countItem,
   craftIx,
   decodeInventory,
@@ -72,25 +65,21 @@ import {
   uniq,
   ZOMBIE,
 } from "./helpers/actions";
-import { tickTxs } from "./helpers/crank";
+import { debugSpawnMobIx, tickTxs } from "./helpers/crank";
+import { chaseUntilHurt, columnNear } from "./helpers/zombie";
 import { TxStats } from "./helpers/stats";
 
 const R = 2; // scouted area: chunks −R..=R
 const TOUR_CHUNKS = 8;
-/** Day length: long enough that the route before the night fits in the day
- *  (night = second half), short enough to keep the wait for it short. */
-const DAY_SECS = 150;
+/** Day length (night = second half). The route usually ends during the day;
+ *  the night wait is bounded either way. */
+const DAY_SECS = 120;
 const DEPOSIT = 0.05 * web3.LAMPORTS_PER_SOL;
 const TOP_UP = 0.01 * web3.LAMPORTS_PER_SOL;
 /** Pillar material to gather (soft blocks; + 5 planks): enough for a lethal
  *  fall at full health (health + 5 blocks above the landing column). */
 const SOFT_BLOCKS = 22;
 const key = (cx: number, cz: number) => `${cx},${cz}`;
-/** World column `i` (0..255) of chunk `k`. */
-const colOf = (k: string, i: number): Col => {
-  const [cx, cz] = k.split(",").map(Number);
-  return [cx * 16 + (i & 15), cz * 16 + (i >> 4)];
-};
 const isWater = (b: number) => b >= 23 && b <= 30;
 const N4: Col[] = [
   [1, 0],
@@ -109,10 +98,6 @@ describe("e2e: one player's journey", () => {
   let spawn: V3;
   let tour: V3[];
   let plan: Plan;
-  /** Reference blocks of the scouted area. */
-  let ref: Map<string, Buffer>;
-  /** Fresh chunks for the night (not on the route, mostly land, next to it). */
-  let nightChunks: string[];
   let baseAtSync: number;
   let erAtSync: number;
   const existing = new Set<string>();
@@ -234,8 +219,6 @@ describe("e2e: one player's journey", () => {
     const pos = (await state()).move.pos;
     return [Math.floor(pos[0] / FP), Math.floor(pos[2] / FP)];
   };
-  const isNight = async () =>
-    Number((await fetchWorld(world))!.acc.timeOfDayMs) >= DAY_SECS * 500;
 
   /** Runs `f`; a `Dead` rejection marks the player dead instead of failing. */
   async function unlessDead(f: () => Promise<unknown>) {
@@ -331,41 +314,6 @@ describe("e2e: one player's journey", () => {
         );
         continue;
       }
-      // Night: zombies spawn ≥ 8 blocks from a player in a ticking chunk with
-      // room under the cap; underground ones (spawned by day in caves near a
-      // lingering player) can fill a chunk's cap and never reach the surface.
-      // So the night is spent in a fresh chunk next to the route, mostly land
-      // (spawn floors), reachable on foot from the work spot.
-      const route = new Set<string>(tr.chunks);
-      for (const b of [
-        ...pl.pathW,
-        ...pl.pathL,
-        ...pl.pathS,
-        ...pl.logs,
-        ...pl.soft,
-        pl.Q,
-        pl.T,
-      ])
-        route.add(key(Math.floor(b[0] / 16), Math.floor(b[2] / 16)));
-      const fromS = walkTree(tw, pl.S);
-      const land = (k: string) => {
-        let n = 0;
-        for (let i = 0; i < 256; i++) if (tw.h(...colOf(k, i)) !== null) n++;
-        return n;
-      };
-      const night = [
-        ...new Set(
-          fromS.order.map((c) =>
-            key(Math.floor(c[0] / 16), Math.floor(c[1] / 16))
-          )
-        ),
-      ].filter((k) => !route.has(k) && land(k) >= 160);
-      if (!night.length) {
-        console.log(`    world ${attempt}: no land chunk for the night`);
-        continue;
-      }
-      ref = chunks;
-      nightChunks = night;
       world = w.world;
       spawn = sp;
       tour = tr.path;
@@ -419,6 +367,14 @@ describe("e2e: one player's journey", () => {
     await walk(plan.pathW);
     const q = plan.Q;
     expect(await blockAt(q)).to.not.equal(0);
+    // The water feeding Q may sit across a chunk border: it must exist.
+    for (const [dx, dz] of N4) {
+      const [cx, cz] = [
+        Math.floor((q[0] + dx) / 16),
+        Math.floor((q[2] + dz) / 16),
+      ];
+      if (Math.abs(cx) <= R && Math.abs(cz) <= R) await ensure(key(cx, cz));
+    }
     await breakBlock(q, "break_block (next to water)");
     const t = Date.now();
     const b = await until(
@@ -500,83 +456,58 @@ describe("e2e: one player's journey", () => {
       .filter((x) => x.item >= 1 && x.item <= 22)
       .reduce((n, x) => n + x.count, 0);
     expect(blocks).to.be.at.least(SOFT_BLOCKS + 5);
-    expect(
-      await isNight(),
-      "still day: the route must fit in the day"
-    ).to.equal(false);
     await phase(`gathered ${blocks} blocks`);
   });
 
-  it("at night, in a fresh chunk, zombies spawn and their hits reduce health", async () => {
-    // Idle until night: the presence entry goes stale and the chunk crank
-    // idles, so no (cave) zombies spawn around the waiting player.
-    while (!(await isNight())) await sleep(1_000);
+  it("at night a zombie next to the player hits it (pending_damage → health)", async () => {
+    // Bounded wait for a night with ≥ 20 s left (≤ one day). Idle meanwhile:
+    // the presence entry goes stale and the chunk crank idles.
+    const tod = async () => Number((await fetchWorld(world))!.acc.timeOfDayMs);
+    const half = DAY_SECS * 500;
+    const end = Date.now() + DAY_SECS * 1000 + 5_000;
+    for (;;) {
+      const t = (await tod()) % (2 * half);
+      if (t >= half && 2 * half - t >= 20_000) break;
+      expect(Date.now(), "night never came").to.be.below(end);
+      await sleep(1_000);
+    }
     await phase("night");
-    // Walk into the first reachable fresh chunk (created ahead of the path).
-    let walked = false;
-    for (const k of nightChunks) {
-      const t = new Terrain(
-        new Map([...(await liveBlocks(world, existing)), [k, ref.get(k)!]])
-      );
-      const tree = walkTree(t, await myCol());
-      const to = tree.order.find(
-        (c) => key(Math.floor(c[0] / 16), Math.floor(c[1] / 16)) === k
-      );
-      if (!to) continue;
-      await walk(tree.path(to)!);
-      console.log(`    night in fresh chunk (${k})`);
-      walked = true;
-      break;
-    }
-    expect(walked, "a fresh chunk reachable for the night").to.equal(true);
-    let hp = (await state()).acc.health;
-    console.log(`    health at nightfall ${hp}`);
-    let hurt = false;
-    let seen = false;
-    const tNight = Date.now();
-    while (!hurt && !dead && Date.now() - tNight < 70_000) {
-      const me = (await state()).move.pos;
-      // Zombies at the player's level (not in caves below).
-      const zs = (await mobsIn(world, existing, ZOMBIE)).filter(
-        (m) => Math.abs(m.pos[1] - me[1]) <= 2 * FP
-      );
-      let next: number[] | undefined;
-      const z = zs
-        .map((m) => ({
-          ...m,
-          d: Math.hypot(m.pos[0] - me[0], m.pos[2] - me[2]),
-        }))
-        .sort((a, b) => a.d - b.d)[0];
-      if (z && !seen) {
-        seen = true;
-        console.log(
-          `    zombie in (${z.chunk}) ${(z.d / FP).toFixed(
-            1
-          )} blocks away after ${Date.now() - tNight} ms of night`
-        );
-      }
-      if (z && z.d > 1.5 * FP) {
-        // Walk toward it (a client's player would fight or flee; we want hits).
-        const path = walkTree(await live(), await myCol()).path([
-          Math.floor(z.pos[0] / FP),
-          Math.floor(z.pos[2] / FP),
-        ]);
-        if (path?.length) next = center(...path[0]);
-      }
-      await unlessDead(() => move(next));
-      if (dead) break;
-      const h = (await state()).acc.health;
-      hurt = h < hp;
-      hp = Math.max(hp, h);
-    }
-    expect(seen, "a zombie spawned").to.equal(true);
-    expect(hurt || dead, "zombie damage reached the player's health").to.equal(
-      true
+    // Natural spawns need luck (floors 8-24 blocks away, room under the cap):
+    // the localnet test hook puts a zombie 3 blocks away instead.
+    const zpos = columnNear(await live(), await myCol(), 3);
+    expect(zpos, "a column 3 blocks away").to.not.equal(null);
+    await ensure(key(chunkOf(zpos![0]), chunkOf(zpos![2])));
+    await er(
+      ["debug_spawn_mob"],
+      [
+        debugSpawnMobIx(
+          world,
+          chunkPda(world, chunkOf(zpos![0]), chunkOf(zpos![2])),
+          ZOMBIE,
+          zpos!
+        ),
+      ]
     );
-    const st = await state();
+    const r = await chaseUntilHurt({
+      world,
+      player: p.player,
+      keys: () => existing,
+      me: async () => {
+        const st = await state();
+        return { pos: st.move.pos, health: st.acc.health };
+      },
+      move: (next) => move(next),
+      timeoutMs: 20_000,
+    });
+    dead = r.dead;
     console.log(
-      `    health ${st.acc.health}${dead ? " (killed by zombies)" : ""}`
+      `    hit: pending ${r.pendingBeforeHit} → health ${r.health}${
+        dead ? " (killed)" : ""
+      }`
     );
+    expect(r.hurt, "zombie damage reached the player's health").to.equal(true);
+    expect(r.pendingBeforeHit, "through pending_damage").to.be.above(0);
+    const st = await state();
     const [cx, cz] = [chunkOf(st.move.pos[0]), chunkOf(st.move.pos[2])];
     const ticks = await tickTxs(chunkPda(world, cx, cz), 30);
     expect(ticks.every((x) => x.ok)).to.equal(true);
@@ -654,19 +585,37 @@ describe("e2e: one player's journey", () => {
     await phase("respawned");
   });
 
-  it("closes its reclaimable chunks; edited / mob / occupied ones fail with the right codes", async () => {
+  it("closes its reclaimable chunks (incl. a fresh one); edited / occupied ones fail with the right codes", async () => {
+    // A chunk created ahead of the path that nobody entered: the client
+    // reclaims it (any mobs in it do not block).
+    const spawnChunk = key(chunkOf(spawn[0] * FP), chunkOf(spawn[2] * FP));
+    const far = [...existing]
+      .flatMap((k) => {
+        const [cx, cz] = k.split(",").map(Number);
+        return N4.map(([dx, dz]) => key(cx + dx, cz + dz));
+      })
+      .filter((k) => {
+        const [cx, cz] = k.split(",").map(Number);
+        return !existing.has(k) && Math.abs(cx) <= R && Math.abs(cz) <= R;
+      })
+      .sort((a, b) => {
+        const d = (k: string) => {
+          const [cx, cz] = k.split(",").map(Number);
+          const [sx, sz] = spawnChunk.split(",").map(Number);
+          return Math.abs(cx - sx) + Math.abs(cz - sz);
+        };
+        return d(b) - d(a);
+      })[0];
+    expect(far, "a chunk to create away from the player").to.not.equal(
+      undefined
+    );
+    await ensure(far);
     const outcome = new Map<string, number>();
-    // Where the blocking zombies are (caves vs surface), for the report.
-    const t = await live();
     const zs = await mobsIn(world, existing, ZOMBIE);
-    const under = zs.filter((m) => {
-      const h = t.h(Math.floor(m.pos[0] / FP), Math.floor(m.pos[2] / FP));
-      return h === null || m.pos[1] < (h - 1) * FP;
-    }).length;
     console.log(
       `    ${zs.length} zombies in ${new Set(zs.map((m) => m.chunk)).size} of ${
         existing.size
-      } chunks, ${under} below the surface`
+      } chunks (they do not block closing)`
     );
     for (const k of [...existing]) {
       const [cx, cz] = k.split(",").map(Number);
@@ -674,7 +623,6 @@ describe("e2e: one player's journey", () => {
       const predict = async () => {
         const d = (await chunkData(ck))!;
         if (chunkHeader(d).edited) return "ChunkEdited";
-        if (chunkMobs(d).some((m) => m.kind === ZOMBIE)) return "ChunkHasMobs";
         if ((await fetchPresence(presencePda(ck))).count)
           return "ChunkOccupied";
         return "closed";
@@ -685,16 +633,7 @@ describe("e2e: one player's journey", () => {
         er(["close_chunk"], [closeChunkIx(p, world, cx, cz, auth())])
       );
       const got = err ? err.code ?? String(err.number) : "closed";
-      if (got !== expected) {
-        // A crank tick may move a zombie across a border between the read and
-        // the tx: accept only if the chunk's state now explains the result.
-        expect(expected, `${k}: ${err}`).to.not.equal("ChunkEdited");
-        if (got !== "closed")
-          expect(await predict(), `${k}: ${err}`).to.equal(got);
-        console.log(
-          `    (${k}): predicted ${expected}, got ${got} (mob moved)`
-        );
-      }
+      expect(got, `${k}: ${err}`).to.equal(expected);
       outcome.set(got, (outcome.get(got) ?? 0) + 1);
       if (got === "closed") {
         const refund = (await erLamports(p.player)) - before;
@@ -707,9 +646,8 @@ describe("e2e: one player's journey", () => {
     console.log(
       `    close: ${[...outcome].map(([k, v]) => `${k} ${v}`).join(", ")}`
     );
-    // Reclaiming is best effort: zombies (spawned in caves near the player
-    // by day, or at night) block their chunk for good; every outcome above
-    // matched the chunk's state.
+    expect(existing.has(far), `fresh chunk ${far} reclaimed`).to.equal(false);
+    expect(outcome.get("closed") ?? 0).to.be.at.least(1);
     expect(
       outcome.get("ChunkEdited") ?? 0,
       "edited chunks kept"

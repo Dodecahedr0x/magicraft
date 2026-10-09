@@ -8,7 +8,10 @@ import { erConn, sendEr, TxError } from "./helpers/env";
 import { setupPlayer, sleep, TestPlayer, until } from "./helpers/player";
 import {
   chunkData,
+  chunkHeader,
   chunkPda,
+  CHUNK_TOTAL_RENT,
+  liveBlocks,
   CHUNK_BLOCKS_OFFSET,
   closeChunkIx,
   createAndGrow,
@@ -22,6 +25,7 @@ import { fetchWorld, params, setupWorld } from "./helpers/world";
 import {
   center,
   chunkOf,
+  erLamports,
   fetchPlayerState,
   fetchPresence,
   isSolid,
@@ -40,8 +44,10 @@ import {
   respawnIx,
   uniq,
 } from "./helpers/actions";
+import { Chase, chaseUntilHurt, columnNear } from "./helpers/zombie";
 import {
   armChunkIx,
+  debugSpawnMobIx,
   crankOf,
   cuStats,
   debugCancelTickIx,
@@ -219,8 +225,19 @@ describe("chunk tick crank", () => {
         continue;
       }
       const route = new Set<string>([key(0, 0)]);
-      for (const p of [...wat.path, wat.Q])
-        route.add(key(Math.floor(p[0] / 16), Math.floor(p[2] / 16)));
+      // Q's horizontal neighbours too: the water feeding it may sit across a
+      // chunk border (it must exist on chain to flow).
+      const [qx, qy, qz] = wat.Q;
+      for (const p of [
+        ...wat.path,
+        wat.Q,
+        ...N4.map(([dx, dz]) => [qx + dx, qy, qz + dz] as V3),
+      ])
+        if (
+          Math.abs(Math.floor(p[0] / 16)) <= R &&
+          Math.abs(Math.floor(p[2] / 16)) <= R
+        )
+          route.add(key(Math.floor(p[0] / 16), Math.floor(p[2] / 16)));
       // A chunk with animals next to (0,0), off the route (wander + close).
       const x = N4.map(([dx, dz]) => [dx, dz] as [number, number]).find(
         ([cx, cz]) => animals.get(key(cx, cz)) && !route.has(key(cx, cz))
@@ -364,27 +381,76 @@ describe("chunk tick crank", () => {
   });
 
   it("idle (no fluid, no mobs, no fresh presence): the tick cancels its own task", async () => {
+    // Animals from the neighbouring animal chunk may have wandered in (a chunk
+    // with mobs never goes idle): clear them with the localnet hook.
+    const strays = chunkMobs((await chunkData(c00()))!).filter((m) => m.kind);
+    if (strays.length) {
+      console.log(
+        `    ${strays.length} animal(s) wandered into (0,0): cleared`
+      );
+      await sendEr(
+        [await debugSpawnMobIx(world, c00(), 0, [0, 0, 0])],
+        [stranger()]
+      );
+    }
     // Stop moving: the presence entry goes stale after 5 s.
     const idle = await until(
       async () => ((await crankOf(c00()))!.armed === 0 ? true : null),
       12_000,
       250
     );
+    if (!idle) {
+      const d = (await chunkData(c00()))!;
+      console.log("    not idle:", {
+        mobs: chunkMobs(d).filter((m) => m.kind),
+        fluid: fluidQueue(d).len,
+        presence: (await fetchPresence(presencePda(c00()))).entries,
+        crank: await crankOf(c00()),
+      });
+    }
     expect(idle, "crank_armed cleared").to.equal(true);
-    const last = (await tickTxs(c00()))[0];
-    expect(last.ok).to.equal(true);
-    expect(
-      last.logs.some((l) => l.includes("tick: idle, crank cancelled")),
-      last.logs.join("\n")
-    ).to.equal(true);
-    logCus("tick_chunk (idle → cancel CPI)", [last.cu]);
-    const n = (await crankOf(c00()))!.tickCount;
-    const sigs = (await tickTxs(c00())).length;
-    await sleep(2_000);
-    expect((await crankOf(c00()))!.tickCount, "tick_count frozen").to.equal(n);
-    expect((await tickTxs(c00())).length, "no further executions").to.equal(
-      sigs
+    // Quiescence: executions already queued when the cancel landed may still
+    // run. Rarely (seen 2 runs in ~10) a second execution stream of the same
+    // task id survives the self-cancel (its extra executions are rejected as
+    // too early, then each accepted one is another idle cancel): a scheduler
+    // replace race, bounded by the task's iterations (≤ 240 × 250 ms). Wait
+    // until no tick is accepted for 2 s (bounded by that).
+    // (Neighbours' ticks list (0,0) too, so its signature history is not a
+    // quiescence signal; every accepted tick of its own sets `last_tick_ms`.)
+    const lastTick = async () => (await crankOf(c00()))!.lastTickMs;
+    let n = await lastTick();
+    const deadline = Date.now() + 75_000;
+    for (;;) {
+      await sleep(2_000);
+      const m = await lastTick();
+      if (m === n) break;
+      n = m;
+      expect(Date.now(), "crank never went quiet").to.be.below(deadline);
+    }
+    const txs = await tickTxs(c00(), 300); // newest first
+    const at = txs.findIndex((t) =>
+      t.logs.some((l) => l.includes("tick: idle, crank cancelled"))
     );
+    expect(at, "an idle tick cancelled the task").to.be.at.least(0);
+    logCus("tick_chunk (idle → cancel CPI)", [txs[at].cu]);
+    // Trailing executions (after the cancel) are ok idle no-ops.
+    for (const t of txs.slice(0, at + 1)) {
+      expect(t.ok, t.logs.join("\n")).to.equal(true);
+      expect(
+        t.logs.some((l) =>
+          /tick: (crank renewed|zombie|account list|armed)/.test(l)
+        ),
+        t.logs.join("\n")
+      ).to.equal(false);
+    }
+    if (at > 0)
+      console.log(`    ${at} trailing no-op executions after the cancel`);
+    const count = (await crankOf(c00()))!.tickCount;
+    await sleep(2_000);
+    expect((await crankOf(c00()))!.tickCount, "tick_count frozen").to.equal(
+      count
+    );
+    expect(await lastTick(), "no further accepted ticks").to.equal(n);
   });
 
   it("watchdog: a move re-arms an idle chunk, and re-arms a dropped task once it is stale", async () => {
@@ -494,7 +560,6 @@ describe("chunk tick crank", () => {
 
   describe("zombies (60 s day)", () => {
     let w2: web3.PublicKey;
-    let t2: Terrain;
 
     before(async () => {
       existing.clear();
@@ -524,7 +589,6 @@ describe("chunk tick crank", () => {
           break;
         }
       }
-      t2 = new Terrain(chunks);
       const ring = new Set<string>(["0,0", ...N4.map(([x, z]) => key(x, z))]);
       await createChunks(w2, ring);
       await sendEr([await joinWorldIx(a, w2)], [a.authority]);
@@ -532,90 +596,108 @@ describe("chunk tick crank", () => {
       await move(center(...sp), w2);
     });
 
-    it("at night a zombie spawns near the present player and its hits reach the player's health", async () => {
-      // Stay (fresh presence) until night: time_of_day ≥ 30 s of the 60 s day.
-      const nightIn = async () => {
-        const t = Number((await fetchWorld(w2))!.acc.timeOfDayMs);
-        return t >= 30_000 ? 0 : 30_000 - t;
-      };
-      while ((await nightIn()) > 0) await stayFor(1_000, 1_000, w2);
-      console.log("    night");
-      const zombieAt = async () => {
-        let best: { pos: V3; d: number } | null = null;
-        const me = (await state(a, w2)).move.pos;
-        for (const k of existing) {
-          const [cx, cz] = k.split(",").map(Number);
-          for (const m of chunkMobs((await chunkData(chunkPda(w2, cx, cz)))!)) {
-            if (m.kind !== ZOMBIE) continue;
-            const d = Math.hypot(m.pos[0] - me[0], m.pos[2] - me[2]);
-            if (!best || d < best.d) best = { pos: m.pos, d };
-          }
-        }
-        return best;
-      };
-      let z: Awaited<ReturnType<typeof zombieAt>> = null;
-      const t0 = Date.now();
-      while (!z && Date.now() - t0 < 30_000) {
+    const tod = async () => Number((await fetchWorld(w2))!.acc.timeOfDayMs);
+    /** Stays (fresh presence, moves every 1 s) until it is night with at least
+     *  `leftMs` of it left; bounded by one day. */
+    async function untilNight(leftMs: number) {
+      const end = Date.now() + 65_000;
+      for (;;) {
+        const t = await tod();
+        if (t >= 30_000 && 60_000 - t >= leftMs) return;
+        expect(Date.now(), "night never came").to.be.below(end);
         await stayFor(1_000, 1_000, w2);
-        z = await zombieAt();
       }
-      if (!z) {
-        for (const k of existing) {
-          const [cx, cz] = k.split(",").map(Number);
-          console.log(`    (${k})`, await crankOf(chunkPda(w2, cx, cz)));
-        }
-        const t = (await tickTxs(chunkPda(w2, 0, 0), 5))[0];
-        console.log(t?.logs.join("\n"));
-      }
-      expect(z, "a zombie spawned").to.not.equal(null);
-      console.log(
-        `    zombie at ${z!.pos} (${(z!.d / 256).toFixed(1)} blocks) after ${
-          Date.now() - t0
-        } ms of night`
-      );
-
-      // Walk toward the nearest zombie until it hits (pending damage → health).
-      const t1 = Date.now();
-      let hurt = false;
-      while (!hurt && Date.now() - t1 < 40_000) {
-        const me = (await state(a, w2)).move.pos;
-        const zz = await zombieAt();
-        let next: number[] | undefined;
-        if (zz && zz.d > 1.5 * 256) {
-          const from: Col = [Math.floor(me[0] / 256), Math.floor(me[2] / 256)];
-          const to: Col = [
-            Math.floor(zz.pos[0] / 256),
-            Math.floor(zz.pos[2] / 256),
-          ];
-          const path = walkTree(t2, from).path(to);
-          if (path?.length) next = center(...path[0]);
-        }
-        if (next && !existing.has(key(chunkOf(next[0]), chunkOf(next[2]))))
-          next = undefined;
-        await move(next, w2);
-        hurt = (await state(a, w2)).acc.health < 20;
-      }
+    }
+    const me = async () => {
       const s = await state(a, w2);
-      const pres = await fetchPresence(
-        presencePda(
-          chunkPda(w2, chunkOf(s.move.pos[0]), chunkOf(s.move.pos[2]))
-        )
-      );
-      console.log(
-        `    health ${s.acc.health} after ${
-          Date.now() - t1
-        } ms of chasing; pending ${pres.entries
-          .map((e) => e.pendingDamage)
-          .join()}`
-      );
-      expect(hurt, "zombie damage applied").to.equal(true);
-      const [mcx, mcz] = [chunkOf(s.move.pos[0]), chunkOf(s.move.pos[2])];
-      const txs = await tickTxs(chunkPda(w2, mcx, mcz));
+      return { pos: s.move.pos, health: s.acc.health };
+    };
+    const myCol = async (): Promise<Col> => {
+      const p = (await me()).pos;
+      return [Math.floor(p[0] / 256), Math.floor(p[2] / 256)];
+    };
+    async function chase(timeoutMs: number, stop?: () => Promise<boolean>) {
+      const r = await chaseUntilHurt({
+        world: w2,
+        player: a.player,
+        keys: () => existing,
+        me,
+        move: (next) => move(next, w2),
+        timeoutMs,
+        stop,
+      });
+      if (r.dead) await sendEr([uniq(), await respawnIx(a, w2)], [a.authority]);
+      return r;
+    }
+    async function logZombieTicks() {
+      const [cx, cz] = (await me()).pos.filter((_, i) => i !== 1).map(chunkOf);
+      const txs = await tickTxs(chunkPda(w2, cx, cz));
       expect(txs.every((t) => t.ok)).to.equal(true);
       logCus(
         "tick_chunk (zombie + player)",
         txs.map((t) => t.cu)
       );
+    }
+
+    it("night: a zombie spawns naturally near a present player and hits it (bounded by world time, fallback chunks)", async () => {
+      // No debug spawns in this world yet: every zombie is a natural spawn.
+      const ring = ["0,0", ...N4.map(([x, z]) => key(x, z))];
+      const end = Date.now() + 130_000; // ≤ 2 nights of the 60 s day
+      let r: Chase | null = null;
+      let tries = 0;
+      while (!r?.hurt && Date.now() < end) {
+        await untilNight(8_000);
+        // Stand in the next fallback chunk (a walk from here), then wait for
+        // a zombie at our level for ≤ 12 s of night.
+        const k = ring[tries++ % ring.length];
+        const t = new Terrain(await liveBlocks(w2, existing));
+        const tree = walkTree(t, await myCol());
+        const to = tree.order.find(
+          (c) => key(Math.floor(c[0] / 16), Math.floor(c[1] / 16)) === k
+        );
+        if (to)
+          for (const [x, y, z] of tree.path(to)!)
+            await move(center(x, y, z), w2);
+        r = await chase(12_000, async () => (await tod()) < 30_000);
+        console.log(
+          `    (${k}): ${
+            r.seenMs < 0 ? "no zombie" : `zombie after ${r.seenMs} ms`
+          }, ${r.hurt ? `hit (pending ${r.pendingBeforeHit})` : "no hit"}`
+        );
+      }
+      expect(r?.hurt, "a natural zombie's hit reached the player").to.equal(
+        true
+      );
+      expect(
+        r!.pendingBeforeHit,
+        "damage came through pending_damage"
+      ).to.be.above(0);
+      await logZombieTicks();
+    });
+
+    it("night: a zombie placed next to the player (debug_spawn_mob) hits it through pending_damage", async () => {
+      await untilNight(12_000);
+      const t = new Terrain(await liveBlocks(w2, existing));
+      const zpos = columnNear(t, await myCol(), 3);
+      expect(zpos, "a column 3 blocks away").to.not.equal(null);
+      const ck = chunkPda(w2, chunkOf(zpos![0]), chunkOf(zpos![2]));
+      const sig = await sendEr(
+        [await debugSpawnMobIx(w2, ck, ZOMBIE, zpos!)],
+        [stranger()]
+      );
+      logCus("debug_spawn_mob", [(await ixCus(sig)).ixs[0]]);
+      expect(
+        chunkMobs((await chunkData(ck))!).some(
+          (m) => m.kind === ZOMBIE && m.pos.join() === zpos!.join()
+        )
+      ).to.equal(true);
+      const r = await chase(15_000);
+      console.log(
+        `    hit after ${r.seenMs} ms in sight; pending ${r.pendingBeforeHit}, health ${r.health}`
+      );
+      expect(r.hurt, "the zombie's hit reached the player").to.equal(true);
+      expect(r.pendingBeforeHit).to.be.above(0);
+      await logZombieTicks();
     });
 
     it("a busy chunk renews its own task from inside the crank (ScheduleTask CPI)", async () => {
@@ -640,6 +722,62 @@ describe("chunk tick crank", () => {
       expect(r!.ok).to.equal(true);
       logCus("tick_chunk (renew CPI)", [r!.cu]);
       console.log(`    (0,0) tick_count ${(await crankOf(c))!.tickCount}`);
+    });
+
+    it("a zombie with nobody near despawns; close_chunk drops the zombies of an empty chunk", async () => {
+      // Stop moving: our entry goes stale in 5 s, so no zombie has a target.
+      const mine = (await me()).pos;
+      const here = key(chunkOf(mine[0]), chunkOf(mine[2]));
+      let k: string | undefined;
+      for (const c of existing) {
+        if (c === here) continue;
+        const [cx, cz] = c.split(",").map(Number);
+        const ck = chunkPda(w2, cx, cz);
+        const pres = await fetchPresence(presencePda(ck));
+        if (!pres.count && !chunkHeader((await chunkData(ck))!).edited) k = c;
+      }
+      expect(k, "an empty, unedited chunk").to.not.equal(undefined);
+      const [cx, cz] = k!.split(",").map(Number);
+      const ck = chunkPda(w2, cx, cz);
+      const t = new Terrain(await liveBlocks(w2, existing));
+      const col: Col = [cx * 16 + 8, cz * 16 + 8];
+      const spot = () => center(col[0], t.h(...col)!, col[1]);
+      await sendEr(
+        [await debugSpawnMobIx(w2, ck, ZOMBIE, spot())],
+        [stranger()]
+      );
+      const t0 = Date.now();
+      const gone = await until(
+        async () =>
+          (
+            await tickTxs(ck, 40)
+          ).find((x) =>
+            x.logs.some((l) => l.includes("tick: zombie despawned"))
+          ) ?? null,
+        35_000,
+        1_000
+      );
+      expect(gone, "a despawning tick").to.not.equal(null);
+      console.log(`    zombie despawned ${Date.now() - t0} ms after the spawn`);
+      logCus("tick_chunk (zombie despawn)", [gone!.cu]);
+
+      // A zombie no longer blocks closing a chunk nobody is in.
+      await sendEr(
+        [uniq(), await debugSpawnMobIx(w2, ck, ZOMBIE, spot())],
+        [stranger()]
+      );
+      expect(
+        chunkMobs((await chunkData(ck))!).some((m) => m.kind === ZOMBIE)
+      ).to.equal(true);
+      const before = await erLamports(a.player);
+      const sig = await sendEr(
+        [await closeChunkIx(a, w2, cx, cz)],
+        [a.authority]
+      );
+      existing.delete(k!);
+      logCus("close_chunk (with a zombie)", [(await ixCus(sig)).ixs[0]]);
+      expect((await erLamports(a.player)) - before).to.equal(CHUNK_TOTAL_RENT);
+      expect(await erConn.getAccountInfo(ck, "confirmed")).to.equal(null);
     });
   });
 });
