@@ -13,6 +13,7 @@ import {
   sendEr,
   TxError,
 } from "./helpers/env";
+import { waitForEr } from "./helpers/spike";
 
 const LOCAL_ER_VALIDATOR = new web3.PublicKey(
   "mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev"
@@ -214,13 +215,3 @@ describe("spike: ephemeral chunk sponsored by Player", () => {
     expect(raised.limit).to.equal(1_400_000 - 150);
   });
 });
-
-async function waitForEr(pk: web3.PublicKey) {
-  const deadline = Date.now() + 15_000;
-  for (;;) {
-    const info = await erConn.getAccountInfo(pk, "confirmed");
-    if (info) return info;
-    if (Date.now() > deadline) throw new Error(`ER never cloned ${pk}`);
-    await new Promise((r) => setTimeout(r, 300));
-  }
-}

@@ -127,10 +127,15 @@ export async function sendEr(
   for (;;) {
     const st = (await erConn.getSignatureStatuses([sig])).value[0];
     if (st?.err) {
-      const info = await erConn.getTransaction(sig, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      });
+      // The status can show the error before getTransaction serves the tx.
+      let info: web3.VersionedTransactionResponse | null = null;
+      for (let i = 0; i < 40 && !info; i++) {
+        info = await erConn.getTransaction(sig, {
+          commitment: "confirmed",
+          maxSupportedTransactionVersion: 0,
+        });
+        if (!info) await new Promise((r) => setTimeout(r, 50));
+      }
       throw parseTxError(info?.meta?.logMessages ?? [], st.err);
     }
     if (

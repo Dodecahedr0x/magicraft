@@ -233,16 +233,16 @@ account"; crates `magicblock-magic-program-api 0.14.10` (`instruction.rs`, `args
 
 | Question | Answer |
 |---|---|
-| Can a crank target an ix on an **ephemeral** account? | **Yes.** `spike_tick` on the 16 896-byte ephemeral chunk: 100 ms × 10 → counter = 10 after ~915 ms, still 10 one second later. |
-| Can the payer be a PDA? | **Yes.** The delegated Player PDA signs the ScheduleTask/CancelTask CPI via `invoke_signed` with its seeds. The validator only checks that account 0 is a signer. The PDA becomes the task **authority** (only it can cancel/replace). |
-| Who pays, how much? | **Nobody, currently.** Player and wallet ER lamport deltas are 0 for scheduling and for all 10 executions. The scheduler sends each execution as a tx **signed and fee-paid by the validator identity** (`ExecuteCrank` + noop), and ER txs cost 0 in this release. No crank price is in the fee docs. |
-| Signers inside a cranked ix | Only the crank-signer PDA `find_program_address(["crank-executor", authority], Crank1111...)` may be marked signer (and not writable); the validator authority may not appear. So tick ixs must be **permissionless** or verify that crank PDA as signer. |
-| `task_id` scope | **Global per validator** (SQLite primary key, not per payer). Another authority scheduling the same live id: the tx **succeeds** (`Scheduled task request` is logged in-tx), but the service rejects it later (`UnauthorizedReplacing`, ER log only). Its cancel is ignored too (`Task authority ... does not match`). Test: A's replacement never ran (0 ticks); B kept ticking (10 per second). **Derive ids that cannot collide** (e.g. from a hash of the chunk PDA) and never trust that a schedule tx means the task exists. |
-| Re-schedule with the same id (same authority) | **Replaces** the task (`INSERT OR REPLACE`; iterations/interval/ixs reset, queue entry replaced). 100 ms × 1000 then rescheduled × 2 → exactly 2 more ticks. This is the "reschedule" primitive for chunk ticks. |
-| Cancel | Works: 100 ms × 1000, cancel after 500 ms → 0 further ticks. Cancelling an unknown id is a silent no-op. |
-| Target ix fails | The ER RPC rejects the crank tx (`-32003 transaction verification error`; the failed attempts are still recorded: 5 failed sigs on the chunk in 3 s). The scheduler **retries without consuming an iteration**, with backoff 100, 200, 400 … ms capped at 5 s. If the ix works again within the window the task resumes and **catches up** missed ticks (fixed-rate cadence: 90 ticks in 6 s after a 3 s outage at 100 ms). After 10 retries (~26 s of continuous failure) the task is **dropped** (moved to `failed_tasks`): 0 ticks after a 35 s outage even once the ix worked again. Retries/drops are only visible at `RUST_LOG=magicblock_task_scheduler=debug`. |
-| Limits | `iterations >= 1` (i64, no max); `0 < interval < u32::MAX` ms, then clamped up to the validator's `[task-scheduler] min-interval` (default **10 ms**); `instructions` non-empty; privileged Magic ixs rejected. Tasks persist in SQLite across validator restarts. |
-| CU | `spike_schedule` (1 tick ix) 12.6k CU incl. Anchor + bincode; `spike_cancel` 4.5k. |
+| Can a crank target an ix on an **ephemeral** account? (tested) | **Yes.** `spike_tick` on the 16 896-byte ephemeral chunk: 100 ms × 10 → counter = 10 after ~915 ms, still 10 one second later. |
+| Can the payer be a PDA? (tested; signer check from source) | **Yes.** The delegated Player PDA signs the ScheduleTask/CancelTask CPI via `invoke_signed` with its seeds. The validator only checks that account 0 is a signer. The PDA becomes the task **authority** (only it can cancel/replace). |
+| Who pays, how much? (tested: deltas; fee-payer identity from source) | **Nobody, currently.** Player and wallet ER lamport deltas are 0 for scheduling and for all 10 executions. The scheduler sends each execution as a tx **signed and fee-paid by the validator identity** (`ExecuteCrank` + noop), and ER txs cost 0 in this release. No crank price is in the fee docs. |
+| Signers inside a cranked ix (source) | Only the crank-signer PDA `find_program_address(["crank-executor", authority], Crank1111...)` may be marked signer (and not writable); the validator authority may not appear. So tick ixs must be **permissionless** or verify that crank PDA as signer. |
+| `task_id` scope (tested) | **Global per validator** (SQLite primary key, not per payer). Another authority scheduling the same live id: the tx **succeeds** (`Scheduled task request` is logged in-tx), but the service rejects it later (`UnauthorizedReplacing`, ER log only). Its cancel is ignored too (`Task authority ... does not match`). Test: A's replacement never ran (0 ticks); B kept ticking (10 per second). **Derive ids that cannot collide** (e.g. from a hash of the chunk PDA) and never trust that a schedule tx means the task exists. |
+| Re-schedule with the same id, same authority (tested) | **Replaces** the task (`INSERT OR REPLACE`; iterations/interval/ixs reset, queue entry replaced). 100 ms × 1000 then rescheduled × 2 → exactly 2 more ticks. This is the "reschedule" primitive for chunk ticks. |
+| Cancel (tested; unknown-id no-op from source) | Works: 100 ms × 1000, cancel after 500 ms → 0 further ticks. Cancelling an unknown id is a silent no-op. |
+| Target ix fails (tested; backoff constants from source + debug log; the 35 s drop test runs only with `SLOW_TESTS=1`) | The ER RPC rejects the crank tx (`-32003 transaction verification error`; the failed attempts are still recorded: 5 failed sigs on the chunk in 3 s). The scheduler **retries without consuming an iteration**, with backoff 100, 200, 400 … ms capped at 5 s. If the ix works again within the window the task resumes and **catches up** missed ticks (fixed-rate cadence: 90 ticks in 6 s after a 3 s outage at 100 ms). After 10 retries (~26 s of continuous failure) the task is **dropped** (moved to `failed_tasks`): 0 ticks after a 35 s outage even once the ix worked again. Retries/drops are only visible at `RUST_LOG=magicblock_task_scheduler=debug`. |
+| Limits (source) | `iterations >= 1` (i64, no max); `0 < interval < u32::MAX` ms, then clamped up to the validator's `[task-scheduler] min-interval` (default **10 ms**); `instructions` non-empty; privileged Magic ixs rejected. Tasks persist in SQLite across validator restarts. |
+| CU (tested) | `spike_schedule` (1 tick ix) 12.6k CU incl. Anchor + bincode; `spike_cancel` 4.5k. |
 
 Design consequences: tick handlers take no user signer (or check the crank PDA of World/Player);
 store the task id in the chunk/world account; on neighbour appearance just call ScheduleTask
@@ -279,7 +279,7 @@ Answers:
 - **(a)(ii) Plain base transfer to the delegated PDA:** allowed and kept on base across commits,
   but the ER never sees it, so it cannot fund ER rent. **Not a top-up path.**
 - **(a)(i) Undelegate → deposit → re-delegate:** works (deposit + delegate in one base tx; the
-  ER re-clones with the new balance in < 1 s). Costs a commit+undelegate round trip, a new
+  ER showed the new balance at the first poll after the base tx confirmed; logged as "ER re-cloned the Player after N ms"). Costs a commit+undelegate round trip, a new
   delegation session (3 000 000-lamport session charge per the fee docs, taken from the delegation
   deposit at undelegation), and the Player is unusable on the ER meanwhile.
 - **(a)(iii) `lamportsDelegatedTransferIx`** (`@magicblock-labs/ephemeral-rollups-sdk`, e-SPL
@@ -288,13 +288,33 @@ Answers:
   fee (5 000). It needs a fresh 32-byte salt per call. The e-SPL global rent PDA (`4RvdEG...`,
   seeds `["rent"]`) sponsors the single-use lamports PDA's delegation (its balance fell by a net
   6 764 400 lamports for one top-up locally). It is pre-funded on MagicBlock clusters; locally the test funds it with 1 SOL. On commit,
-  the lamports PDA's balance moves into the Player on base.
+  the Player's base balance moves by its ER delta (see the accounting below).
+
+**Base-layer accounting of one 0.02 SOL top-up** (tx lamport deltas logged by the test):
+
+| Tx | Deltas |
+|---|---|
+| top-up (wallet-signed) | wallet −20 305 000 (incl. 5 000 fee); e-SPL rent PDA −6 764 400; lamports PDA +20 890 880; its delegation record +4 078 560, metadata +2 094 960 (sum = −5 000) |
+| Player commit (validator-signed) | validator identity −19 039 816; Player +18 914 816 (= +20 000 000 top-up − 1 085 184 rent): **the validator fronts the Player's ER delta** |
+| lamports PDA undelegation (validator-signed) | lamports PDA −20 890 880, record −4 078 560, metadata −2 094 960 → e-SPL rent PDA +6 764 400 (made whole), `EpJnX7…` +20 270 000, `7Jrkjm…` +30 000, validator identity −415 000 (fees) |
+
+So the 1 976 064 lamports of the lamports PDA that did not reach the Player (20 890 880 −
+18 914 816) are its 890 880 rent-exempt balance (back to the rent PDA) plus the 1 085 184 of
+chunk rent spent on the ER. The top-up's 20 000 000 and 270 000 of the 300 000 setup charge go to
+`EpJnX7…`, and 30 000 to `7Jrkjm…`. That 90/10 split matches the fee docs' validator / protocol fee
+vaults, so `EpJnX7…` is most likely the validator fee vault, which reimburses the validator for
+fronting the Player's delta. Rent spent on the ER therefore ends up with the validator side on base.
 
 **Recommendation: (iii) `lamportsDelegatedTransferIx`** as the top-up path (cheapest, no
 downtime, works for a delegated PDA, any wallet can pay). Keep `deposit` for the initial funding in
 the init+delegate tx. Re-check that the global rent PDA is funded on the target cluster.
 
 ### Other notes
+
+- `magicblock-magic-program-api` (0.14) and `bincode` stay as direct dependencies: the real
+  chunk-tick and day cranks build `ScheduleTask`/`CancelTask` the same way as `spike_schedule`.
+- The ~41 s "dropped after 10 retries" test is skipped unless `SLOW_TESTS=1` (`SLOW_TESTS=1 pnpm test`).
+- A commit with only rent spent (no top-up) lowers the base Player by exactly the rent (tested).
 
 - `commit` needs no extra account besides `magic_context`/`magic_program` (SDK
   `ephem::commit_accounts` / `commit_and_undelegate_accounts`, re-exported from the deprecated v0

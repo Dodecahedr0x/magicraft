@@ -202,18 +202,22 @@ describe("spike: cranks on ephemeral accounts", () => {
     await settle(a.chunk);
   });
 
-  it("a target ix that keeps failing gets the task dropped after 10 retries (~26 s)", async () => {
-    const id = randomTaskId();
-    await schedule(a, id, 100, 1000);
-    await sleep(500);
-    await fillBlocks(a, 0xff);
-    const atFail = await counter(a.chunk);
-    await sleep(35_000);
-    await fillBlocks(a, 0);
-    await sleep(6_000);
-    const after = await counter(a.chunk);
-    console.log(`    ticks after a 35 s outage + 6 s: ${after - atFail}`);
-    expect(after - atFail, "task was dropped").to.be.lessThanOrEqual(1);
-    await cancel(a, id); // no-op for a dropped task
-  });
+  // ~41 s: run with SLOW_TESTS=1 (e.g. `SLOW_TESTS=1 pnpm test`).
+  (process.env.SLOW_TESTS === "1" ? it : it.skip)(
+    "a target ix that keeps failing gets the task dropped after 10 retries (~26 s)",
+    async () => {
+      const id = randomTaskId();
+      await schedule(a, id, 100, 1000);
+      await sleep(500);
+      await fillBlocks(a, 0xff);
+      const atFail = await counter(a.chunk);
+      await sleep(35_000);
+      await fillBlocks(a, 0);
+      await sleep(6_000);
+      const after = await counter(a.chunk);
+      console.log(`    ticks after a 35 s outage + 6 s: ${after - atFail}`);
+      expect(after - atFail, "task was dropped").to.be.lessThanOrEqual(1);
+      await cancel(a, id); // no-op for a dropped task
+    }
+  );
 });

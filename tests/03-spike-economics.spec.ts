@@ -7,6 +7,8 @@ import {
   GetCommitmentSignature,
   deriveLamportsPda,
   deriveRentPda,
+  delegationMetadataPdaFromDelegatedAccount,
+  delegationRecordPdaFromDelegatedAccount,
   lamportsDelegatedTransferIx,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { baseConn, erConn, sendEr, TxError } from "./helpers/env";
@@ -25,6 +27,25 @@ const RENT = (CHUNK_LEN + 60) * 32; // 542 592: ephemeral rent of one chunk
 
 async function lamports(conn: web3.Connection, pk: web3.PublicKey) {
   return (await conn.getAccountInfo(pk, "confirmed"))?.lamports ?? 0;
+}
+
+async function logBaseTxDeltas(label: string, sig: string) {
+  const tx = await baseConn.getTransaction(sig, {
+    commitment: "confirmed",
+    maxSupportedTransactionVersion: 0,
+  });
+  if (!tx?.meta) return console.log(`    ${label}: not found`);
+  const named = new Map<string, string>([
+    [LOCAL_ER_VALIDATOR.toBase58(), "validator identity"],
+    [deriveRentPda()[0].toBase58(), "e-SPL rent PDA"],
+  ]);
+  const keys = tx.transaction.message.getAccountKeys().staticAccountKeys;
+  console.log(`    ${label} lamport deltas:`);
+  keys.forEach((k, i) => {
+    const d = tx.meta!.postBalances[i] - tx.meta!.preBalances[i];
+    if (d !== 0)
+      console.log(`      ${named.get(k.toBase58()) ?? k.toBase58()}: ${d}`);
+  });
 }
 
 async function sendBase(p: SpikePlayer, ixs: web3.TransactionInstruction[]) {
@@ -106,8 +127,8 @@ describe("spike: Player top-up and settlement", () => {
 
   it("(iii) lamportsDelegatedTransferIx (one base tx) credits the delegated Player on the ER", async () => {
     // The e-SPL program's global rent PDA sponsors the delegation of the
-    // single-use lamports PDA (~4.08M lamports of delegation deposit). It is
-    // pre-funded on devnet/mainnet; fund it locally.
+    // single-use lamports PDA (it paid a net 6 764 400 lamports per top-up in
+    // our runs). It is pre-funded on devnet/mainnet; fund it locally.
     const [rentPda] = deriveRentPda();
     if ((await lamports(baseConn, rentPda)) < 0.1 * LAMPORTS) {
       await sendBase(p, [
@@ -123,7 +144,7 @@ describe("spike: Player top-up and settlement", () => {
     const amount = 0.02 * LAMPORTS;
     const salt = crypto.getRandomValues(new Uint8Array(32));
     [lamportsPda] = deriveLamportsPda(p.authority.publicKey, p.player, salt);
-    await sendBase(p, [
+    const topUpSig = await sendBase(p, [
       lamportsDelegatedTransferIx(
         p.authority.publicKey,
         p.player,
@@ -133,6 +154,32 @@ describe("spike: Player top-up and settlement", () => {
     ]);
     const walletCost =
       walletBefore - (await lamports(baseConn, p.authority.publicKey));
+    // Full lamport accounting of the top-up tx.
+    const tx = await baseConn.getTransaction(topUpSig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    const keys = tx!.transaction.message.getAccountKeys().staticAccountKeys;
+    const names = new Map<string, string>([
+      [p.authority.publicKey.toBase58(), "wallet"],
+      [rentPda.toBase58(), "e-SPL rent PDA"],
+      [lamportsPda.toBase58(), "lamports PDA"],
+      [p.player.toBase58(), "Player"],
+      [
+        delegationRecordPdaFromDelegatedAccount(lamportsPda).toBase58(),
+        "lamports PDA delegation record",
+      ],
+      [
+        delegationMetadataPdaFromDelegatedAccount(lamportsPda).toBase58(),
+        "lamports PDA delegation metadata",
+      ],
+    ]);
+    console.log("    top-up tx lamport deltas:");
+    keys.forEach((k, i) => {
+      const d = tx!.meta!.postBalances[i] - tx!.meta!.preBalances[i];
+      if (d !== 0)
+        console.log(`      ${names.get(k.toBase58()) ?? k.toBase58()}: ${d}`);
+    });
     const rentDelta = (await lamports(baseConn, rentPda)) - rentBefore;
     const t0 = Date.now();
     const credited = await until(
@@ -170,7 +217,13 @@ describe("spike: Player top-up and settlement", () => {
 
   it("commit: base Player moves by the ER-side delta (top-up minus rent); base-only transfers survive", async () => {
     const lpBefore = await lamports(baseConn, lamportsPda);
-    await commit(false);
+    const [rentPda] = deriveRentPda();
+    const watch = [rentPda, LOCAL_ER_VALIDATOR, p.authority.publicKey];
+    const watchBefore = await Promise.all(
+      watch.map((k) => lamports(baseConn, k))
+    );
+    const commitSig = await commit(false);
+    await logBaseTxDeltas("base commit tx", commitSig);
     await until(
       async () => (await lamports(baseConn, p.player)) !== baseBal,
       15_000,
@@ -187,6 +240,34 @@ describe("spike: Player top-up and settlement", () => {
         lamportsPda
       )}`
     );
+    await sleep(2_000); // let the lamports PDA's own undelegation land
+    for (const { signature } of (
+      await baseConn.getSignaturesForAddress(lamportsPda)
+    ).reverse()) {
+      await logBaseTxDeltas(
+        `lamports PDA tx ${signature.slice(0, 8)}…`,
+        signature
+      );
+    }
+    const watchAfter = await Promise.all(
+      watch.map((k) => lamports(baseConn, k))
+    );
+    console.log(
+      `    across commit (base): e-SPL rent PDA Δ ${
+        watchAfter[0] - watchBefore[0]
+      }, validator identity Δ ${watchAfter[1] - watchBefore[1]}, wallet Δ ${
+        watchAfter[2] - watchBefore[2]
+      }`
+    );
+    console.log(
+      `    after commit: lamports PDA delegation record ${await lamports(
+        baseConn,
+        delegationRecordPdaFromDelegatedAccount(lamportsPda)
+      )}, metadata ${await lamports(
+        baseConn,
+        delegationMetadataPdaFromDelegatedAccount(lamportsPda)
+      )}`
+    );
     expect(base - baseBal).to.equal(erBal - erAtSync);
     expect(base - erBal, "the 0.01 SOL base transfer is kept").to.equal(
       0.01 * LAMPORTS
@@ -195,10 +276,26 @@ describe("spike: Player top-up and settlement", () => {
     erAtSync = erBal;
   });
 
+  it("commit after rent only: base drops by exactly the rent", async () => {
+    await sendEr(await chunkIxs(2), [p.authority]);
+    erBal -= RENT;
+    expect(await lamports(erConn, p.player)).to.equal(erBal);
+    await commit(false);
+    await until(
+      async () => (await lamports(baseConn, p.player)) !== baseBal,
+      15_000,
+      200
+    );
+    const base = await lamports(baseConn, p.player);
+    expect(baseBal - base).to.equal(RENT);
+    baseBal = base;
+    erAtSync = erBal;
+  });
+
   it("closing a chunk refunds its rent on the ER; commit+undelegate carries it to base", async () => {
-    await sendEr([await closeIx(0)], [p.authority]);
+    await sendEr([await closeIx(0), await closeIx(2)], [p.authority]);
     const erNow = await lamports(erConn, p.player);
-    expect(erNow - erBal).to.equal(RENT);
+    expect(erNow - erBal).to.equal(2 * RENT);
     erBal = erNow;
     expect(await erConn.getAccountInfo(p.chunk, "confirmed")).to.equal(null);
 
@@ -260,11 +357,13 @@ describe("spike: Player top-up and settlement", () => {
     const info = await baseConn.getAccountInfo(p.player);
     expect(info!.owner.toBase58()).to.equal(DELEGATION_PROGRAM_ID.toBase58());
     expect(info!.lamports).to.equal(baseBal);
+    const t0 = Date.now();
     const seen = await until(
       async () => (await lamports(erConn, p.player)) === baseBal,
       15_000,
-      300
+      50
     );
+    console.log(`    ER re-cloned the Player after ${Date.now() - t0} ms`);
     expect(seen, "ER re-cloned the Player with the base balance").to.equal(
       true
     );
