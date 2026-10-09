@@ -179,6 +179,9 @@ export async function moveIx(
     existing: Set<string>;
     signer?: web3.PublicKey;
     sessionToken?: web3.PublicKey | null;
+    /** Overrides of the derived presence accounts. */
+    presence?: web3.PublicKey;
+    oldPresence?: web3.PublicKey | null;
   }
 ) {
   const [cx0, cz0] = moveWindow(o.prev, o.pos) ?? [
@@ -209,8 +212,13 @@ export async function moveIx(
       chunk10: slot(1, 0),
       chunk01: slot(0, 1),
       chunk11: slot(1, 1),
-      presence: presencePda(chunkPda(world, ncx, ncz)),
-      oldPresence: crossed ? presencePda(chunkPda(world, ocx, ocz)) : null,
+      presence: o.presence ?? presencePda(chunkPda(world, ncx, ncz)),
+      oldPresence:
+        o.oldPresence !== undefined
+          ? o.oldPresence
+          : crossed
+          ? presencePda(chunkPda(world, ocx, ocz))
+          : null,
     })
     .instruction();
 }

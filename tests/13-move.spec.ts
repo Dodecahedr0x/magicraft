@@ -56,6 +56,7 @@ type Vec3 = [number, number, number];
 
 describe("join + move", () => {
   let tw: TestWorld;
+  let w2: TestWorld; // a second (seeded) world of `a`
   let a: TestPlayer;
   let world: web3.PublicKey;
   let spawn: Vec3; // block coordinates
@@ -148,7 +149,7 @@ describe("join + move", () => {
   const spawnPos = () => center(spawn[0], spawn[1], spawn[2]);
 
   it("join_world before the spawn is set → SpawnNotSet", async () => {
-    const w2 = await setupWorld({ player: a });
+    w2 = await setupWorld({ player: a });
     const err = await fails(
       sendEr([await joinWorldIx(a, w2.world)], [a.authority])
     );
@@ -283,6 +284,67 @@ describe("join + move", () => {
     it("client_ms not after the last accepted one → TimeSkew", async () => {
       const err = await fails(move(a, pos, { clientMs: lastMs }));
       expect(err?.code, String(err)).to.equal("TimeSkew");
+    });
+
+    /** A rejected move from the current state with `existing`/presence overrides. */
+    async function badMove(
+      to: number[],
+      o: {
+        existing?: Set<string>;
+        presence?: web3.PublicKey;
+        oldPresence?: web3.PublicKey | null;
+      } = {}
+    ) {
+      const ix = await moveIx(a, world, {
+        prev: pos,
+        pos: to,
+        onGround: true,
+        clientMs: await nextClientMs(world, lastMs),
+        existing: o.existing ?? existing,
+        presence: o.presence,
+        oldPresence: o.oldPresence,
+      });
+      return fails(sendEr([ix], [a.authority]));
+    }
+    const back = () =>
+      center(...(path.length > 1 ? path[path.length - 2] : spawn));
+
+    it("crossing back with the previous (own) chunk omitted → ChunkNotReady", async () => {
+      const err = await badMove(back(), { existing: new Set(["0,0"]) });
+      expect(err?.code, String(err)).to.equal("ChunkNotReady");
+    });
+
+    it("in place with the own chunk omitted → ChunkNotReady", async () => {
+      const err = await badMove(pos, { existing: new Set(["0,0"]) });
+      expect(err?.code, String(err)).to.equal("ChunkNotReady");
+    });
+
+    it("crossing back without old_presence → InvalidPresence", async () => {
+      const err = await badMove(back(), { oldPresence: null });
+      expect(err?.code, String(err)).to.equal("InvalidPresence");
+    });
+
+    it("the presence of another chunk → InvalidPresence", async () => {
+      const err = await badMove(pos, {
+        presence: presencePda(chunkPda(world, 0, 0)),
+      });
+      expect(err?.code, String(err)).to.equal("InvalidPresence");
+    });
+
+    it("a chunk of another world → InvalidChunk", async () => {
+      await createAndGrow(a, w2.world, 0, 0);
+      const ix = await moveIx(a, world, {
+        prev: pos,
+        pos,
+        onGround: true,
+        clientMs: await nextClientMs(world, lastMs),
+        existing,
+      });
+      const own = chunkPda(world, target[0], target[1]);
+      const idx = ix.keys.findIndex((k) => k.pubkey.equals(own));
+      ix.keys[idx] = { ...ix.keys[idx], pubkey: chunkPda(w2.world, 0, 0) };
+      const err = await fails(sendEr([ix], [a.authority]));
+      expect(err?.code, String(err)).to.equal("InvalidChunk");
     });
 
     it("a chunk passed in the wrong window slot → InvalidChunk", async () => {

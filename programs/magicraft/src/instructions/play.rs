@@ -15,11 +15,15 @@
 //! Accounts: World **read-only** (chain time + params; never re-arms the day crank), the
 //! mover's Player (mut: presence rent sponsor), its `PlayerState` (mut), the up-to-4 chunks
 //! of the 2×2 window `physics::move_window(prev.pos, pos)` in slot order `(cx0, cz0)`,
-//! `(cx0+1, cz0)`, `(cx0, cz0+1)`, `(cx0+1, cz0+1)` (read-only; `None` = missing or not
-//! created → reads as Stone, fail closed), the presence of the chunk containing `pos`
-//! (mut) and, when the move crosses a chunk border, the presence of the previous chunk
-//! (mut). Steps:
-//! 1. `Dead` if health is 0 (until `respawn`, Task 19).
+//! `(cx0+1, cz0)`, `(cx0, cz0+1)`, `(cx0+1, cz0+1)` (read-only), the presence of the chunk
+//! containing `pos` (mut) and, when the move crosses a chunk border, the presence of the
+//! previous chunk (mut, **required**). Steps:
+//! 1. `Dead` if health is 0 (until `respawn`, Task 19). Every window slot overlapped by
+//!    the xz footprint (± `GROUND_HALF_W`) of the previous **or** the new position must be
+//!    passed and ready ([`required_slots`]), else `ChunkNotReady`. Only the other slots (reachable only by the swept path across a
+//!    chunk corner) may be omitted and read as Stone, which can only block. Otherwise a
+//!    client could omit its own chunk: the previous box would read Stone, and the "stuck"
+//!    rule of `check_move` (plus the omitted presence) would let it skip walls / damage.
 //! 2. `physics::check_move` with `chain_ms` from `World::chain_ms_ro`; a *coarse* reading
 //!    (anchor stale) is shifted forward by `COARSE_LEAD_MS − LEAD_MS` (750 ms), i.e. the
 //!    allowed lead becomes 1 000 ms (the coarse reading floors to the second) and the lag
@@ -33,9 +37,8 @@
 //! 5. Store `MoveState`, current chunk `(cx, cz)`, vitals; `crank::maybe_arm_chunk` (no-op
 //!    until Task 20).
 //!
-//! The previous chunk is the chunk of `prev.pos` (always inside the window); `PlayerState`
-//! `cx`/`cz` is a cache of the chunk of the stored position. If the previous chunk was not
-//! passed (missing), its presence is skipped (an entry there would go stale and be pruned).
+//! The previous chunk is the chunk of `prev.pos` (always a required slot); `PlayerState`
+//! `cx`/`cz` is a cache of the chunk of the stored position.
 
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::anchor::MagicProgram;
@@ -43,7 +46,9 @@ use ephemeral_rollups_sdk::consts::EPHEMERAL_VAULT_ID;
 use ephemeral_rollups_sdk::ephemeral_accounts::{rent, EphemeralAccount};
 use magicraft_core::consts::{CHUNK_VOL, FP};
 use magicraft_core::inventory::{Inventory, MAX_FOOD};
-use magicraft_core::physics::{check_move, move_window, ChunkQuad, MoveState, LEAD_MS, MAX_DT_MS};
+use magicraft_core::physics::{
+    check_move, move_window, ChunkQuad, MoveState, GROUND_HALF_W, LEAD_MS,
+};
 use session_keys::{session_auth_or, Session, SessionError, SessionTokenV2};
 
 use crate::auth::{player_seeds, pstate_seeds};
@@ -69,9 +74,13 @@ pub const EXHAUSTION_PER_FOOD: u32 = 4_000;
 /// point per 250 blocks of travel).
 pub const EXHAUST_FP_PER_UNIT: u64 = 16;
 /// Time exhaustion: 1 unit per this many ms of (client) time between accepted moves
-/// (20 units/s, one food point per 200 s). With continuous walking (~4.3 blocks/s) food
+/// (20 units/s, one food point per 200 s). The gap is clamped to [`EXHAUST_MAX_GAP_MS`]
+/// (not to the 2 s movement cap, so sending rarely does not dodge hunger). With continuous walking (~4.3 blocks/s) food
 /// lasts ≈ 20 × 4 000 / (69 + 20) s ≈ 15 min.
 pub const EXHAUST_MS_PER_UNIT: u64 = 50;
+/// Largest move gap counted for time exhaustion, ms (a player who was away does not come
+/// back starved).
+pub const EXHAUST_MAX_GAP_MS: i64 = 10_000;
 /// Regeneration / starvation step period, ms of client time (≈ 4 s, at most one step per
 /// move: long gaps do not accumulate steps).
 pub const VITALS_TICK_MS: i64 = 4_000;
@@ -139,6 +148,26 @@ pub fn approx_dist(a: [i32; 3], b: [i32; 3]) -> u64 {
     let dx = (a[0] as i64 - b[0] as i64).unsigned_abs();
     let dz = (a[2] as i64 - b[2] as i64).unsigned_abs();
     dx.max(dz) + dx.min(dz) / 2
+}
+
+/// Window slots (order `(cx0,cz0)`, `(cx0+1,cz0)`, `(cx0,cz0+1)`, `(cx0+1,cz0+1)`) that
+/// the xz footprint (± `GROUND_HALF_W`, which covers the collision box) of `a` or `b`
+/// overlaps; these chunks must be passed to `move_player`.
+pub fn required_slots(a: [i32; 3], b: [i32; 3], cx0: i32, cz0: i32) -> [bool; 4] {
+    let m = GROUND_HALF_W as i64;
+    let mut req = [false; 4];
+    for p in [a, b] {
+        let (x, z) = (p[0] as i64, p[2] as i64);
+        for cz in ((z - m) >> 12)..=((z + m - 1) >> 12) {
+            for cx in ((x - m) >> 12)..=((x + m - 1) >> 12) {
+                let (dx, dz) = (cx - cx0 as i64, cz - cz0 as i64);
+                if (0..2).contains(&dx) && (0..2).contains(&dz) {
+                    req[(dz * 2 + dx) as usize] = true;
+                }
+            }
+        }
+    }
+    req
 }
 
 /// Chunk of an FP coordinate (floor division by 16 blocks; arithmetic shift, no division).
@@ -262,7 +291,7 @@ pub struct MovePlayer<'info> {
     #[account(mut)]
     pub presence: UncheckedAccount<'info>,
     /// CHECK: presence of the previous chunk; required when crossing a border into another
-    /// chunk while the previous chunk is passed in the window (`presence_of`).
+    /// chunk (`presence_of`; `InvalidPresence` if missing or of another chunk).
     #[account(mut)]
     pub old_presence: Option<UncheckedAccount<'info>>,
     /// CHECK: ephemeral rent vault
@@ -303,6 +332,10 @@ pub fn move_player(
         a.chunk01.as_deref(),
         a.chunk11.as_deref(),
     ];
+    let required = required_slots(prev.pos, pos, cx0, cz0);
+    for (r, s) in required.iter().zip(slots.iter()) {
+        require!(!r || s.is_some(), MagicraftError::ChunkNotReady);
+    }
     let slot_key = |cx: i32, cz: i32| -> Option<Pubkey> {
         let (dx, dz) = (cx.wrapping_sub(cx0), cz.wrapping_sub(cz0));
         if !(0..2).contains(&dx) || !(0..2).contains(&dz) {
@@ -362,13 +395,13 @@ pub fn move_player(
     let me = a.player.key();
     let mut pending = 0u32;
     if (ncx, ncz) != (ocx, ocz) {
-        if let Some(old_chunk) = slot_key(ocx, ocz) {
-            let old = a
-                .old_presence
-                .as_ref()
-                .ok_or(MagicraftError::InvalidPresence)?;
-            pending += presence::leave(old, &old_chunk, &me, &sponsor)? as u32;
-        }
+        // The previous chunk is a required slot, so it was passed.
+        let old_chunk = slot_key(ocx, ocz).ok_or(MagicraftError::ChunkNotReady)?;
+        let old = a
+            .old_presence
+            .as_ref()
+            .ok_or(MagicraftError::InvalidPresence)?;
+        pending += presence::leave(old, &old_chunk, &me, &sponsor)? as u32;
     }
     pending += presence::enter_or_update(&a.presence, &new_chunk, &me, pos, t.ms, &sponsor)? as u32;
 
@@ -379,7 +412,9 @@ pub fn move_player(
         exhaustion: ps.exhaustion,
         tick_ms: ps.food_tick_ms,
     };
-    let dt = client_ms.saturating_sub(prev.last_ms).clamp(0, MAX_DT_MS) as u64;
+    let dt = client_ms
+        .saturating_sub(prev.last_ms)
+        .clamp(0, EXHAUST_MAX_GAP_MS) as u64;
     apply_vitals(
         &mut v,
         world.params.hunger != 0,
@@ -532,6 +567,40 @@ mod tests {
         };
         apply_vitals(&mut v, true, 0, u64::MAX, u64::MAX, i64::MIN);
         assert!(v.exhaustion < EXHAUSTION_PER_FOOD as u16);
+    }
+
+    #[test]
+    fn required_slots_cover_both_footprints() {
+        let c = |b: i32| b * 256 + 128; // block center
+                                        // In the middle of chunk (0,0): only slot 0.
+        assert_eq!(
+            required_slots([c(8), 0, c(8)], [c(9), 0, c(8)], 0, 0),
+            [true, false, false, false]
+        );
+        // Crossing +x: both chunks of the row.
+        assert_eq!(
+            required_slots([c(15), 0, c(8)], [c(16), 0, c(8)], 0, 0),
+            [true, true, false, false]
+        );
+        // Footprint of the previous position straddles the border (x = 16 blocks − 10 FP).
+        assert_eq!(
+            required_slots([4096 - 10, 0, c(8)], [c(24), 0, c(8)], 0, 0),
+            [true, true, false, false]
+        );
+        // Diagonal corner crossing: the two other chunks are only touched by the sweep.
+        assert_eq!(
+            required_slots([c(15), 0, c(15)], [c(16), 0, c(16)], 0, 0),
+            [true, false, false, true]
+        );
+        // Negative coordinates.
+        assert_eq!(
+            required_slots([c(-1), 0, c(-1)], [c(-1), 0, c(-1)], -1, -1),
+            [true, false, false, false]
+        );
+        assert_eq!(
+            required_slots([-10, 0, c(3)], [-10, 0, c(3)], -1, 0),
+            [true, true, false, false]
+        );
     }
 
     #[test]

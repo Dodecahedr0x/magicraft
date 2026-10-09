@@ -7,7 +7,9 @@
 //! - entering a chunk (or re-entering after being pruned) costs the mover one entry;
 //! - leaving a chunk (border crossing) refunds the mover one entry: a crossing nets to 0;
 //! - pruning stale entries (other players' `last_seen_ms` older than [`STALE_MS`] of chain
-//!   time, at most [`MAX_PRUNE`] per call) refunds **the pruner** (the mover), not the
+//!   time, at most [`MAX_PRUNE`] per call, **never one with `pending_damage > 0`**: that
+//!   damage must reach its owner, so such an entry is removed only by its owner's own move
+//!   — later also by close/respawn paths) refunds **the pruner** (the mover), not the
 //!   entry's original payer. The vault does not track who paid an entry, and this is the
 //!   designed incentive (a player who quits leaves ≤ 1 792 lamports behind, collected by
 //!   whoever moves through that chunk next).
@@ -26,7 +28,7 @@ use ephemeral_rollups_sdk::ephemeral_accounts::{rent, EphemeralAccount};
 
 use crate::errors::MagicraftError;
 use crate::state::{
-    ensure_sponsor_reserve, presence_len, presence_of, LeI32, LeI64, PresenceEntry,
+    ensure_sponsor_reserve, presence_len, presence_of, LeI32, LeI64, PresenceEntry, PresenceHeader,
     PRESENCE_ENTRY_SIZE, PRESENCE_HEADER_SIZE,
 };
 
@@ -67,7 +69,7 @@ pub fn new_entry(me: &Pubkey, pos: [i32; 3], now: i64) -> PresenceEntry {
 }
 
 /// Pure list step (see the module docs): prunes up to [`MAX_PRUNE`] entries of other
-/// players with `now − last_seen_ms > STALE_MS` (swap-remove), then updates `me`'s entry
+/// players with `now − last_seen_ms > STALE_MS` and no pending damage (swap-remove), then updates `me`'s entry
 /// (position, `last_seen_ms = now`, takes and zeroes `pending_damage`) or inserts it into a
 /// freed slot; if no slot is free, reports `grow`.
 pub fn upsert(entries: &mut [PresenceEntry], me: &Pubkey, pos: [i32; 3], now: i64) -> Upsert {
@@ -78,7 +80,10 @@ pub fn upsert(entries: &mut [PresenceEntry], me: &Pubkey, pos: [i32; 3], now: i6
     for (i, e) in entries.iter().enumerate() {
         if e.player == *me {
             own = Some(i);
-        } else if ns < MAX_PRUNE && now.saturating_sub(e.last_seen_ms.get()) > STALE_MS {
+        } else if ns < MAX_PRUNE
+            && e.pending_damage == 0
+            && now.saturating_sub(e.last_seen_ms.get()) > STALE_MS
+        {
             stale[ns] = i;
             ns += 1;
         }
@@ -173,7 +178,9 @@ pub fn enter_or_update<'info>(
         let mut d = presence.try_borrow_mut_data()?;
         let o = presence_len(n);
         d[o..o + PRESENCE_ENTRY_SIZE].copy_from_slice(bytemuck::bytes_of(&new_entry(me, pos, now)));
-        d[42..44].copy_from_slice(&new_count.to_le_bytes());
+        bytemuck::from_bytes_mut::<PresenceHeader>(&mut d[..PRESENCE_HEADER_SIZE])
+            .count
+            .set(new_count);
     } else if r.count < n {
         sponsor.resize(presence, presence_len(r.count))?;
     }
@@ -278,6 +285,18 @@ mod tests {
         let r = upsert(&mut l2, &me, [1; 3], 100_001);
         assert_eq!((r.count, r.pruned), (1, 2));
         assert_eq!(keys(&l2[..1]), vec![1]);
+    }
+
+    #[test]
+    fn stale_entries_with_pending_damage_are_kept() {
+        let me = Pubkey::new_from_array([1; 32]);
+        let mut l = vec![entry(2, 0, 3), entry(3, 0, 0)];
+        let r = upsert(&mut l, &me, [0; 3], 100_000);
+        assert_eq!((r.count, r.pruned, r.grow), (2, 1, false));
+        assert_eq!(keys(&l[..2]), vec![1, 2]);
+        // The owner collects it on its own move.
+        let owner = Pubkey::new_from_array([2; 32]);
+        assert_eq!(upsert(&mut l[..2], &owner, [0; 3], 100_001).pending, 3);
     }
 
     #[test]

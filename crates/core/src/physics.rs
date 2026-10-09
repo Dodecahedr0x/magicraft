@@ -66,7 +66,11 @@
 //!    legs are one tall box (exact); horizontal legs sample the box every ≤
 //!    [`SAMPLE_STEP`] (0.5 block, per axis), at most [`MAX_SAMPLES`] samples. If the box at
 //!    the *old* position is already obstructed (a block was placed into the player), the
-//!    sweep is skipped so the player can step out. → `Collision`.
+//!    sweep is skipped so the player can step out, but only by a short step: horizontal
+//!    displacement ≤ [`STUCK_MAX_XZ`] (1 block) and `−1 ≤ Δy ≤ 1.5` blocks
+//!    ([`STUCK_MAX_UP`]), destination clear (rule 4). Otherwise `Collision` (no phasing
+//!    through walls from an obstructed start, e.g. when the caller's block access reads
+//!    missing chunks as Stone). → `Collision`.
 //! 8. Outcome: `in_water` = the feet or head voxel (at the xz center) is water (any water
 //!    byte, flowing levels included — puddles count). Fall damage on an explicit landing
 //!    (`on_ground`, not in water) at `y`, or an implicit one at the ground height:
@@ -87,7 +91,8 @@
 //! updates), which also lets a player cross gaps a little wider than a jump; jumps
 //! 0.25 block higher; clipping a corner diagonally between horizontal samples; sweeping
 //! through a block when params make a horizontal leg longer than `MAX_SAMPLES × 0.5`
-//! blocks (never with default params); passing a block placed *into* the player; no
+//! blocks (never with default params); stepping ≤ 1 block out of a block placed *into* the
+//! player (possibly through an adjacent wall that thin); no
 //! air-control limits; reported velocity only loosely bounded.
 //!
 //! # Client parity requirements
@@ -177,6 +182,11 @@ pub const MAX_AIR_MS: i64 = 60_000;
 pub const SAMPLE_STEP: i64 = 128;
 /// Maximum horizontal sweep samples per update.
 pub const MAX_SAMPLES: i64 = 64;
+/// Largest horizontal step out of an obstructed start (rule 7), FP (1 block).
+pub const STUCK_MAX_XZ: i64 = FP as i64;
+/// Largest rise out of an obstructed start (rule 7), FP (1.5 blocks); the largest drop is
+/// 1 block.
+pub const STUCK_MAX_UP: i64 = 384;
 /// `|x|, |z|` limit for positions, FP (2^27 FP = 524 288 blocks).
 pub const XZ_LIMIT: i32 = 1 << 27;
 /// Lowest valid y, FP (4 blocks below the world).
@@ -751,6 +761,11 @@ pub fn check_move(
         if !path_clear(blocks, a, b, py.max(ny)) && !path_clear(blocks, a, b, py.min(ny)) {
             return Err(Collision);
         }
+    } else if dx * dx + dz * dz > STUCK_MAX_XZ * STUCK_MAX_XZ
+        || !(-FPL..=STUCK_MAX_UP).contains(&dy)
+    {
+        // Stuck: only a short step out (the destination box is clear, rule 4).
+        return Err(Collision);
     }
 
     // 8. Outcome. Explicit landing on ground (not water) or an implicit one pays damage.
@@ -1417,6 +1432,29 @@ mod tests {
         // Standing inside the wall (e.g. someone placed a block on us): leaving is allowed.
         let prev = grounded([bf(20, 128), bf(10, 0), bf(5, 0)], 0);
         mv(&prev, [bf(19, 160), bf(10, 0), bf(5, 0)], true, 300).unwrap();
+        // One block out, either side.
+        mv(&prev, [bf(21, 128), bf(10, 0), bf(5, 0)], true, 300).unwrap();
+    }
+
+    #[test]
+    fn stuck_start_cannot_phase_far() {
+        // Inside the wall (or a caller reading a missing chunk as Stone): a long move
+        // would skip the swept path, so it is limited to a short step out.
+        let prev = grounded([bf(20, 128), bf(10, 0), bf(5, 0)], 0);
+        for x in [bf(28, 128), bf(22, 0), bf(12, 128)] {
+            assert_eq!(
+                mv(&prev, [x, bf(10, 0), bf(5, 0)], true, 2_000).err(),
+                Some(MoveError::Collision),
+                "x {x}"
+            );
+        }
+        // Exactly 1 block is still fine; a 2-block rise out is not.
+        mv(&prev, [bf(21, 128), bf(10, 0), bf(5, 0)], true, 2_000).unwrap();
+        let tall = grounded([bf(20, 128), bf(10, 0), bf(5, 0)], 0);
+        assert_eq!(
+            mv(&tall, [bf(20, 128), bf(13, 0), bf(5, 0)], false, 2_000).err(),
+            Some(MoveError::Collision)
+        );
     }
 
     #[test]

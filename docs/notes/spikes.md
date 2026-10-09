@@ -689,3 +689,13 @@ Decisions:
   would otherwise be stuck: missing chunks read as Stone).
 - Not e2e-testable yet (unit tests instead): fall damage (no block edits to build a drop),
   `pending_damage` (written by mobs, Task 20), death. Revoked token: `AccountNotInitialized`.
+- **Review fix (omitted-chunk exploit):** omitting the mover's own chunk made the previous box
+  read Stone, so `check_move` skipped the swept path ("stuck" exemption: ~14-block wall
+  phasing) and the old presence (pending-damage escape). Now `move_player` requires every
+  window chunk under the previous or new xz footprint (`play::required_slots`,
+  `ChunkNotReady`) and `old_presence` on every chunk change (`InvalidPresence`); core limits a
+  stuck start to a short step (≤ 1 block horizontally, −1..+1.5 vertically, destination
+  clear). Pruning keeps stale entries with `pending_damage > 0` (only the owner's move
+  collects them). **Task 20:** mobs should only damage fresh entries, and close/respawn
+  paths must handle kept damaged entries (they also block `close_chunk` via the count).
+  Time exhaustion uses the move gap clamped to 10 s (not the 2 s movement cap).
