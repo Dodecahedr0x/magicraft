@@ -24,10 +24,13 @@ use session_keys::{session_auth_or, Session, SessionError, SessionTokenV2};
 use crate::auth::{chunk_seeds, player_seeds, presence_seeds};
 use crate::errors::MagicraftError;
 use crate::scheduler;
+use magicraft_core::consts::CHUNK_VOL;
+
 use crate::state::{
-    chunk_for, chunk_header, chunk_parts_mut, ensure_sponsor_reserve, init_chunk_header,
-    init_presence_header, presence_for, presence_len, Player, World, CHUNK_FULL_LEN,
-    CHUNK_INITIAL_LEN, CHUNK_SEED, GEN_CREATED, GEN_DONE, GEN_STAGE1, PLAYER_SEED, PRESENCE_SEED,
+    check_chunk_identity, chunk_for, chunk_header, chunk_header_from, chunk_parts_mut,
+    ensure_sponsor_reserve, init_chunk_header, init_presence_header, presence_for, presence_len,
+    Player, World, CHUNK_BLOCKS_OFFSET, CHUNK_FULL_LEN, CHUNK_INITIAL_LEN, CHUNK_SEED, GEN_CREATED,
+    GEN_DONE, GEN_STAGE1, PLAYER_SEED, PRESENCE_SEED,
 };
 
 /// Byte size of a fresh (empty) `ChunkPresence`.
@@ -81,8 +84,11 @@ pub struct CreateChunk<'info> {
     pub magic_program: Program<'info, MagicProgram>,
 }
 
-/// Adjacency rule: an existing edge neighbor in `world` is passed, or this is the world's
-/// first chunk and it is (0,0). (Task 18 adds: the player's current chunk.)
+/// Adjacency rule: an existing, fully generated (`DONE`, else `ChunkNotReady`) edge neighbor
+/// in `world` is passed, or the world has no chunks and this is (0,0). (Task 18 adds: the
+/// player's current chunk.) `chunk_count` is why `create_chunk` / `close_chunk` take the
+/// World writable; both are rare, so the write lock is acceptable (`populate_chunk` and
+/// gameplay ixs take it read-only).
 fn check_adjacency(
     neighbor: Option<&AccountInfo>,
     world: &Pubkey,
@@ -96,8 +102,14 @@ fn check_adjacency(
                 let h = chunk_header(n)?;
                 (h.cx.get(), h.cz.get())
             };
-            // Identity (world, coordinates, PDA) of the neighbor itself.
-            chunk_for(n, world, nx, nz)?;
+            // Identity (world, coordinates, PDA) of the neighbor itself, and it must be
+            // fully generated (a squatted stage-0/1 chunk is not a foothold).
+            let len = n.data_len();
+            let stage = chunk_for(n, world, nx, nz)?.gen_stage;
+            require!(
+                stage == GEN_DONE && len >= CHUNK_FULL_LEN,
+                MagicraftError::ChunkNotReady
+            );
             require!(
                 is_edge_neighbor(cx, cz, nx, nz),
                 MagicraftError::NotAdjacent
@@ -114,7 +126,8 @@ fn check_adjacency(
 /// Creates `Chunk (cx, cz)` at 10 240 bytes (`gen_stage = 0`) and its empty
 /// `ChunkPresence`, both sponsored by the Player, which must be able to pay the rent of
 /// the **full** chunk + presence and keep its reserve. `open_chunks += 1`,
-/// `world.chunk_count += 1`. Follow with `grow_chunk` in the same tx.
+/// `world.chunk_count += 1` (counters: checked `+1` here, saturating `−1` in `close_chunk`).
+/// Follow with `grow_chunk` in the same tx.
 #[session_auth_or(
     ctx.accounts.player.authority == ctx.accounts.signer.key(),
     MagicraftError::Unauthorized
@@ -168,20 +181,22 @@ pub fn create_chunk(mut ctx: Context<CreateChunk>, cx: i32, cz: i32) -> Result<(
         .open_chunks
         .checked_add(1)
         .ok_or(MagicraftError::Overflow)?;
-    a.world.chunk_count = a.world.chunk_count.saturating_add(1);
+    a.world.chunk_count = a
+        .world
+        .chunk_count
+        .checked_add(1)
+        .ok_or(MagicraftError::Overflow)?;
     Ok(())
 }
 
 // ---------- grow_chunk (ER) ----------
 
-#[derive(Accounts, Session)]
+#[derive(Accounts)]
 pub struct GrowChunk<'info> {
-    pub signer: Signer<'info>,
-    /// The chunk's payer (sponsor of the resize).
+    /// The chunk's payer (`chunk.payer`, checked): sponsors the resize, signing with its
+    /// stored PDA seeds. No user signature: the rent was reserved at `create_chunk`.
     #[account(mut, seeds = [PLAYER_SEED, player.authority.as_ref()], bump = player.bump)]
     pub player: Account<'info, Player>,
-    #[session(signer = signer, authority = player.authority.key())]
-    pub session_token: Option<Account<'info, SessionTokenV2>>,
     pub world: Account<'info, World>,
     /// CHECK: validated by `chunk_for` (owner, discriminator, world, coordinates, PDA).
     #[account(mut)]
@@ -195,11 +210,11 @@ pub struct GrowChunk<'info> {
 /// Resizes the chunk to [`CHUNK_FULL_LEN`] (requires `gen_stage == 0` **and** length
 /// 10 240, else `WrongGenStage`, so it never resizes twice), writes stage-1 terrain into
 /// the block region in place and the 256 biome bytes into the header; `gen_stage = 1`.
-/// Only the chunk's payer (wallet or session key) may grow it.
-#[session_auth_or(
-    ctx.accounts.player.authority == ctx.accounts.signer.key(),
-    MagicraftError::Unauthorized
-)]
+///
+/// **Permissionless** (anti-squatting): anyone may grow a created chunk, so a creator who
+/// stops after `create_chunk` cannot block the coordinates. The sponsor is the chunk's own
+/// payer Player (`InvalidChunk` if another Player is passed); its reserve for the full
+/// chunk was checked at create (re-checked here for the resize delta).
 pub fn grow_chunk(ctx: Context<GrowChunk>, cx: i32, cz: i32) -> Result<()> {
     let a = &ctx.accounts;
     let world_key = a.world.key();
@@ -208,7 +223,7 @@ pub fn grow_chunk(ctx: Context<GrowChunk>, cx: i32, cz: i32) -> Result<()> {
     let len = chunk_ai.data_len();
     {
         let h = chunk_for(&chunk_ai, &world_key, cx, cz)?;
-        require_keys_eq!(h.payer, a.player.key(), MagicraftError::Unauthorized);
+        require_keys_eq!(h.payer, a.player.key(), MagicraftError::InvalidChunk);
         require!(
             h.gen_stage == GEN_CREATED && len == CHUNK_INITIAL_LEN,
             MagicraftError::WrongGenStage
@@ -241,8 +256,7 @@ pub fn grow_chunk(ctx: Context<GrowChunk>, cx: i32, cz: i32) -> Result<()> {
 
 #[derive(Accounts)]
 pub struct PopulateChunk<'info> {
-    /// Written only when this is chunk (0,0) and the spawn is unset.
-    #[account(mut)]
+    /// Read-only (the spawn is set by `set_spawn`).
     pub world: Account<'info, World>,
     /// CHECK: validated by `chunk_for`.
     #[account(mut)]
@@ -250,9 +264,8 @@ pub struct PopulateChunk<'info> {
 }
 
 /// Stage 2 (caves, ores, trees, cacti, animals) on a `gen_stage == 1` chunk
-/// (`WrongGenStage` otherwise); animals go into the mob slots; `gen_stage = DONE`. For
-/// (0,0) with the world spawn unset, also sets `World.spawn` ([`spawn_point`], block
-/// coordinates of the feet block).
+/// (`WrongGenStage` otherwise); animals go into the mob slots; `gen_stage = DONE`. The
+/// World is read-only; after populating (0,0) the client sends `set_spawn`.
 ///
 /// **Permissionless** (no signer besides the fee payer): the result is a pure function of
 /// the seed and the stage-1 blocks, so anyone may finish a half-generated chunk (e.g. if
@@ -265,23 +278,54 @@ pub fn populate_chunk(ctx: Context<PopulateChunk>, cx: i32, cz: i32) -> Result<(
         require!(h.gen_stage == GEN_STAGE1, MagicraftError::WrongGenStage);
     }
     let seed = Seed::new(&ctx.accounts.world.seed);
-    let spawn = {
-        let (mut h, mut blocks) = chunk_parts_mut(&chunk_ai)?;
-        let mut info = Box::new(Stage1Info::EMPTY);
-        stage1_info_from_blocks(&blocks, &h.biomes, &mut info);
-        let mut spawns = [MobSpawn::default(); MAX_SPAWNS];
-        let n = generate_stage2(&seed, cx, cz, &mut blocks, &info, &mut spawns);
-        for (i, s) in spawns.iter().take(n).enumerate() {
-            h.set_mob(i, &Mob::from_spawn(s, cx, cz));
-        }
-        h.gen_stage = GEN_DONE;
-        (cx == 0 && cz == 0 && !ctx.accounts.world.spawn_set).then(|| spawn_point(&blocks))
-    };
-    if let Some((x, y, z)) = spawn {
-        let w = &mut ctx.accounts.world;
-        w.spawn = [x as i32, y as i32, z as i32];
-        w.spawn_set = true;
+    let (mut h, mut blocks) = chunk_parts_mut(&chunk_ai)?;
+    let mut info = Box::new(Stage1Info::EMPTY);
+    stage1_info_from_blocks(&blocks, &h.biomes, &mut info);
+    let mut spawns = [MobSpawn::default(); MAX_SPAWNS];
+    let n = generate_stage2(&seed, cx, cz, &mut blocks, &info, &mut spawns);
+    for (i, s) in spawns.iter().take(n).enumerate() {
+        h.set_mob(i, &Mob::from_spawn(s, cx, cz));
     }
+    h.gen_stage = GEN_DONE;
+    Ok(())
+}
+
+// ---------- set_spawn (ER, permissionless) ----------
+
+#[derive(Accounts)]
+pub struct SetSpawn<'info> {
+    #[account(mut, constraint = !world.spawn_set @ MagicraftError::SpawnAlreadySet)]
+    pub world: Account<'info, World>,
+    /// CHECK: chunk (0,0) of `world`, validated by `chunk_for`; read-only.
+    pub chunk: UncheckedAccount<'info>,
+}
+
+/// Sets `World.spawn` once (`SpawnAlreadySet` afterwards) from the populated chunk (0,0)
+/// (`ChunkNotReady` unless full size and `DONE`): [`spawn_point`], in **block**
+/// coordinates of the feet block (Task 18 converts to FP). Permissionless; the client sends
+/// it right after `populate_chunk(0, 0)`. Kept out of `populate_chunk` so that one takes the
+/// World read-only. If (0,0) was edited before anyone called this, the spawn reflects the
+/// edited blocks (harmless: it is still ground with 2 air above, or the center fallback).
+pub fn set_spawn(ctx: Context<SetSpawn>) -> Result<()> {
+    let world_key = ctx.accounts.world.key();
+    let chunk_ai = ctx.accounts.chunk.to_account_info();
+    let len = chunk_ai.data_len();
+    let data = chunk_ai.try_borrow_data()?;
+    let h = chunk_header_from(&data)?;
+    require_keys_eq!(*chunk_ai.owner, crate::ID, MagicraftError::InvalidChunk);
+    check_chunk_identity(h, chunk_ai.key, &world_key, 0, 0)?;
+    require!(
+        h.is_done() && len >= CHUNK_FULL_LEN,
+        MagicraftError::ChunkNotReady
+    );
+    let blocks: &[u8; CHUNK_VOL] = data[CHUNK_BLOCKS_OFFSET..CHUNK_FULL_LEN]
+        .try_into()
+        .unwrap();
+    let (x, y, z) = spawn_point(blocks);
+    drop(data);
+    let w = &mut ctx.accounts.world;
+    w.spawn = [x as i32, y as i32, z as i32];
+    w.spawn_set = true;
     Ok(())
 }
 
@@ -311,8 +355,11 @@ pub struct CloseChunk<'info> {
 
 /// Closes an unedited chunk and its presence list, refunding all rent to the payer Player
 /// (on the ER; the next commit carries it to base). Payer only (wallet or session key).
-/// Requires `!edited` (`ChunkEdited`), no mobs (`ChunkHasMobs`) and an empty presence list
-/// (`ChunkOccupied`); any `gen_stage` (a half-generated chunk can be reclaimed). Cancels
+/// Requires `!edited` (`ChunkEdited`), no zombies or other non-passive mobs (`ChunkHasMobs`)
+/// and an empty presence list (`ChunkOccupied`); any `gen_stage` (a half-generated chunk
+/// can be reclaimed). **Passive animals do not block**: they are dropped with the chunk
+/// (whatever happened to them is lost) and the populate of a regenerated chunk spawns the
+/// original animals again. Cancels
 /// the chunk's tick crank first if one was ever armed (unknown ids are a no-op).
 /// `open_chunks −= 1`, `world.chunk_count −= 1` (saturating).
 #[session_auth_or(
@@ -328,7 +375,7 @@ pub fn close_chunk(mut ctx: Context<CloseChunk>, cx: i32, cz: i32) -> Result<()>
         let h = chunk_for(&chunk_ai, &world_key, cx, cz)?;
         require_keys_eq!(h.payer, a.player.key(), MagicraftError::Unauthorized);
         require!(h.edited == 0, MagicraftError::ChunkEdited);
-        require!(!h.has_mobs(), MagicraftError::ChunkHasMobs);
+        require!(!h.has_blocking_mobs(), MagicraftError::ChunkHasMobs);
         (h.task_id.get(), h.bump)
     };
     {

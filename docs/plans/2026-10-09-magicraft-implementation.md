@@ -259,8 +259,12 @@ Commit `feat(program): worlds, vrf seed, day crank`.
 **Done (Task 17):** measured (SBF) tx 1 (create + grow) 604k-632k CU, populate 587k-802k (model
 max over 10^6 chunks 1.13M; construction bound ≈ 1.42M), close 17k; no further split. Needed
 `overflow-checks = false` for `magicraft-core` in release (stage 1 > 1.4M with checks).
-`populate_chunk` is permissionless; adjacency = edge neighbor passed as `neighbor` or first
-chunk (0,0) (player's-chunk path: TODO Task 18); spawn = `populate::spawn_point`. Helpers:
+`grow_chunk` and `populate_chunk` are permissionless (grow's sponsor = the chunk's payer
+Player); adjacency = a `DONE` edge neighbor passed as `neighbor`, or the world's first chunk
+(0,0) (player's-chunk path: TODO Task 18); populate takes the World read-only and the client
+then sends the permissionless `set_spawn` (`populate::spawn_point`, block coords); `close_chunk`
+ignores passive animals (zombies block). Open risk: populate worst case ≈ 1.42M CU
+(theoretical) — follow-up core optimization, no split. Helpers:
 `tests/helpers/{world,chunk}.ts`. Details: `docs/notes/spikes.md`.
 
 Commit `feat(program): chunk generation and reclaim`.

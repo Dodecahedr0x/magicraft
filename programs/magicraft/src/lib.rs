@@ -80,13 +80,19 @@ pub mod magicraft {
     }
 
     /// Resizes the chunk to full size and writes stage-1 terrain (`gen_stage 1`).
+    /// Permissionless (sponsor = the chunk's payer Player).
     pub fn grow_chunk(ctx: Context<GrowChunk>, cx: i32, cz: i32) -> Result<()> {
         instructions::chunk::grow_chunk(ctx, cx, cz)
     }
 
-    /// Stage 2 (caves, ores, trees, animals; spawn for (0,0)). Permissionless.
+    /// Stage 2 (caves, ores, trees, animals). Permissionless; World read-only.
     pub fn populate_chunk(ctx: Context<PopulateChunk>, cx: i32, cz: i32) -> Result<()> {
         instructions::chunk::populate_chunk(ctx, cx, cz)
+    }
+
+    /// Sets the world spawn once from the populated chunk (0,0). Permissionless.
+    pub fn set_spawn(ctx: Context<SetSpawn>) -> Result<()> {
+        instructions::chunk::set_spawn(ctx)
     }
 
     /// Closes an unedited, empty chunk + presence; refunds the payer Player.

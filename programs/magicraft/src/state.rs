@@ -40,7 +40,7 @@
 //! | 81 | `params` | [`WorldParams`] (48 B, identical to `core::physics::WorldParams::to_bytes`) |
 //! | 129 | `seed` | [u8; 32] |
 //! | 161 | `seed_set` | bool |
-//! | 162 | `spawn` | [i32; 3] (block coordinates of the feet block) |
+//! | 162 | `spawn` | [i32; 3] (**block** coordinates of the feet block, not FP; `set_spawn`) |
 //! | 174 | `spawn_set` | bool |
 //! | 175 | `time_of_day_ms` | u64 (0 ..< day_length_secs·1000) |
 //! | 183 | `day_task_id` | i64 (0 = not scheduled) |
@@ -407,7 +407,9 @@ pub struct World {
     pub params: WorldParams,
     pub seed: [u8; 32],
     pub seed_set: bool,
-    /// Block coordinates of the spawn feet block.
+    /// **Block** coordinates (not fixed-point) of the spawn feet block, set once by
+    /// `set_spawn` from chunk (0,0). Task 18 (`join_world` / `respawn`) converts to FP feet
+    /// position: `x·256 + 128, y·256, z·256 + 128` (block center).
     pub spawn: [i32; 3],
     pub spawn_set: bool,
     pub time_of_day_ms: u64,
@@ -677,6 +679,17 @@ impl ChunkHeader {
 
     pub fn has_mobs(&self) -> bool {
         (0..MOB_SLOTS).any(|i| !self.mob(i).is_empty())
+    }
+
+    /// A mob that blocks `close_chunk`: any occupied slot that is not a passive animal
+    /// (pig/cow/sheep), i.e. zombies (and any unknown kind). Passive animals are dropped with
+    /// the chunk and come back from `populate_chunk` when it is regenerated.
+    pub fn has_blocking_mobs(&self) -> bool {
+        (0..MOB_SLOTS).any(|i| {
+            let k = self.mob(i).kind;
+            k != magicraft_core::mobs::KIND_NONE
+                && !(magicraft_core::mobs::KIND_PIG..=magicraft_core::mobs::KIND_SHEEP).contains(&k)
+        })
     }
 
     /// The fluid queue (copied out; LE `repr(C)` layout: `buf` u16 × 64 @0,
@@ -1509,5 +1522,44 @@ mod tests {
                 assert!(ms >= before, "reanchor went back");
             }
         }
+    }
+
+    #[test]
+    fn passive_mobs_do_not_block_close() {
+        use magicraft_core::mobs::{KIND_COW, KIND_SHEEP, KIND_ZOMBIE};
+        let mut h: ChunkHeader = bytemuck::Zeroable::zeroed();
+        assert!(!h.has_blocking_mobs());
+        for (i, k) in [magicraft_core::mobs::KIND_PIG, KIND_COW, KIND_SHEEP]
+            .into_iter()
+            .enumerate()
+        {
+            h.set_mob(
+                i,
+                &Mob {
+                    kind: k,
+                    hp: 5,
+                    ..Mob::EMPTY
+                },
+            );
+        }
+        assert!(h.has_mobs() && !h.has_blocking_mobs());
+        h.set_mob(
+            7,
+            &Mob {
+                kind: KIND_ZOMBIE,
+                hp: 20,
+                ..Mob::EMPTY
+            },
+        );
+        assert!(h.has_blocking_mobs());
+        h.set_mob(
+            7,
+            &Mob {
+                kind: 9,
+                hp: 1,
+                ..Mob::EMPTY
+            },
+        );
+        assert!(h.has_blocking_mobs());
     }
 }

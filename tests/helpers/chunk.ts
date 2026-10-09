@@ -75,22 +75,16 @@ export async function createChunkIx(
     .instruction();
 }
 
+/** Permissionless: any fee payer; `player` must be the chunk's payer Player. */
 export async function growChunkIx(
-  p: TestPlayer,
+  player: web3.PublicKey,
   world: web3.PublicKey,
   cx: number,
-  cz: number,
-  o: { signer?: web3.PublicKey; sessionToken?: web3.PublicKey | null } = {}
+  cz: number
 ) {
-  return p.er.methods
+  return erProgram.methods
     .growChunk(cx, cz)
-    .accountsPartial({
-      signer: o.signer ?? p.authority.publicKey,
-      player: p.player,
-      sessionToken: o.sessionToken ?? null,
-      world,
-      chunk: chunkPda(world, cx, cz),
-    })
+    .accountsPartial({ player, world, chunk: chunkPda(world, cx, cz) })
     .instruction();
 }
 
@@ -139,10 +133,18 @@ export async function createAndGrow(
     [
       computeBudgetIx(),
       await createChunkIx(p, world, cx, cz, { neighbor }),
-      await growChunkIx(p, world, cx, cz),
+      await growChunkIx(p.player, world, cx, cz),
     ],
     [p.authority]
   );
+}
+
+/** Permissionless: sets the world spawn from the populated chunk (0,0). */
+export async function setSpawnIx(world: web3.PublicKey) {
+  return erProgram.methods
+    .setSpawn()
+    .accountsPartial({ world, chunk: chunkPda(world, 0, 0) })
+    .instruction();
 }
 
 /** Generation tx 2: ComputeBudget 1.4M + populate_chunk, paid by `payer`

@@ -85,8 +85,8 @@ mobs and pruned by the next mover in that chunk (pruner receives the refund).
 ### Spawn
 
 Global per world, stored in `World.spawn`. Chunk (0,0) is always the first chunk, created by the
-world creator right after the VRF callback; generating it sets spawn above the topmost solid block
-nearest its center.
+world creator right after the VRF callback; after populating it the client sends `set_spawn`,
+which sets spawn above the topmost solid block nearest its center (block coordinates).
 
 ## Terrain generation
 
@@ -130,19 +130,24 @@ Steps, sent back to back by the client:
    rejected, never double-resized); resize `Chunk` to full size (same tx as 1), then biome,
    heightmap, column fill if it fits the budget (otherwise a separate stage-1 ix/tx), and
    stores the 256 biome bytes in the `Chunk` header (`biomes: [u8; 256]`) for stage 2.
-   `gen_stage = 1`. Authorized for the chunk's payer (wallet or session key).
+   `gen_stage = 1`. **Permissionless** (anti-squatting): the chunk's payer Player sponsors the
+   resize (rent reserved at create).
 3. `populate_chunk` — requires `gen_stage == 1`; rebuilds `Stage1Info` from the stored biomes +
    a column scan of the stage-1 blocks (`stage1_info_from_blocks`), then caves, ores, trees,
    cactus, animals (`generate_stage2`; sea ice is already placed by stage 1). Sets
-   `gen_stage = DONE`.
+   `gen_stage = DONE`. Permissionless; World read-only.
+4. For (0,0) only: `set_spawn` (permissionless, once) computes `World.spawn` (block coordinates)
+   from the populated chunk.
 
 Every other ix that takes a chunk (moves, edits, ticks, mobs) rejects it (`ChunkNotReady`; ticks
 no-op) unless it is at full size and `DONE`.
 
-Creation allowed only adjacent to an existing chunk or the player's current chunk. Payer =
+Creation allowed only adjacent to an existing **fully generated** chunk or the player's current
+chunk (or (0,0) in an empty world). Payer =
 creator's `Player` PDA.
 
-`close_chunk`: payer only, if `!edited`, no mobs, presence empty. Cancels the chunk's tick crank,
+`close_chunk`: payer only, if `!edited`, no zombies (passive animals are dropped and come back
+when the chunk is regenerated), presence empty. Cancels the chunk's tick crank,
 closes `Chunk` + `ChunkPresence`, refunds rent, `open_chunks -= 1`. Regeneration later yields
 identical terrain. The payer's `Player` must be delegated (the refund goes to it on the ER).
 

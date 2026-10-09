@@ -1,7 +1,8 @@
 //! Integer hashing and a splitmix64 PRNG.
 //!
 //! Everything is integer-only and wrapping, so native and SBF builds agree bit for bit
-//! (overflow checks stay on in release; all arithmetic here uses explicit `wrapping_*`).
+//! (all arithmetic here uses explicit `wrapping_*`, so it is unaffected by the crate's
+//! release setting `overflow-checks = false`; see the crate docs).
 //!
 //! Design: the 32-byte VRF world seed is folded once into a [`Seed`] (two `u64` keys) so
 //! hot paths never re-read 32 bytes. The fold chains a bijective mixer over the four

@@ -62,4 +62,5 @@ Recorded 2026-10-09 when scaffolding the workspace (Task 1). `anchor build` and
 - **`magicraft-core` builds without overflow checks in release** (`[profile.release.package.magicraft-core]
   overflow-checks = false`, Task 17): checked `i64` multiplication is a software routine on SBF and
   pushed terrain stage 1 past the 1.4M CU limit (≈ 2.5× slower). Debug/test builds keep the checks;
-  the program crate keeps them in release.
+  the program crate keeps them in release. **Any other build of `magicraft-core` that must match
+  onchain results (e.g. the wasm client) must use the same profile setting** (see the crate docs).
