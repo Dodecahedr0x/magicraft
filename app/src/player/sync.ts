@@ -2,7 +2,9 @@
 // last **confirmed** onchain `MoveState` as the base of the next update.
 //
 // - Frames: the controller records every rendered physics state with its chain-time stamp
-//   (`ChainClock`: World time anchor + ER slot, `worldChainMs`); stamps strictly increase.
+//   (`ChainClock`: World time anchor + the ER Clock sysvar's slot and unix_timestamp — the
+//   validator's wall time, learned as an offset, never the local clock — stamped 75 ms
+//   behind the estimate); stamps strictly increase.
 // - Every `intervalMs` (125 ms) the newest frame newer than the last sent `client_ms` is
 //   checked locally with the core's `check_move` (wasm) from the confirmed state against the
 //   local 2×2 chunk window — exactly what the program will run (`chooseFrame`: a recent
@@ -16,7 +18,8 @@
 //   one send right after it settles (newest frame wins). Pipelining is a Task 28 option.
 // - Results: confirmed → the predicted state (wasm output) becomes `prev`; a snap-back
 //   error (MoveTooFast/Collision/NotOnGround/Flying/TimeSkew/InvalidMoveState) → re-read the
-//   PlayerState, snap the player to it (velocity 0); `timeout` (may still land) → re-read and
+//   PlayerState, snap the player to it (velocity 0); every candidate failing with TimeSkew →
+//   counted, and after ~1 s snap back + recalibrate the clock; `timeout` (may still land) → re-read and
 //   adopt the onchain state without snapping; `notReady` → hold; `dead` → stop (`onDead`);
 //   `topup` / `renewSession` → `onIssue`, sends pause 5 s.
 // - PlayerState notifications (health / food changes from damage, our own moves landing)
@@ -26,14 +29,24 @@
 // - Day-crank watchdog: `schedule_day_crank` when `World.last_tick_ms` is > 3 s behind
 //   chain time, at most every 5 s.
 import type { TransactionInstruction } from "@solana/web3.js";
-import { dayCrankStale, decodeMoveState, worldChainMs, type MoveState, type V3, type WorldAccount, type WorldParams } from "../chain/layout";
+import { requiredSlots } from "../chain/actions";
+import {
+  dayCrankStale,
+  decodeMoveState,
+  MOVE_STATE_SIZE,
+  PSTATE_HEALTH_OFFSET,
+  PSTATE_MOVE_OFFSET,
+  worldChainMs,
+  type MoveState,
+  type V3,
+  type WorldAccount,
+  type WorldParams,
+} from "../chain/layout";
 import type { SendOptions, SendResult, TxFailure, IxSource } from "../chain/sender";
-import { checkMove, coreMoveWindow, type CheckResult } from "../wasm";
+import { checkMove, coreMoveWindow, invalidateQuad, type CheckResult } from "../wasm";
 
-/** Byte offset / length of `MoveState` in `PlayerState` account data. */
-export const PSTATE_MOVE_OFFSET = 73;
-export const MOVE_STATE_LEN = 72;
-const HEALTH_OFFSET = 145;
+export { PSTATE_MOVE_OFFSET };
+const moveBytes = (data: Uint8Array) => data.slice(PSTATE_MOVE_OFFSET, PSTATE_MOVE_OFFSET + MOVE_STATE_SIZE);
 
 /** `WorldParams` → its 48-byte layout (`core::physics::WorldParams::to_bytes`). */
 export function encodeParams(p: WorldParams): Uint8Array {
@@ -51,31 +64,94 @@ export function encodeParams(p: WorldParams): Uint8Array {
 
 // ---------------------------------------------------------------- chain clock
 
-/** The program falls back to coarse wall time when its anchor is older than this, ms. */
+/** The program falls back to coarse wall time when its anchor is older than this, or the
+ *  estimate is this far from the validator's wall time, ms (`state::STALE_MS`). */
 const ANCHOR_STALE_MS = 10_000;
+/** Frames are stamped this far behind the chain-time estimate (headroom under the
+ *  program's `LEAD_MS` = 250 for estimate noise), ms. */
+export const STAMP_BEHIND_MS = 75;
+/** Readings with a longer round trip are dropped once the clock is calibrated, ms. */
+export const MAX_READING_RTT_MS = 250;
+/** Backward corrections are slewed at most this much per reading, ms. */
+const SLEW_BACK_MS = 25;
+/** Differences larger than this are taken at once (mode switch fine ↔ coarse), ms. */
+const JUMP_MS = 2_000;
 
-/** Chain-time estimate from the World anchor at `slot` (`worldChainMs`), or — when the
- *  program would read coarse wall time (anchor unset / stale) — local wall time 200 ms
- *  back (inside the coarse window `[wall − 1250, wall + 1000]`). */
-export function chainEstimate(w: Pick<WorldAccount, "clock">, slot: number, wallMs: number): number {
+/** Chain-time estimate the program would compute: the World anchor at `slot`
+ *  (`worldChainMs`), or — when the program reads coarse wall time (anchor unset, older than
+ *  10 s, or 10 s off the validator's wall time) — the validator's wall time `wallMs` minus
+ *  300 ms (the coarse window accepts `[floor_s − 1250, floor_s + 1000]`). `wallMs` must be
+ *  the **validator's** wall time (`ChainClock` learns it from its Clock sysvar), never the
+ *  local `Date.now()`; null = unknown (then the fine estimate is trusted if it exists). */
+export function chainEstimate(w: Pick<WorldAccount, "clock">, slot: number, wallMs: number | null): number | null {
   const est = worldChainMs(w, slot);
-  if (est === null || est - w.clock.anchorMs > ANCHOR_STALE_MS || Math.abs(est - wallMs) > ANCHOR_STALE_MS) return wallMs - 200;
+  if (wallMs === null) return est;
+  if (est === null || est - w.clock.anchorMs > ANCHOR_STALE_MS || Math.abs(est - wallMs) > ANCHOR_STALE_MS) return wallMs - 300;
   return est;
 }
 
-/** Local estimate of chain time: `perfNow() + offset`, calibrated from readings. */
+/** One ER reading: `slot` and the Clock sysvar's `unix_timestamp` (s; null if unavailable),
+ *  requested at local time `t0` and answered at `t1` (perfNow clock). */
+export type ChainReading = { slot: number; unixS: number | null; t0: number; t1: number };
+
+/** Local estimate of chain time, `perfNow() + offset`, and of the validator's wall time,
+ *  `perfNow() + wallOffset`, learned from readings (local `Date.now()` is never used, so a
+ *  skewed client clock doesn't matter). Once calibrated, readings with a round trip over
+ *  `MAX_READING_RTT_MS` are dropped; the chain offset steps forward at once but slews
+ *  backward (≤ 25 ms per reading) unless off by more than 2 s. The wall offset is the
+ *  running mean (last ~30) of `unix_timestamp · 1000 + 500 − t_mid` (1 s resolution). */
 export class ChainClock {
   offset: number | null = null;
+  wallOffset: number | null = null;
+  private wallN = 0;
+  dropped = 0;
   constructor(readonly perfNow: () => number = () => performance.now()) {}
-  /** A chain-time reading taken between local times `t0` and `t1` (perfNow clock). Small
-   *  differences are slewed (¼ per reading), jumps > 500 ms are taken at once. */
-  observe(chainMs: number, t0: number, t1: number) {
-    const sample = chainMs - (t0 + t1) / 2;
-    if (this.offset === null || Math.abs(sample - this.offset) > 500) this.offset = sample;
-    else this.offset += (sample - this.offset) / 4;
+
+  /** Feeds a reading with the current World; returns false if it was dropped. */
+  observe(r: ChainReading, w: Pick<WorldAccount, "clock">): boolean {
+    const rtt = r.t1 - r.t0;
+    if (this.offset !== null && rtt > MAX_READING_RTT_MS) {
+      this.dropped++;
+      return false;
+    }
+    const mid = (r.t0 + r.t1) / 2;
+    if (r.unixS !== null) {
+      const ws = r.unixS * 1000 + 500 - mid;
+      if (this.wallOffset === null || Math.abs(ws - this.wallOffset) > JUMP_MS) {
+        this.wallOffset = ws;
+        this.wallN = 1;
+      } else {
+        this.wallN = Math.min(this.wallN + 1, 30);
+        this.wallOffset += (ws - this.wallOffset) / this.wallN;
+      }
+    }
+    const chain = chainEstimate(w, r.slot, this.wallOffset === null ? null : mid + this.wallOffset);
+    if (chain === null) return false;
+    this.apply(chain - mid);
+    return true;
   }
+
+  private apply(sample: number) {
+    const o = this.offset;
+    if (o === null || sample >= o || o - sample > JUMP_MS) this.offset = sample;
+    else this.offset = o - Math.min(o - sample, SLEW_BACK_MS);
+  }
+
+  /** Forget the calibration (after persistent `TimeSkew`). */
+  reset() {
+    this.offset = null;
+    this.wallOffset = null;
+    this.wallN = 0;
+  }
+
   now(): number | null {
     return this.offset === null ? null : this.perfNow() + this.offset;
+  }
+
+  /** Stamp for a frame simulated `ageMs` ago. */
+  stamp(ageMs = 0): number | null {
+    const n = this.now();
+    return n === null ? null : n - STAMP_BEHIND_MS - ageMs;
   }
 }
 
@@ -102,6 +178,8 @@ export type SyncDeps = {
   clock: { now(): number | null };
   /** Snap the local player to `pos` (FP) at rest. */
   snap: (pos: V3) => void;
+  /** Frames keep failing with `TimeSkew` (~1 s): the clock should recalibrate. */
+  onClockSuspect?: () => void;
   onDead?: () => void;
   /** Top-up / session problems (sends pause for `issuePauseMs`). */
   onIssue?: (f: TxFailure) => void;
@@ -129,12 +207,17 @@ export type SyncStats = {
   /** External resets (a newer onchain state that is not our move: respawn, teleport). */
   resets: number;
   dayCranks: number;
+  /** Ticks where every candidate failed the local check with `TimeSkew` (clock off). */
+  timeSkewHolds: number;
   /** Send → result latency of confirmed moves, ms. */
   latencyAvg: number;
   latencyMax: number;
   /** Confirmed moves per second over the last 5 s. */
   rateHz: number;
 };
+
+/** The newest frames checked one by one per decision (+ one supported + ≤ 8 sparse). */
+export const MAX_CANDIDATES = 16;
 
 export type Choice = { frame: Frame; onGround: boolean; res: Extract<CheckResult, { ok: true }> };
 
@@ -143,15 +226,18 @@ export type Choice = { frame: Frame; onGround: boolean; res: Extract<CheckResult
  *  ground or in water) came after `floor`, the newest supported one is tried first: the
  *  program refreshes the jump ceiling only from updates that are on ground / in water, and
  *  a one-frame landing between two 8 Hz updates (bunny-hopping onto a bump) is otherwise
- *  invisible to it. Then newest → oldest. A frame claiming ground that the core rejects
+ *  invisible to it. Then newest → oldest: the newest `maxCandidates`, then every 4th
+ *  older frame (≤ 8; for long gaps), so a decision costs ≤ ~25 core checks. A frame claiming ground that the core rejects
  *  with `NotOnGround` is retried airborne. First accepted frame wins; else `rejected` = the
  *  first error seen (or only `notReady`: a window chunk isn't ready locally). */
 export function chooseFrame(
   frames: readonly Frame[],
   floor: number,
   check: (f: Frame, onGround: boolean) => CheckResult | "notReady",
-): { pick: Choice | null; notReady: boolean; rejected: string | null } {
+  maxCandidates = MAX_CANDIDATES,
+): { pick: Choice | null; notReady: boolean; rejected: string | null; timeSkew: boolean } {
   let notReady = false;
+  let timeSkew = false;
   let rejected: string | null = null;
   let first = frames.length;
   while (first > 0 && frames[first - 1].t > floor) first--;
@@ -163,7 +249,11 @@ export function chooseFrame(
         order.push(i);
         break;
       }
-  for (let i = last; i >= first; i--) if (i !== order[0]) order.push(i);
+  // The newest `maxCandidates`, then every 4th older frame (≤ 8 more: long gaps).
+  for (let i = last, n = 0; i >= first && n < maxCandidates + 8; n++) {
+    if (i !== order[0]) order.push(i);
+    i -= n < maxCandidates ? 1 : 4;
+  }
   for (const i of order) {
     const f = frames[i];
     for (const g of f.onGround ? [true, false] : [false]) {
@@ -172,13 +262,16 @@ export function chooseFrame(
         notReady = true;
         break;
       }
-      if (r.ok) return { pick: { frame: f, onGround: g, res: r }, notReady, rejected };
-      if (r.error === "TimeSkew") break;
+      if (r.ok) return { pick: { frame: f, onGround: g, res: r }, notReady, rejected, timeSkew };
+      if (r.error === "TimeSkew") {
+        timeSkew = true;
+        break;
+      }
       rejected ??= r.error;
       if (r.error !== "NotOnGround") break;
     }
   }
-  return { pick: null, notReady, rejected };
+  return { pick: null, notReady, rejected, timeSkew };
 }
 
 const same = (a: readonly number[], b: readonly number[]) => a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
@@ -212,7 +305,9 @@ export class MoveSync {
     notReadyHolds: 0,
     resets: 0,
     dayCranks: 0,
+    timeSkewHolds: 0,
   };
+  private skewStreak = 0;
   private readonly perfNow: () => number;
 
   constructor(readonly deps: SyncDeps) {
@@ -229,9 +324,9 @@ export class MoveSync {
 
   /** PlayerState account data (initial fetch or notification). */
   onPlayerState(data: Uint8Array) {
-    const bytes = data.slice(PSTATE_MOVE_OFFSET, PSTATE_MOVE_OFFSET + MOVE_STATE_LEN);
+    const bytes = moveBytes(data);
     const st = decodeMoveState(bytes);
-    const dead = data[HEALTH_OFFSET] === 0;
+    const dead = data[PSTATE_HEALTH_OFFSET] === 0;
     if (dead && !this.dead) {
       this.dead = true;
       this.deps.onDead?.();
@@ -240,7 +335,17 @@ export class MoveSync {
       this.adopt(bytes, st, true);
       return;
     }
-    if (st.lastMs <= this.prevState.lastMs) return;
+    if (st.lastMs === this.prevState.lastMs) {
+      // Same update, different bytes (our prediction differed from the program's): the
+      // onchain state wins; snap only if the position differs.
+      if (!bytes.every((b, i) => b === this.prev![i])) {
+        this.log("onchain state differs from the predicted one; adopting it", st);
+        const moved = st.pos.some((v, i) => v !== this.prevState!.pos[i]);
+        this.adopt(bytes, st, moved);
+      }
+      return;
+    }
+    if (st.lastMs < this.prevState.lastMs) return;
     if (this.inflight?.clientMs === st.lastMs || this.maybeLanded.has(st.lastMs)) {
       this.adopt(bytes, st, false);
       return;
@@ -288,12 +393,8 @@ export class MoveSync {
     if (!win) return "far";
     const [cx0, cz0] = win;
     const slots = [this.deps.blocks(cx0, cz0), this.deps.blocks(cx0 + 1, cz0), this.deps.blocks(cx0, cz0 + 1), this.deps.blocks(cx0 + 1, cz0 + 1)];
-    // `play::required_slots`: chunks under the footprint (± GROUND_HALF_W) of a or b.
-    const m = 78;
-    for (const p of [a, b])
-      for (let cz = Math.floor((p[2] - m) / 4096); cz <= Math.floor((p[2] + m - 1) / 4096); cz++)
-        for (let cx = Math.floor((p[0] - m) / 4096); cx <= Math.floor((p[0] + m - 1) / 4096); cx++)
-          if (!slots[(cz - cz0) * 2 + (cx - cx0)]) return "notReady";
+    const req = requiredSlots(a, b, cx0, cz0);
+    if (req.some((r, i) => r && !slots[i])) return "notReady";
     return { cx0, cz0, slots };
   }
 
@@ -308,6 +409,7 @@ export class MoveSync {
 
   private choose(chainMs: number) {
     const floor = Math.max(this.prevState!.lastMs, this.lastSentMs);
+    invalidateQuad(); // chunk bytes may have changed since the last decision
     return chooseFrame(this.frames, floor, (f, g) => this.check(f, g, chainMs));
   }
 
@@ -328,11 +430,24 @@ export class MoveSync {
     if (latest.t <= Math.max(prev.lastMs, this.lastSentMs)) return;
     if (same(latest.pos, prev.pos) && latest.onGround === prev.onGround && chainMs - prev.lastMs < (this.deps.heartbeatMs ?? 1000)) return;
 
-    const { pick, notReady, rejected } = this.choose(chainMs);
+    const { pick, notReady, rejected, timeSkew } = this.choose(chainMs);
+    if (!pick && !rejected && !notReady && timeSkew) {
+      // Every candidate's stamp is outside the chain's time window: the clock is off.
+      this.stats.timeSkewHolds++;
+      if (++this.skewStreak * this.intervalMs >= 1000) {
+        this.log("frames keep failing with TimeSkew: snap back, recalibrate the clock", { chainMs, lastMs: prev.lastMs });
+        this.skewStreak = 0;
+        this.frames = [];
+        this.deps.snap(prev.pos);
+        this.deps.onClockSuspect?.();
+      }
+      return;
+    }
+    this.skewStreak = 0;
     if (!pick) {
       if (rejected) {
         this.stats.localSnapbacks++;
-        this.log(`local check rejected every frame (${rejected}): snap back`, prev.pos);
+        this.log(`local check rejected every frame (${rejected}): snap back`, { prev: prev.pos, lastMs: prev.lastMs, latest, n: this.frames.length, chainMs });
         this.frames = [];
         this.deps.snap(prev.pos);
       } else if (notReady) this.stats.notReadyHolds++;
@@ -418,9 +533,9 @@ export class MoveSync {
       /* keep the current prev */
     }
     if (!data) return;
-    const bytes = data.slice(PSTATE_MOVE_OFFSET, PSTATE_MOVE_OFFSET + MOVE_STATE_LEN);
+    const bytes = moveBytes(data);
     const st = decodeMoveState(bytes);
-    if (data[HEALTH_OFFSET] === 0 && !this.dead) {
+    if (data[PSTATE_HEALTH_OFFSET] === 0 && !this.dead) {
       this.dead = true;
       this.deps.onDead?.();
     }

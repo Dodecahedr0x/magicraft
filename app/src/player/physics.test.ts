@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_WORLD_PARAMS } from "../chain/layout";
 import { moveWindow } from "../chain/actions";
-import { checkMove, coreMoveWindow, defaultParamsBytes, spawnState } from "../wasm";
-import { FP, HALF_W, PlayerPhysics, sampleOf } from "./physics";
+import { checkMove, coreMoveWindow, defaultParamsBytes, physicsConstants, spawnState } from "../wasm";
+import { BODY_H, FEET_EPS, FP, HALF_W, PlayerPhysics, sampleOf } from "./physics";
 import { encodeParams } from "./sync";
 import { ChunkWorld, coreBlock, fp, PARAMS, runClient, type Script } from "./testkit";
 
@@ -27,6 +27,9 @@ describe("wasm core", () => {
       [[-4000, 0, 4090], [-4200, 0, 4200]],
     ];
     for (const [a, b] of cases) expect(coreMoveWindow(a, b)).toEqual(moveWindow(a, b));
+    const [halfW, feetEps, bodyH] = physicsConstants();
+    expect([feetEps, bodyH]).toEqual([FEET_EPS, BODY_H]);
+    expect(HALF_W).toBeGreaterThan(halfW);
   });
 
   it("check_move mirrors core cases: walk ok, teleport / into stone rejected, 10-block fall = 7", () => {

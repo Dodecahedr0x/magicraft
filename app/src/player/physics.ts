@@ -38,8 +38,8 @@ export const STEP_S = 1 / 60;
 /** Most simulated time per frame, s (longer frames drop time). */
 export const MAX_CATCHUP_S = 0.25;
 /** `physics::FEET_EPS` / `BODY_H`: the program's water probes (feet / head voxel). */
-const FEET_EPS = 4;
-const BODY_H = 456;
+export const FEET_EPS = 4;
+export const BODY_H = 456;
 /** Overlaps thinner than this don't count (float noise at exact faces), FP. */
 const EPS = 1e-4;
 

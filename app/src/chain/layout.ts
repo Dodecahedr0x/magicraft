@@ -380,6 +380,11 @@ export type PlayerStateAccount = {
   respawnMs: number;
 };
 
+/** `PlayerState.move_state` offset in the account data (`MoveState`, 72 B). */
+export const PSTATE_MOVE_OFFSET = 73;
+/** `PlayerState.health` offset (u8; 0 ⇔ dead). */
+export const PSTATE_HEALTH_OFFSET = 145;
+
 export function decodePlayerState(d: Uint8Array): PlayerStateAccount {
   expectKind(d, "playerState", PSTATE_LEN);
   const r = new Reader(d);
@@ -387,8 +392,8 @@ export function decodePlayerState(d: Uint8Array): PlayerStateAccount {
     player: r.pubkey(8),
     world: r.pubkey(40),
     bump: r.u8(72),
-    move: decodeMoveState(d, 73),
-    health: r.u8(145),
+    move: decodeMoveState(d, PSTATE_MOVE_OFFSET),
+    health: r.u8(PSTATE_HEALTH_OFFSET),
     food: r.u8(146),
     exhaustion: r.u16(147),
     inventory: decodeInventory(d, 149),

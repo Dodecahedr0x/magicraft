@@ -2,7 +2,7 @@ import { Keypair, TransactionInstruction } from "@solana/web3.js";
 import { describe, expect, it, vi } from "vitest";
 import { decodeMoveState, DEFAULT_WORLD_PARAMS, PSTATE_LEN, type V3 } from "../chain/layout";
 import type { SendResult } from "../chain/sender";
-import { checkMove, coreMoveWindow, spawnState } from "../wasm";
+import { checkMove, coreMoveWindow, quadUploads, spawnState } from "../wasm";
 import { FP, PlayerPhysics, sampleOf } from "./physics";
 import { chainEstimate, ChainClock, chooseFrame, encodeParams, MoveSync, PSTATE_MOVE_OFFSET, type Frame, type SyncDeps, type SyncSender } from "./sync";
 import { ChunkWorld, PARAMS } from "./testkit";
@@ -252,6 +252,41 @@ describe("MoveSync", () => {
     expect(s.sync.summary().resets).toBe(1);
   });
 
+  it("same last_ms but different onchain bytes: the onchain state wins", () => {
+    const s = setup();
+    const other = spawnState([HOME[0] + 50, HOME[1], HOME[2]], 9_000, true);
+    s.sync.onPlayerState(pstate(other));
+    expect(s.sync.prevState?.pos[0]).toBe(HOME[0] + 50);
+    expect(s.snaps.at(-1)).toEqual([HOME[0] + 50, HOME[1], HOME[2]]);
+  });
+
+  it("uploads each window's chunks to wasm once per decision, checks ≤ 25 candidates", async () => {
+    const s = setup();
+    for (let i = 1; i <= 60; i++) s.sync.record(s.frame(9_000 + i * 10, 3_000)); // all teleports
+    const calls = { n: 0 };
+    const check = s.sync.check.bind(s.sync);
+    s.sync.check = (f, g, c) => (calls.n++, check(f, g, c));
+    const before = quadUploads();
+    await s.sync.tick();
+    expect(calls.n).toBeLessThanOrEqual(25);
+    expect(quadUploads() - before).toBeLessThanOrEqual(4);
+    expect(s.sync.summary().localSnapbacks).toBe(1);
+  });
+
+  it("persistent TimeSkew (stamps outside the chain window): counted, then snap back + recalibrate", async () => {
+    const onClockSuspect = vi.fn();
+    const s = setup({ onClockSuspect });
+    s.setChain(20_000); // frames stamped ≥ 2 s behind chain time
+    for (let k = 0; k < 8; k++) {
+      s.sync.record(s.frame(9_100 + k * 100, 10 + k));
+      await s.sync.tick();
+    }
+    expect(s.f.calls).toHaveLength(0);
+    expect(s.sync.summary().timeSkewHolds).toBe(8);
+    expect(onClockSuspect).toHaveBeenCalledTimes(1);
+    expect(s.snaps.at(-1)).toEqual(HOME);
+  });
+
   it("idle: an unchanged position is only re-sent as a heartbeat", async () => {
     const s = setup();
     s.setChain(9_500);
@@ -279,24 +314,37 @@ describe("MoveSync", () => {
 });
 
 describe("chain clock", () => {
-  it("observes readings, slews small differences, jumps large ones", () => {
+  const W = (anchorMs: number, anchorSlot = 0) => ({ clock: { anchorSlot, anchorMs, msPerSlot: 50, baseMsPerSlot: 50, syncSlot: 0, syncMs: 0 } });
+
+  it("steps forward, slews backward, drops slow readings once calibrated", () => {
     let t = 1_000;
     const c = new ChainClock(() => t);
     expect(c.now()).toBeNull();
-    c.observe(50_000, 990, 1_010);
-    expect(c.now()).toBe(50_000);
+    // Fine anchor: chain = 50 000 + slot · 50; wall agrees (unix 50 s).
+    expect(c.observe({ slot: 0, unixS: 50, t0: 990, t1: 1_010 }, W(50_000))).toBe(true);
+    expect(c.now()).toBe(49_000 + 1_000);
     t = 2_000;
-    c.observe(51_100, 2_000, 2_000); // 100 ms ahead: ¼ applied
-    expect(c.now()).toBe(51_025);
-    c.observe(60_000, 2_000, 2_000);
-    expect(c.now()).toBe(60_000);
+    c.observe({ slot: 22, unixS: 51, t0: 2_000, t1: 2_000 }, W(50_000)); // 100 ms ahead: step
+    expect(c.now()).toBe(51_100);
+    c.observe({ slot: 18, unixS: 51, t0: 2_000, t1: 2_000 }, W(50_000)); // 200 ms behind: slew 25
+    expect(c.now()).toBe(51_075);
+    expect(c.observe({ slot: 40, unixS: 52, t0: 1_000, t1: 2_000 }, W(50_000))).toBe(false); // RTT 1 s
+    expect(c.now()).toBe(51_075);
+    expect(c.stamp()).toBe(51_000);
   });
 
-  it("falls back to wall time when the anchor is stale", () => {
-    const w = { clock: { anchorSlot: 100, anchorMs: 1_000_000, msPerSlot: 50, baseMsPerSlot: 50, syncSlot: 0, syncMs: 0 } };
+  it("uses the validator's wall time (Clock sysvar), not the local clock, when the anchor is stale", () => {
+    const w = W(1_000_000, 100);
     expect(chainEstimate(w, 120, 1_001_000)).toBe(1_001_000);
-    expect(chainEstimate(w, 1_000, 1_045_000)).toBe(1_045_000 - 200); // anchor 45 s old
-    expect(chainEstimate({ clock: { ...w.clock, msPerSlot: 0 } }, 120, 7_000)).toBe(6_800);
+    expect(chainEstimate(w, 1_000, 1_045_000)).toBe(1_045_000 - 300); // anchor 45 s old
+    expect(chainEstimate({ clock: { ...w.clock, msPerSlot: 0 } }, 120, 7_000)).toBe(6_700);
+    expect(chainEstimate(w, 120, null)).toBe(1_001_000);
+    // A local clock 60 s off never enters: the wall offset comes from unix_timestamp.
+    let t = 5_000;
+    const c = new ChainClock(() => t);
+    for (let i = 0; i < 20; i++, t += 1_000) c.observe({ slot: 1_000 + i * 20, unixS: 1_045 + i, t0: t, t1: t }, w);
+    // Last reading at t = 24 000: wall 1 064 500, coarse estimate 300 ms behind; now t = 25 000.
+    expect(c.now()).toBe(1_064_500 - 300 + 1_000);
   });
 });
 
@@ -313,15 +361,43 @@ describe("chooseFrame", () => {
   });
 });
 
+/** Validator + program time model: wall time `T` (ms), slots every 50 ms; the World
+ *  anchor is re-anchored every second (fine) or frozen 60 s in the past (coarse). Mirrors
+ *  `TimeAnchor::read` + `move_player`'s coarse lead shift. */
+function chainModel(coarse: boolean, T0: number) {
+  const slotAt = (T: number) => 1_000 + Math.floor((T - T0) / 50);
+  let anchor = { anchorSlot: slotAt(T0 - 60_000), anchorMs: T0 - 60_000 };
+  return {
+    slotAt,
+    world: () => ({ clock: { ...anchor, msPerSlot: 50, baseMsPerSlot: 50, syncSlot: 0, syncMs: 0 } }),
+    tick(T: number) {
+      if (!coarse) anchor = { anchorSlot: slotAt(T), anchorMs: T0 + (slotAt(T) - 1_000) * 50 };
+    },
+    programMs(T: number) {
+      const wall = Math.floor(T / 1000) * 1000;
+      const est = anchor.anchorMs + (slotAt(T) - anchor.anchorSlot) * 50;
+      if (est - anchor.anchorMs > 10_000 || Math.abs(est - wall) > 10_000) return wall + 750;
+      return est;
+    },
+  };
+}
+
 describe("MoveSync + physics against a simulated chain (core check_move)", () => {
-  it("random play with 40–260 ms round trips: no onchain rejection", async () => {
+  /** 40 s of random play; local clock `skew` ms off the validator; readings every second
+   *  (RTT 20–80 ms; `slowAt`: one reading with a 900 ms RTT and a value from its end). */
+  async function simulate(o: { skew: number; coarse: boolean; slowAt?: number; seconds?: number }) {
     const w = new ChunkWorld();
-    let now = 0; // ms, chain clock = local clock
-    let onchain: Uint8Array = pstate(spawnState(HOME, 0, true));
+    const T0 = 1_791_000_000_000;
+    let T = T0; // validator wall time
+    const perf = () => T + o.skew; // the client's clock: skewed
+    const chain = chainModel(o.coarse, T0);
+    const clock = new ChainClock(perf);
+    // `join_world` stores the (uncorrected) chain reading: coarse = wall seconds.
+    let onchain: Uint8Array = pstate(spawnState(HOME, (o.coarse ? T0 : chain.programMs(T0)) - 1_000, true));
     const phys = new PlayerPhysics(HOME, PARAMS, w.physWorld());
     const pending: { at: number; run: () => void }[] = [];
     let built: Parameters<SyncDeps["moveIx"]>[0] | null = null;
-    let rejected = 0;
+    const rejected: string[] = [];
     let rand = 7;
     const rnd = () => ((rand = (rand * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
     const sender: SyncSender = {
@@ -330,17 +406,17 @@ describe("MoveSync + physics against a simulated chain (core check_move)", () =>
         const m = built!;
         return new Promise<SendResult>((resolve) =>
           pending.push({
-            at: now + 40 + rnd() * 220,
+            at: T + 40 + rnd() * 220,
             run: () => {
               // The "program": check against the onchain state at processing time.
               const prev = onchain.slice(PSTATE_MOVE_OFFSET, PSTATE_MOVE_OFFSET + 72);
               const win = coreMoveWindow(decodeMoveState(prev).pos, m.pos)!;
-              const r = checkMove(params, prev, m.pos, m.vel, m.onGround, m.clientMs, now, w.quad(win[0], win[1]));
+              const r = checkMove(params, prev, m.pos, m.vel, m.onGround, m.clientMs, chain.programMs(T), w.quad(win[0], win[1]));
               if (r.ok) {
                 onchain = pstate(r.state);
                 resolve({ status: "confirmed", sig: "s", ms: 1 });
               } else {
-                rejected++;
+                rejected.push(r.error);
                 resolve({ status: "failed", error: { kind: "snapback", name: r.error, message: r.error } });
               }
             },
@@ -357,15 +433,29 @@ describe("MoveSync + physics against a simulated chain (core check_move)", () =>
       },
       blocks: (cx, cz) => w.chunk(cx, cz),
       fetchState: async () => onchain,
-      clock: { now: () => now },
+      clock,
       snap: (p) => phys.teleport(p),
-      perfNow: () => now,
+      onClockSuspect: () => clock.reset(),
+      perfNow: perf,
+      log: process.env.SYNC_LOG ? (m, d) => console.log(Math.round(T - T0), m, JSON.stringify(d)) : undefined,
     });
     sync.onPlayerState(onchain);
     let yaw = 0;
     let inp = {};
-    for (let f = 1; f <= 60 * 60; f++) {
-      now = (f * 1000) / 60;
+    const frames = 60 * (o.seconds ?? 40);
+    for (let f = 1; f <= frames; f++) {
+      T = T0 + (f * 1000) / 60;
+      chain.tick(T);
+      if (f % 60 === 1) {
+        const k = Math.floor(f / 60);
+        if (k === o.slowAt) {
+          // Request sent 900 ms ago, value read at the end: looks 450 ms ahead.
+          clock.observe({ slot: chain.slotAt(T), unixS: Math.floor(T / 1000), t0: perf() - 900, t1: perf() }, chain.world());
+        } else {
+          const rtt = 20 + rnd() * 60;
+          clock.observe({ slot: chain.slotAt(T - rtt / 2), unixS: Math.floor((T - rtt / 2) / 1000), t0: perf() - rtt, t1: perf() }, chain.world());
+        }
+      }
       if (f % 20 === 1) {
         yaw += (rnd() - 0.5) * 2.5;
         inp = { forward: rnd() < 0.85, left: rnd() < 0.15, jump: rnd() < 0.5, sprint: rnd() < 0.6 };
@@ -375,8 +465,9 @@ describe("MoveSync + physics against a simulated chain (core check_move)", () =>
       phys.yaw = yaw;
       phys.input = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, ...inp };
       phys.update(1 / 60);
-      sync.record({ t: now, ...sampleOf(phys.body), inWater: phys.body.inWater });
-      for (const p of pending.filter((p) => p.at <= now)) {
+      const t = clock.stamp();
+      if (t !== null) sync.record({ t, ...sampleOf(phys.body), inWater: phys.body.inWater });
+      for (const p of pending.filter((p) => p.at <= T)) {
         pending.splice(pending.indexOf(p), 1);
         p.run();
       }
@@ -384,10 +475,29 @@ describe("MoveSync + physics against a simulated chain (core check_move)", () =>
       if (f % 7 === 0) void sync.tick(); // ≈ 8.6 Hz
       await flush();
     }
-    const st = sync.summary();
-    expect(rejected).toBe(0);
-    expect(st.snapbacks).toBe(0);
-    expect(st.localSnapbacks).toBe(0);
+    return { rejected, st: sync.summary(), clock };
+  }
+
+  it("random play with 40–260 ms round trips: no onchain rejection", async () => {
+    const { rejected, st } = await simulate({ skew: 0, coarse: false, seconds: 60 });
+    expect(rejected).toEqual([]);
+    expect(st).toMatchObject({ snapbacks: 0, localSnapbacks: 0, timeSkewHolds: 0 });
     expect(st.confirmed).toBeGreaterThan(200);
+  }, 60_000);
+
+  for (const skew of [60_000, -60_000])
+    for (const coarse of [false, true])
+      it(`client clock ${skew > 0 ? "+" : "−"}60 s, ${coarse ? "stale anchor (coarse chain time)" : "fresh anchor"}: no TimeSkew`, async () => {
+        const { rejected, st } = await simulate({ skew, coarse, seconds: 20 });
+        expect(rejected).toEqual([]);
+        expect(st).toMatchObject({ snapbacks: 0, localSnapbacks: 0, timeSkewHolds: 0 });
+        expect(st.confirmed).toBeGreaterThan(100);
+      }, 60_000);
+
+  it("one slow clock reading is dropped and causes no rejection", async () => {
+    const { rejected, st, clock } = await simulate({ skew: 0, coarse: false, slowAt: 5, seconds: 15 });
+    expect(clock.dropped).toBe(1);
+    expect(rejected).toEqual([]);
+    expect(st).toMatchObject({ snapbacks: 0, localSnapbacks: 0, timeSkewHolds: 0 });
   }, 60_000);
 });

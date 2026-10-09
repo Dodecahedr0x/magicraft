@@ -8,7 +8,7 @@
 // toggles the free-fly camera (the player then stands still) and `__magicraft.player`
 // drives input programmatically (`input({ forward: true }, 2000)`, `look(yaw, pitch)`,
 // `stats()`), for automation where pointer lock is unavailable.
-import type { PublicKey } from "@solana/web3.js";
+import { SYSVAR_CLOCK_PUBKEY, type PublicKey } from "@solana/web3.js";
 import type { PerspectiveCamera } from "three";
 import { decodeWorld, moveIx, pstatePda, scheduleDayCrankIx, type V3, type WorldAccount } from "../chain";
 import type { TxFailure } from "../chain/sender";
@@ -16,7 +16,7 @@ import type { App } from "../state";
 import { blockFlags } from "../wasm";
 import type { WorldHandle } from "../world/world";
 import { EYE, FP, NO_INPUT, PlayerPhysics, sampleOf, type Input, type PhysParams, type World } from "./physics";
-import { chainEstimate, ChainClock, encodeParams, MoveSync } from "./sync";
+import { ChainClock, encodeParams, MoveSync, type ChainReading } from "./sync";
 
 const SENS = 0.0025;
 const PITCH_MAX = 1.55;
@@ -56,6 +56,7 @@ export class PlayerController {
   private drag: { x: number; y: number } | null = null;
   private off: (() => void)[] = [];
   locked = false;
+  private skipMove = false;
 
   constructor(readonly o: ControllerOptions) {
     const on = <K extends keyof DocumentEventMap>(t: EventTarget, type: K, f: (e: DocumentEventMap[K]) => void) => {
@@ -83,7 +84,10 @@ export class PlayerController {
     on(window, "blur", () => this.keys.clear());
     on(document, "pointerlockchange", () => {
       this.locked = document.pointerLockElement === canvas;
+      // Browsers can report a huge movementX/Y in the first event after locking.
+      this.skipMove = this.locked;
     });
+    on(document, "visibilitychange", () => this.keys.clear());
     on(canvas, "pointerdown", (e) => {
       if (e.button !== 0 || o.isFlying?.()) return;
       if (!this.locked) {
@@ -98,7 +102,13 @@ export class PlayerController {
       if (o.isFlying?.()) return;
       let dx = 0;
       let dy = 0;
-      if (this.locked) [dx, dy] = [e.movementX, e.movementY];
+      if (this.locked) {
+        [dx, dy] = [e.movementX, e.movementY];
+        if (this.skipMove || Math.abs(dx) > 400 || Math.abs(dy) > 400) {
+          this.skipMove = false;
+          return;
+        }
+      }
       else if (this.drag) {
         [dx, dy] = [e.clientX - this.drag.x, e.clientY - this.drag.y];
         this.drag = { x: e.clientX, y: e.clientY };
@@ -198,6 +208,7 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
     fetchState: async () => (await er.getAccountInfo(pstate, "confirmed"))?.data ?? null,
     clock,
     snap: (pos: V3) => controller.snap(pos),
+    onClockSuspect: () => clock.reset(),
     onDead: () => {
       controller.frozen = true;
       opts.onDead?.();
@@ -206,14 +217,24 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
     log: (msg, data) => console.info(`[move] ${msg}`, data ?? ""),
   });
 
-  // Chain clock: World anchor (subscription) + ER slot (polled).
+  // Chain clock: World anchor (subscription) + the ER's Clock sysvar (slot + validator
+  // wall time; polled). Fallback: getSlot + getBlockTime. Never local Date.now().
   let stopped = false;
-  const calibrate = async () => {
+  const reading = async (): Promise<ChainReading> => {
     const t0 = performance.now();
+    const info = await er.getAccountInfo(SYSVAR_CLOCK_PUBKEY, "processed").catch(() => null);
+    if (info && info.data.length >= 40) {
+      const v = new DataView(info.data.buffer, info.data.byteOffset, info.data.byteLength);
+      return { slot: Number(v.getBigUint64(0, true)), unixS: Number(v.getBigInt64(32, true)), t0, t1: performance.now() };
+    }
+    const slot = await er.getSlot("processed");
+    const t1 = performance.now();
+    const unixS = await er.getBlockTime(slot).catch(() => null);
+    return { slot, unixS, t0, t1 };
+  };
+  const calibrate = async () => {
     try {
-      const slot = await er.getSlot("processed");
-      const t1 = performance.now();
-      clock.observe(chainEstimate(world, slot, Date.now() - (t1 - t0) / 2), t0, t1);
+      clock.observe(await reading(), world);
     } catch {
       /* next round */
     }
@@ -241,10 +262,10 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
     if (!p) return;
     const b = p.body;
     if (!view.flying) view.setFocus(b.pos[0] / FP, b.pos[1] / FP, b.pos[2] / FP);
-    const now = clock.now();
-    if (now === null) return;
+    const t = clock.stamp(p.acc * 1000);
+    if (t === null) return;
     // Stamp = chain time of the physics state (the accumulator holds unsimulated time).
-    sync.record({ t: now - p.acc * 1000, ...sampleOf(b), inWater: b.inWater });
+    sync.record({ t, ...sampleOf(b), inWater: b.inWater });
   });
 
   const g = globalThis as { __magicraft?: Record<string, unknown> };
