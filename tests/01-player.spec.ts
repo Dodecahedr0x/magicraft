@@ -1,7 +1,7 @@
 // Player creation: init + deposit + delegate in one base-layer tx, then the
 // ER clones the delegated Player.
 import { expect } from "chai";
-import { web3 } from "@anchor-lang/core";
+import { BN, web3 } from "@anchor-lang/core";
 import { DELEGATION_PROGRAM_ID } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { airdrop, baseConn, programFor } from "./helpers/env";
 import {
@@ -47,5 +47,27 @@ describe("player", () => {
     expect(acc.bump).to.equal(bump);
     const baseInfo = await baseConn.getAccountInfo(player, "confirmed");
     expect(info.lamports).to.equal(baseInfo!.lamports);
+  });
+
+  it("rejects deposit on a delegated Player (top-ups use lamportsDelegatedTransferIx)", async () => {
+    const err = await base.methods
+      .deposit(new BN(0.01 * LAMPORTS))
+      .accounts({ authority: authority.publicKey })
+      .rpc()
+      .then(
+        () => null,
+        (e) => e
+      );
+    expect(err, "deposit should fail").to.not.equal(null);
+    // The delegated Player is owned by the delegation program, so Anchor's
+    // Account<Player> owner check fails.
+    expect(err.error?.errorCode?.code, String(err)).to.equal(
+      "AccountOwnedByWrongProgram"
+    );
+    const info = await baseConn.getAccountInfo(player, "confirmed");
+    expect(info!.lamports).to.equal(
+      (await baseConn.getMinimumBalanceForRentExemption(info!.data.length)) +
+        deposit
+    );
   });
 });

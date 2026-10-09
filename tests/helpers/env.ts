@@ -24,6 +24,14 @@ const ER_WS = process.env.EPHEMERAL_WS_ENDPOINT ?? "ws://127.0.0.1:7800";
 const WALLET_PATH =
   process.env.ANCHOR_WALLET ?? `${os.homedir()}/.config/solana/id.json`;
 
+export const VRF_PROGRAM = new web3.PublicKey(
+  "Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz"
+);
+/** DEFAULT_EPHEMERAL_TEST_QUEUE (local ER VRF queue). */
+export const ER_TEST_QUEUE = new web3.PublicKey(
+  "Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT"
+);
+
 export const payer = web3.Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(fs.readFileSync(WALLET_PATH, "utf8")))
 );

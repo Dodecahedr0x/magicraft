@@ -17,12 +17,6 @@ export const LAMPORTS = web3.LAMPORTS_PER_SOL;
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function i32le(n: number): Buffer {
-  const b = Buffer.alloc(4);
-  b.writeInt32LE(n);
-  return b;
-}
-
 /** Wait until the ER has the account (it clones delegated accounts on demand). */
 export async function waitForEr(pk: web3.PublicKey, timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs;

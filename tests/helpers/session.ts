@@ -6,13 +6,6 @@ import { web3 } from "@anchor-lang/core";
 export const GPL_SESSION = new web3.PublicKey(
   "KeyspM2ssCJbqUhQ4k7sveSiY4WjnYsrXkC8oDbwde5"
 );
-export const VRF_PROGRAM = new web3.PublicKey(
-  "Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz"
-);
-/** DEFAULT_EPHEMERAL_TEST_QUEUE (local ER VRF queue). */
-export const ER_TEST_QUEUE = new web3.PublicKey(
-  "Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT"
-);
 
 /** session_keys::SessionError numbers as seen from our program (not in our IDL). */
 export const SESSION_ERRORS: Record<number, string> = {
