@@ -9,7 +9,11 @@ export const WORLD_LEN = 265;
 /** Ephemeral rent: (data_len + 60) * 32 lamports. */
 export const ephemeralRent = (len: number) => (len + 60) * 32;
 
-/** core::physics::WorldParams::default(), with a 60 s day for the tests. */
+/** core::physics::WorldParams::default(), with a 60 s day for the tests, **no
+ *  zombies and a 60 s mob tick**: the chunk tick crank (Task 20) runs in every
+ *  armed chunk, so specs that compare mob slots or exact health stay
+ *  deterministic (mobs step at most once a minute). `15-crank.spec.ts` sets
+ *  its own mob / zombie params. */
 export const PARAMS = {
   walkSpeed: 1101,
   sprintSpeed: 1434,
@@ -20,11 +24,11 @@ export const PARAMS = {
   reach: 1280,
   attackCooldownMs: 600,
   daySecs: 60,
-  mobTickMs: 333,
+  mobTickMs: 60_000,
   fluidTickMs: 250,
   fallDamage: 1,
   hunger: 1,
-  zombieCapPerChunk: 4,
+  zombieCapPerChunk: 0,
   pad: 0,
 };
 export function params(over: Partial<typeof PARAMS> = {}) {

@@ -207,11 +207,20 @@ Design decisions (post-spike):
 Crank types:
 
 - **World day crank** — scheduled at world creation; advances `time_of_day`.
-- **Chunk tick crank** — accounts `[world, chunk, presence, N/S/E/W chunks + presences]` (missing
-  neighbor = self placeholder; `create_chunk` reschedules (replaces) existing neighbors' cranks with
-  the new account list). Each tick: process up to ~32 fluid-queue entries; step mobs; spawn zombies.
-  Runs while fluid work, mobs, or fresh presence exist; otherwise lets iterations expire. Re-armed by
-  edits/moves/spawns.
+- **Chunk tick crank** — `tick_chunk` with accounts `[world, chunk, presence, N/S/E/W chunks,
+  N/S/E/W presences, magic_program]`; a **missing neighbor is a placeholder** (the center chunk /
+  presence again: the ER rejects non-existent accounts listed writable). Which neighbors exist is
+  `ChunkHeader::nbr_mask`, kept by `create_chunk` / `close_chunk` (both take the 4 neighbor slots,
+  writable iff the neighbor exists) and they re-arm every armed neighbor (its list changed); a tick
+  whose list doesn't match the mask re-arms itself. Interval `min(fluid_tick_ms, mob_tick_ms)`,
+  240 iterations per arm; each accepted tick (≥ half an interval since the last): fluid step
+  (budget 16), mobs on the global `mob_tick_ms` period (crossings into neighbor slots, hits into
+  fresh presence entries), one zombie spawn attempt. Idle (no fluid work, no mobs, no fresh
+  presence in the chunk or its neighbors) → the tick **cancels its own task** (CPI from inside the
+  crank works); fluid work or fresh presence → it **renews** its task every 160 ticks; mobs alone
+  → it runs out (≤ 60 s). Armed by populate (animals), moves (watchdog), fluid edits, neighbor
+  fluid pushes (from inside the tick) and the permissionless `arm_chunk`; all stale-gated. Details:
+  `instructions/crank.rs` (module docs).
 
 ### Fluids
 

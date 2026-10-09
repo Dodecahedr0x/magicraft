@@ -303,6 +303,21 @@ Commit `feat(program): block edits, crafting, combat`.
 - Hydra: the SDK marks these Magic-program crank CPIs deprecated in favour of Hydra (not in the local stack). Keep the CPI behind one helper so it can be swapped; re-check before devnet (Task 28).
 - Tests: pour water (place source on a flat area) → after 2 s water spread observed; zombie spawned at night (create world with short `day_length_secs`) near a joined player and `pending_damage` grows; idle chunk crank stops; re-arming twice doesn't double the tick rate; a crank stalled by cancelling it directly is re-armed by the watchdog; closing a chunk cancels its crank.
 
+**Done (Task 20):** code in `instructions/crank.rs` (module docs hold the rules). Deviations:
+missing neighbors are **placeholders** (center chunk / presence) because the ER rejects a tx
+listing a non-existent account writable ("illegally used as writable", checked after execution);
+so `ChunkHeader` gained `nbr_mask` (+ stored `presence_bump`, `nbr_bumps`, `arm_tick`) and
+`create_chunk` / `close_chunk` take the 4 neighbor slots `chunk_n/s/e/w` (each the neighbor PDA,
+writable iff it exists; `create_chunk`'s `neighbor` account is gone, adjacency = any `DONE`
+neighbor slot) and re-arm armed neighbors. Interval `min(fluid, mob)` (250 ms), 240 iterations;
+idle ticks cancel their own task, busy ones renew every 160 ticks (both CPIs from inside the crank
+work, tested); `arm_chunk` (permissionless watchdog) and `debug_cancel_tick` (localnet-only test
+hook) added; `break_block` / `place_block` / `populate_chunk` take `magic_program`. Test params
+default to no zombies and a 60 s mob tick (`helpers/world.ts`) so older specs stay deterministic.
+Measured: tick 5-12k CU (animals, fluid), 12-21k with a zombie and a player (max 44k with a spawn
+attempt), cancel 8k, renew 23-31k (crank tx limit 400k); move that arms ≈ +17k. Details:
+`docs/notes/spikes.md`.
+
 Commit `feat(program): chunk tick crank`.
 
 ### Task 21: End-to-end integration test

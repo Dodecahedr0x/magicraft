@@ -74,7 +74,11 @@ pub fn cancel<'info>(
         .map_err(|_| ProgramError::InvalidInstructionData)?;
     let cpi = Instruction {
         program_id: MAGIC_PROGRAM_ID,
-        accounts: vec![AccountMeta::new(authority.key(), true)],
+        accounts: vec![AccountMeta {
+            pubkey: authority.key(),
+            is_signer: true,
+            is_writable: authority.is_writable,
+        }],
         data,
     };
     invoke_signed(&cpi, std::slice::from_ref(authority), &[signer_seeds])?;

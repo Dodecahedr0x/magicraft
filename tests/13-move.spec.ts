@@ -107,7 +107,7 @@ describe("join + move", () => {
       console.log(`    world ${attempt}: no walkable path, retrying`);
     }
     expect(path, "walkable path found").to.not.equal(undefined);
-    await createAndGrow(a, world, target[0], target[1], chunkPda(world, 0, 0));
+    await createAndGrow(a, world, target[0], target[1]);
     await populate(world, target[0], target[1]);
     existing.add(`${target[0]},${target[1]}`);
     console.log(

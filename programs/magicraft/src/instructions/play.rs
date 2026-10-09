@@ -34,8 +34,8 @@
 //!    update/insert own entry in the new list, pruning ≤ 4 stale entries (refund to the
 //!    mover). `pending_damage` of both entries is applied.
 //! 4. Vitals ([`apply_vitals`]): fall + pending damage, hunger, regeneration, starvation.
-//! 5. Store `MoveState`, current chunk `(cx, cz)`, vitals; `crank::maybe_arm_chunk` (no-op
-//!    until Task 20).
+//! 5. Store `MoveState`, current chunk `(cx, cz)`, vitals; `crank::maybe_arm_chunk` on the
+//!    new chunk (read-only; re-arms its tick crank only if stale, see `crank`).
 //!
 //! The previous chunk is the chunk of `prev.pos` (always a required slot); `PlayerState`
 //! `cx`/`cz` is a cache of the chunk of the stored position.
@@ -442,8 +442,10 @@ pub fn move_player(
         );
     }
 
+    // Watchdog: the mover is fresh presence, i.e. work for the crank (stale-gated).
     maybe_arm_chunk(
         slots[((ncz - cz0) * 2 + (ncx - cx0)) as usize].unwrap(),
+        world,
         t.ms,
     )?;
 

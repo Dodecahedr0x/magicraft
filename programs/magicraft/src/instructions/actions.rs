@@ -93,6 +93,7 @@
 use core::cell::RefMut;
 
 use anchor_lang::prelude::*;
+use ephemeral_rollups_sdk::anchor::MagicProgram;
 use magicraft_core::blocks::{self as blk, Block};
 use magicraft_core::consts::{CHUNK_H, CHUNK_VOL};
 use magicraft_core::coords::block_index;
@@ -361,18 +362,19 @@ fn edit_block(
 
 /// `crank::maybe_arm_chunk` for every chunk whose queue has work (after all borrows of
 /// them are released).
-fn arm_chunks(
-    chunk: &AccountInfo,
-    nbr: [Option<&AccountInfo>; 4],
+fn arm_chunks<'info>(
+    chunk: &AccountInfo<'info>,
+    nbr: [Option<&AccountInfo<'info>>; 4],
     has_work: [bool; 5],
+    world: &Account<'info, World>,
     now: i64,
 ) -> Result<()> {
     if has_work[0] {
-        maybe_arm_chunk(chunk, now)?;
+        maybe_arm_chunk(chunk, world, now)?;
     }
     for (i, ai) in nbr.iter().enumerate() {
         if let (true, Some(ai)) = (has_work[i + 1], ai) {
-            maybe_arm_chunk(ai, now)?;
+            maybe_arm_chunk(ai, world, now)?;
         }
     }
     Ok(())
@@ -480,6 +482,8 @@ pub struct BreakBlock<'info> {
     /// CHECK: optional neighbour `(cx − 1, cz)`.
     #[account(mut)]
     pub chunk_w: Option<UncheckedAccount<'info>>,
+    /// Arms the tick crank of edited chunks with fluid work (stale-gated).
+    pub magic_program: Program<'info, MagicProgram>,
 }
 
 #[derive(Accounts, Session)]
@@ -514,6 +518,8 @@ pub struct PlaceBlock<'info> {
     /// CHECK: optional neighbour `(cx − 1, cz)`.
     #[account(mut)]
     pub chunk_w: Option<UncheckedAccount<'info>>,
+    /// Arms the tick crank of edited chunks with fluid work (stale-gated).
+    pub magic_program: Program<'info, MagicProgram>,
 }
 
 /// Accounts of the actions that only touch the player's own state.
@@ -627,7 +633,7 @@ pub fn break_block(ctx: Context<BreakBlock>, x: i32, y: i32, z: i32) -> Result<(
                 .ok_or(error!(MagicraftError::Unbreakable))?;
             Ok(AIR)
         })?;
-        arm_chunks(&a.chunk, nbr, e.has_work, now)?;
+        arm_chunks(&a.chunk, nbr, e.has_work, &a.world, now)?;
 
         if let Some(b) = Block::from_u8(e.old) {
             if blk::can_harvest(b, tool) {
@@ -709,7 +715,7 @@ pub fn place_block(ctx: Context<PlaceBlock>, x: i32, y: i32, z: i32, slot: u8) -
             }
             Ok(block as u8)
         })?;
-        arm_chunks(&a.chunk, nbr, e.has_work, now)?;
+        arm_chunks(&a.chunk, nbr, e.has_work, &a.world, now)?;
         inv.remove_at(slot as usize, 1)
             .map_err(MagicraftError::from)?;
         inv

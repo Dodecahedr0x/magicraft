@@ -47,6 +47,44 @@ export function presencePda(chunk: web3.PublicKey): web3.PublicKey {
   )[0];
 }
 
+/** Neighbor offsets N, S, E, W (`chunk_n/s/e/w`). */
+export const NBR_OFF: [number, number][] = [
+  [0, -1],
+  [0, 1],
+  [1, 0],
+  [-1, 0],
+];
+
+/** The 4 neighbor slots of create_chunk / close_chunk: each neighbor's chunk
+ *  PDA, writable iff it exists on the ER (the ER rejects a non-existent
+ *  writable account). `over` replaces slots by index (tests). */
+export async function neighborSlots(
+  world: web3.PublicKey,
+  cx: number,
+  cz: number,
+  over: (web3.PublicKey | null)[] = []
+) {
+  const keys = NBR_OFF.map(
+    ([dx, dz], i) => over[i] ?? chunkPda(world, cx + dx, cz + dz)
+  );
+  const infos = await erConn.getMultipleAccountsInfo(keys, "confirmed");
+  return keys.map((pubkey, i) => ({
+    pubkey,
+    writable: !!infos[i] && infos[i]!.owner.equals(programId),
+  }));
+}
+
+/** Sets the writability of the `chunk_n/s/e/w` metas of a built ix. */
+function applySlots(
+  ix: web3.TransactionInstruction,
+  slots: { pubkey: web3.PublicKey; writable: boolean }[]
+) {
+  for (const s of slots)
+    for (const m of ix.keys)
+      if (m.pubkey.equals(s.pubkey)) m.isWritable = s.writable;
+  return ix;
+}
+
 export const computeBudgetIx = (units = 1_400_000) =>
   web3.ComputeBudgetProgram.setComputeUnitLimit({ units });
 
@@ -56,7 +94,8 @@ export async function createChunkIx(
   cx: number,
   cz: number,
   o: {
-    neighbor?: web3.PublicKey | null;
+    /** Replaces neighbor slots (N, S, E, W) by index. */
+    slots?: (web3.PublicKey | null)[];
     /** The player's PlayerState in `world` (creating its current chunk). */
     playerState?: web3.PublicKey | null;
     signer?: web3.PublicKey;
@@ -64,7 +103,8 @@ export async function createChunkIx(
   } = {}
 ) {
   const chunk = chunkPda(world, cx, cz);
-  return p.er.methods
+  const slots = await neighborSlots(world, cx, cz, o.slots);
+  const ix = await p.er.methods
     .createChunk(cx, cz)
     .accountsPartial({
       signer: o.signer ?? p.authority.publicKey,
@@ -73,10 +113,14 @@ export async function createChunkIx(
       world,
       chunk,
       presence: presencePda(chunk),
-      neighbor: o.neighbor ?? null,
+      chunkN: slots[0].pubkey,
+      chunkS: slots[1].pubkey,
+      chunkE: slots[2].pubkey,
+      chunkW: slots[3].pubkey,
       playerState: o.playerState ?? null,
     })
     .instruction();
+  return applySlots(ix, slots);
 }
 
 /** Permissionless: any fee payer; `player` must be the chunk's payer Player. */
@@ -112,7 +156,8 @@ export async function closeChunkIx(
   o: { signer?: web3.PublicKey; sessionToken?: web3.PublicKey | null } = {}
 ) {
   const chunk = chunkPda(world, cx, cz);
-  return p.er.methods
+  const slots = await neighborSlots(world, cx, cz);
+  const ix = await p.er.methods
     .closeChunk(cx, cz)
     .accountsPartial({
       signer: o.signer ?? p.authority.publicKey,
@@ -121,23 +166,28 @@ export async function closeChunkIx(
       world,
       chunk,
       presence: presencePda(chunk),
+      chunkN: slots[0].pubkey,
+      chunkS: slots[1].pubkey,
+      chunkE: slots[2].pubkey,
+      chunkW: slots[3].pubkey,
     })
     .instruction();
+  return applySlots(ix, slots);
 }
 
-/** The client's generation tx 1: ComputeBudget 1.4M + create_chunk + grow_chunk. */
+/** The client's generation tx 1: ComputeBudget 1.4M + create_chunk + grow_chunk
+ *  (the neighbor slots are derived; an existing `DONE` neighbor is the foothold). */
 export async function createAndGrow(
   p: TestPlayer,
   world: web3.PublicKey,
   cx: number,
   cz: number,
-  neighbor: web3.PublicKey | null = null,
   units = 1_400_000
 ): Promise<string> {
   return sendEr(
     [
       computeBudgetIx(units),
-      await createChunkIx(p, world, cx, cz, { neighbor }),
+      await createChunkIx(p, world, cx, cz),
       await growChunkIx(p.player, world, cx, cz),
     ],
     [p.authority]

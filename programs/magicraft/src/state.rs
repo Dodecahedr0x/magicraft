@@ -85,14 +85,18 @@
 //! | 80 | `bump` | u8 |
 //! | 81 | `edited` | u8 (0/1) |
 //! | 82 | `gen_stage` | u8 ([`GEN_CREATED`], [`GEN_STAGE1`], [`GEN_DONE`]) |
-//! | 83 | `crank_armed` | u8 (0/1) |
-//! | 84 | `task_id` | i64 (tick crank id, 0 = never armed) |
-//! | 92 | `last_tick_ms` | i64 |
-//! | 100 | `tick_count` | u64 |
+//! | 83 | `crank_armed` | u8 (0/1: a tick crank should be live; see `instructions::crank`) |
+//! | 84 | `task_id` | i64 (tick crank id `sha256("tick" ‖ chunk)`, set by `create_chunk`) |
+//! | 92 | `last_tick_ms` | i64 (chain ms of the last accepted `tick_chunk` **or arm**) |
+//! | 100 | `tick_count` | u64 (accepted non-idle `tick_chunk`s; diagnostics + renewal) |
 //! | 108 | `biomes` | [u8; 256] (`core::terrain::Biome`, index `lz * 16 + lx`) |
 //! | 364 | `mobs` | [u8; 256] (8 × `core::mobs::Mob`, 32 B each) |
 //! | 620 | `fluid` | [u8; 134] (`core::fluid::FluidQueue` repr(C) layout) |
-//! | 754 | `_reserved` | [u8; 14] |
+//! | 754 | `presence_bump` | u8 (bump of `["presence", chunk]`) |
+//! | 755 | `nbr_bumps` | [u8; 8] (bumps of the N, S, E, W chunk PDAs, then of their presence PDAs; `create_chunk`) |
+//! | 763 | `arm_tick` | u8 (low byte of `tick_count` at the last (re)arm with a write) |
+//! | 764 | `nbr_mask` | u8 (bit `i` set ⇔ neighbor `i` (N, S, E, W) exists; `create_chunk` / `close_chunk`) |
+//! | 765 | `_reserved` | [u8; 3] |
 //! | 768 | blocks | [u8; 16 384] |
 //!
 //! # `ChunkPresence` (ephemeral), PDA `["presence", chunk]`, `48 + 56·n` bytes
@@ -644,7 +648,15 @@ pub struct ChunkHeader {
     pub biomes: [u8; 256],
     pub mobs: [u8; MOB_SLOTS * Mob::SIZE],
     pub fluid: [u8; FluidQueue::SIZE],
-    pub _reserved: [u8; 14],
+    pub presence_bump: u8,
+    /// Bumps of the N, S, E, W neighbor chunk PDAs (`fluid` slot order), then of their
+    /// presence PDAs: the tick crank's account list is derived without bump searches.
+    pub nbr_bumps: [u8; 8],
+    pub arm_tick: u8,
+    /// Bit `i` set ⇔ neighbor `i` (N, S, E, W) exists (any generation stage); the tick
+    /// crank's account list depends on it (missing neighbors are placeholders).
+    pub nbr_mask: u8,
+    pub _reserved: [u8; 3],
 }
 
 const _: () = {
@@ -664,7 +676,11 @@ const _: () = {
     assert!(core::mem::offset_of!(ChunkHeader, biomes) == 108);
     assert!(core::mem::offset_of!(ChunkHeader, mobs) == 364);
     assert!(core::mem::offset_of!(ChunkHeader, fluid) == 620);
-    assert!(core::mem::offset_of!(ChunkHeader, _reserved) == 754);
+    assert!(core::mem::offset_of!(ChunkHeader, presence_bump) == 754);
+    assert!(core::mem::offset_of!(ChunkHeader, nbr_bumps) == 755);
+    assert!(core::mem::offset_of!(ChunkHeader, arm_tick) == 763);
+    assert!(core::mem::offset_of!(ChunkHeader, nbr_mask) == 764);
+    assert!(core::mem::offset_of!(ChunkHeader, _reserved) == 765);
     // The header must fit the creation size; the whole chunk must fit one resize.
     assert!(CHUNK_HEADER_SIZE <= CHUNK_INITIAL_LEN);
     assert!(CHUNK_FULL_LEN - CHUNK_INITIAL_LEN <= 10_240);
@@ -682,7 +698,19 @@ impl ChunkHeader {
     }
 
     pub fn has_mobs(&self) -> bool {
-        (0..MOB_SLOTS).any(|i| !self.mob(i).is_empty())
+        // `kind` is byte 0 of each slot (0 = empty).
+        (0..MOB_SLOTS).any(|i| self.mobs[i * Mob::SIZE] != 0)
+    }
+
+    /// First empty mob slot.
+    pub fn free_mob_slot(&self) -> Option<usize> {
+        (0..MOB_SLOTS).find(|&i| self.mobs[i * Mob::SIZE] == 0)
+    }
+
+    /// `FluidQueue::has_work` straight from the bytes (`len` @131 non-zero or `overflow`
+    /// @132 not clean), without decoding the queue.
+    pub fn fluid_has_work(&self) -> bool {
+        self.fluid[131] != 0 || self.fluid[132] != 0
     }
 
     /// A mob that blocks `close_chunk`: any occupied slot that is not a passive animal

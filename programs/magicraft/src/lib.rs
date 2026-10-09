@@ -172,6 +172,25 @@ pub mod magicraft {
     pub fn tick_day(ctx: Context<TickDay>) -> Result<()> {
         instructions::crank::tick_day(ctx)
     }
+
+    // ----- Chunk tick crank (ER) -----
+
+    /// Crank target: one chunk tick (fluid, mobs, zombie spawn, idle / renewal).
+    /// Permissionless; never fails on recoverable state.
+    pub fn tick_chunk(ctx: Context<TickChunk>) -> Result<()> {
+        instructions::crank::tick_chunk(ctx)
+    }
+
+    /// Re-arms a chunk's tick crank if it has fluid work or mobs and the crank is stale
+    /// (permissionless watchdog; chunk read-only).
+    pub fn arm_chunk(ctx: Context<ArmChunk>) -> Result<()> {
+        instructions::crank::arm_chunk(ctx)
+    }
+
+    /// Test hook (`localnet` builds only): cancels a chunk's tick task, header untouched.
+    pub fn debug_cancel_tick(ctx: Context<DebugCancelTick>) -> Result<()> {
+        instructions::crank::debug_cancel_tick(ctx)
+    }
 }
 
 #[derive(Accounts)]

@@ -768,3 +768,62 @@ Decisions:
 - Observed: the route's digging can remove the block under the world spawn (respawned players
   then fall a little); and a block placed into the spawn would put respawned players in a block
   (they can break their way out — breaking needs no movement).
+
+## 2026-10-09: Chunk tick crank (Task 20, permanent code)
+
+Test: `tests/15-crank.spec.ts` (+ unit tests in `instructions/crank.rs`). Code:
+`instructions/crank.rs` (module docs hold the rules), `chunk.rs` (neighbor slots), helpers
+`tests/helpers/crank.ts`.
+
+Findings (tested on the local ER 0.14.10):
+
+| Question | Answer |
+|---|---|
+| Can a cranked tx list a **non-existent** account writable (e.g. the PDA of a neighbor chunk not created yet)? | **No.** The program runs, then the tx fails with `Account N: <key> was illegally used as writable` / `InvalidWritableAccount` (the ER checks writable accounts after execution; `create_chunk` works only because the account exists at the end of that tx). So a missing neighbor is a **placeholder**: the center chunk (and the center presence) again. Duplicates in an ix are fine. Read-only non-existent accounts are fine. |
+| How is a crank executed? | One tx signed by the validator: a Magic-program ix, then `Crank1111…` (`Executed crank with 1 instructions`) which invokes the scheduled ix at **depth 2** with accounts `[validator, executor, program, ...ix accounts]`; it shows up in `getSignaturesForAddress` of the ix accounts. The tick gets **≈ 400k CU** (`of 399700`). |
+| Does a Magic-program CPI work **inside** a cranked tx? | **Yes**, both: `CancelTask` (idle tick cancels its own task: `Successfully added cancel request`, no further executions) and `ScheduleTask` (busy tick renews its own task; the task kept running past 240 iterations: (0,0) reached `tick_count` 170+ with one renewal at 160). The chunk PDA signs via `invoke_signed` as usual. |
+| Rate | 250 ms interval: 3.8-4.0 accepted ticks/s, unchanged by 2 `arm_chunk` re-arms or by 16 moves in 3 s (stale gate; no CPI in those txs). |
+| Watchdog | `debug_cancel_tick` (localnet-only hook; header untouched) froze `tick_count`; moves did not re-arm until the last tick was > 3 s old, then the next move re-armed (2.85 s after the cancel) and ticks resumed. |
+| Neighbor lists | `create_chunk` / `close_chunk` next to an armed chunk re-armed it (`neighbor i crank re-armed`): its next tick listed the new chunk, and after the close the list no longer did; no failed ticks. |
+
+**Measured CU** (whole magicraft ix):
+
+| Ix | CU |
+|---|---|
+| `tick_chunk`, player present, no mobs / fluid single-hole flow | 6.1k-6.6k / 5.1k-10.0k |
+| `tick_chunk`, animals, nobody near | 5.6k-12.1k |
+| `tick_chunk`, zombies + player (chase, hits) | 12.5k-20.6k, max 43.6k (spawn attempt with the torch scan) |
+| `tick_chunk`, idle → `CancelTask` CPI | 7.8k-8.3k |
+| `tick_chunk`, renewal (`ScheduleTask` CPI, list reused) | 23.0k-31k |
+| `move_player` that arms (first move: + presence grow) | 32.3k-32.5k; border crossing that arms 39.7k |
+| `arm_chunk` (crank alive: no-op) | 3.4k |
+| `create_chunk` alone (8 bump searches for the neighbor bumps) | 39k-50k (was 17.7k-28.2k); + re-arming one neighbor 56k-64k |
+| `close_chunk` (+ re-arm one neighbor, cancel) | 27.9k |
+| `break_block` next to water | 12.3k-13.2k |
+
+The stale check itself costs ≈ 0.45k per move (measured by stubbing it); run-to-run variance of
+`move_player` is several k (random keys), so compare within one run.
+
+Decisions:
+- Interval `min(fluid_tick_ms, mob_tick_ms)`; a tick is accepted only ≥ half an interval after
+  `last_tick_ms` (direct calls can at most double the rate); fluid every accepted tick (when it is
+  the interval), mobs when the global `chain_ms / mob_tick_ms` period advanced (`dt` = periods ×
+  `mob_tick_ms`, ≤ 1 s). 240 iterations per arm, renew every 160 accepted ticks while there is
+  fluid work or fresh presence (center or neighbors); mobs alone let it run out (≤ 60 s); idle
+  cancels. Populate arms chunks with animals; moves arm the mover's chunk (read-only); fluid edits
+  and neighbor fluid pushes (from inside the tick, untested end to end: same CPI path as the
+  renewal) arm the chunks with work; `arm_chunk` is a client watchdog. All gated by
+  `crank_stale` (`crank_armed == 0` or `last_tick_ms` > 3 s old; writable arms set
+  `last_tick_ms = now`).
+- `nbr_mask` + neighbor slots in `create_chunk` / `close_chunk` (each slot = the neighbor PDA,
+  writable iff it exists; the client looks the 4 accounts up). A tick whose list doesn't match the
+  mask (a neighbor created while this chunk's crank was armed read-only and not yet ticked) is a
+  no-op that re-arms itself with the derived list. A neighbor **closed** under such a crank makes
+  its ticks fail (non-existent writable) until the scheduler drops it; the next move re-arms
+  (`crank_armed` is still 0).
+- Tests: `helpers/world.ts` `PARAMS` now default to `zombieCapPerChunk 0` and `mobTickMs 60000`
+  (mobs step ≤ once a minute), so specs comparing mob slots or exact health stay deterministic;
+  14-actions finds its animal by kind nearest to the scouted spot and walks back into reach if it
+  wandered; its water-break check accepts water already flowing in.
+- Not covered: a fluid-heavy tick (the scouted breaks fill one hole; core's estimate for the worst
+  tick is ≤ ~130k, within the 400k crank budget).

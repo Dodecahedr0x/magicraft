@@ -75,6 +75,8 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
   let spawn: V3;
   let hunt: Hunt;
   let plan: Plan;
+  /** Reference terrain of the scouted area (unedited), for re-planning walks. */
+  let terrain: Terrain;
   const existing = new Set<string>();
   const cus = new Map<string, number[]>();
 
@@ -96,10 +98,15 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
   }
 
   /** One distinct ER tx of `ixs` signed by `p`. */
+  let lastSig: string | undefined;
   const act = async (
     ixs: Promise<web3.TransactionInstruction>[],
     p: TestPlayer = a
-  ) => sendEr([uniq(), ...(await Promise.all(ixs))], [p.authority]);
+  ) =>
+    (lastSig = await sendEr(
+      [uniq(), ...(await Promise.all(ixs))],
+      [p.authority]
+    ));
 
   async function blockAt(p: V3): Promise<number> {
     const d = (await chunkData(chunkAt(p)))!;
@@ -172,6 +179,7 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
       plan: Plan;
       spawn: V3;
       walk: number;
+      terrain: Terrain;
     } | null = null;
     for (let attempt = 0; attempt < 30; attempt++) {
       const w = await setupWorld({ player: a });
@@ -205,11 +213,11 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
         p.pathB.length;
       console.log(`    world ${attempt}: fits, ${walk} steps of walking`);
       if (!best || walk < best.walk)
-        best = { tw: w, hunt: h, plan: p, spawn: sp, walk };
+        best = { tw: w, hunt: h, plan: p, spawn: sp, walk, terrain: copy() };
       if (walk <= 90) break;
     }
     expect(best, "a world that fits the route").to.not.equal(null);
-    ({ tw, hunt, plan, spawn } = best!);
+    ({ tw, hunt, plan, spawn, terrain } = best!);
     world = tw.world;
 
     // Chunks touched by the route, plus BFS parents (creation adjacency).
@@ -260,15 +268,7 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
     for (const k of order.filter((k) => need.has(k))) {
       const [cx, cz] = k.split(",").map(Number);
       const par = parent.get(k);
-      await createAndGrow(
-        a,
-        world,
-        cx,
-        cz,
-        par
-          ? chunkPda(world, ...(par.split(",").map(Number) as [number, number]))
-          : null
-      );
+      await createAndGrow(a, world, cx, cz);
       await populate(world, cx, cz);
       if (k === "0,0")
         await sendEr([await setSpawnIx(world)], [web3.Keypair.generate()]);
@@ -304,14 +304,36 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
   it("attack an animal until it dies → meat in the inventory (cooldown enforced)", async () => {
     await walk(a, hunt.pathP);
     const chunk = chunkAt(hunt.animal.pos);
+    // Animals wander: the chunk tick crank steps them (about once a minute with
+    // these params), so take the nearest animal of the kind to the scouted spot.
     const feet = center(...hunt.animal.pos);
     const mobs = chunkMobs((await chunkData(chunk))!);
-    const idx = mobs.findIndex(
-      (m) => m.kind === hunt.animal.kind && m.pos.every((v, i) => v === feet[i])
-    );
+    let idx = -1;
+    let best = 4 * FP;
+    mobs.forEach((m, i) => {
+      const d = Math.hypot(m.pos[0] - feet[0], m.pos[2] - feet[2]);
+      if (m.kind === hunt.animal.kind && d <= best) [idx, best] = [i, d];
+    });
     expect(idx, "mob slot").to.be.at.least(0);
     const hp0 = mobs[idx].hp;
-    await logCu("attack_mob", await act([attackIx(a, world, chunk, idx)]));
+    /** Attacks slot `idx`; if it wandered out of reach, walks back into reach
+     *  (re-planned over the reference terrain) and retries. */
+    const hit = async () => {
+      for (let k = 0; ; k++) {
+        const r = await fails(act([attackIx(a, world, chunk, idx)]));
+        if (!r) return;
+        if (r.code !== "OutOfReach" || k >= 2) throw r;
+        const m = chunkMobs((await chunkData(chunk))!)[idx];
+        const pos = (await state()).move.pos;
+        const h = scoutHunt(terrain, pos.map((v) => Math.floor(v / FP)) as V3, [
+          { kind: m.kind, pos: m.pos.map((v) => Math.floor(v / FP)) as V3 },
+        ]);
+        if (typeof h === "string") throw new Error(`re-approach: ${h}`);
+        await walk(a, h.pathP);
+      }
+    };
+    await hit();
+    await logCu("attack_mob", lastSig!);
     expect(chunkMobs((await chunkData(chunk))!)[idx].hp).to.equal(hp0 - 1);
     const err = await fails(act([attackIx(a, world, chunk, idx)]));
     expect(err?.code, String(err)).to.equal("Cooldown");
@@ -319,7 +341,8 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
     while (chunkMobs((await chunkData(chunk))!)[idx].kind !== 0) {
       expect(hits, "hits").to.be.below(hp0 + 1);
       await waitAttack();
-      await logCu("attack_mob", await act([attackIx(a, world, chunk, idx)]));
+      await hit();
+      await logCu("attack_mob", lastSig!);
       hits++;
     }
     expect(hits, "fist = 1 damage per hit").to.equal(hp0);
@@ -355,12 +378,18 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
       await act([breakIx(a, world, plan.Q)])
     );
     const d = (await chunkData(chunk))!;
-    expect(d[CHUNK_BLOCKS_OFFSET + localIndex(plan.Q)]).to.equal(0);
     expect(chunkHeader(d).edited).to.equal(1);
     const after = fluidQueue(d);
-    expect(after.len, "queue grew").to.be.above(before.len);
-    expect(after.entries).to.include(localIndex(plan.Q));
-    console.log(`    fluid queue ${before.len} → ${after.len}`);
+    // The edit armed the chunk's tick crank, which may already have run (then
+    // the water has started to flow into the hole).
+    const q = d[CHUNK_BLOCKS_OFFSET + localIndex(plan.Q)];
+    if (q === 0) {
+      expect(after.len, "queue grew").to.be.above(before.len);
+      expect(after.entries).to.include(localIndex(plan.Q));
+    } else {
+      expect(q, "water flowed in").to.be.within(23, 30);
+    }
+    console.log(`    fluid queue ${before.len} → ${after.len}; block ${q}`);
   });
 
   it("punching a log → log in the inventory; cooldown and reach enforced", async () => {
