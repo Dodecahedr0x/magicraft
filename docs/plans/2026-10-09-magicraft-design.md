@@ -161,7 +161,14 @@ Rules established by the spikes (`docs/notes/spikes.md`, Tasks 4 and 6):
   **not** prove the task exists (collisions are rejected later, only in the validator log).
 - **Same authority + same id = replace** (interval, iterations and ixs reset). This is the
   reschedule primitive: re-arming or changing a chunk's neighbor list is just another
-  `ScheduleTask`; no cancel needed. Cancelling an unknown id is a no-op.
+  `ScheduleTask`; no cancel needed. Cancelling an unknown id is a no-op. **A replace restarts the
+  timer and executes at once** (Task 16: re-arming every ~500 ms gave ~2 ticks/s on a 1 s crank),
+  so unconditional re-arms let callers drive the tick rate: re-arm ixs are no-ops unless the
+  crank is **stale** (`last_tick` older than `CRANK_STALE_MS` = 3 s, or never ticked and created
+  more than 3 s ago). Changing a chunk's neighbor list is the one deliberate unconditional replace.
+- **`ScheduleTask` accepts a read-only signer at account 0** (Task 16, tested): the authority
+  PDA need not be write-locked to arm its crank (`schedule_day_crank` takes the World read-only;
+  4.9k CU vs 7.3k writable).
 - **Cranked ixs are permissionless.** Executions are signed and fee-paid by the validator; the only
   signer allowed inside a cranked ix is the crank-executor PDA (`["crank-executor", authority]` of
   `Crank1111…`). `tick_day` / `tick_chunk` take no user signer.
@@ -176,9 +183,14 @@ Design decisions (post-spike):
   player's move/edit can re-arm any chunk's crank.
 - **Never-failing ticks + watchdog.** `tick_chunk` / `tick_day` no-op instead of erroring on bad
   state and record `last_tick`. `move_player` (and block edits) re-arm the current chunk's crank
-  when work exists and its `last_tick` has stalled, and re-arm the day crank when
-  `World.last_tick` has stalled. (A cranked ix has a fixed account list, so `tick_day` can't
-  watch chunks.)
+  when work exists and it is stale (same 3 s rule). **The day-crank watchdog is client-driven:**
+  the client sends `schedule_day_crank` when it sees `World.last_tick_ms` stale; `move_player`
+  takes the World **read-only** and never re-arms the day crank (no write lock on the World from
+  movers). (A cranked ix has a fixed account list, so `tick_day` can't watch chunks.)
+- **Unseeded worlds:** `tick_day` only records liveness (`last_tick_ms`, `day_ticks`) while
+  `!seed_set` — no clock re-anchor, `time_of_day` stays 0, so the first day starts at sunrise
+  when the seed lands. `request_seed` can be paid by **any** session-authed delegated Player
+  while `!seed_set` (VRF output is unbiasable, so the payer doesn't matter).
 - **`close_chunk` cancels the chunk's crank** before closing.
 - **`World` ≤ 10 240 bytes**, so it is created in one ix.
 - **`Player.open_chunks`** is for UI warnings only; withdraw is never blocked.
@@ -220,13 +232,13 @@ once). Validity is checked against the ER clock, max 7 days.
 - `init_player` / `deposit` / `delegate_player` / `withdraw` (commit + undelegate) — wallet-signed.
   Top-up is client-side only (`lamportsDelegatedTransferIx`).
 - `create_world(name, nonce, params)` → `request_seed` (VRF inside the ER on `DEFAULT_EPHEMERAL_QUEUE`,
-  `DEFAULT_EPHEMERAL_TEST_QUEUE` locally, `oracle_queue` address-constrained; payer = the creator's
-  delegated `Player` PDA via a manual `invoke_signed` with both the `["identity"]` and Player seeds —
+  `DEFAULT_EPHEMERAL_TEST_QUEUE` locally, `oracle_queue` address-constrained; payer = any
+  session-authed delegated `Player` PDA via a manual `invoke_signed` with both the `["identity"]` and Player seeds —
   not `invoke_signed_vrf`, which signs with the identity only) → `callback_seed` (`#[vrf_callback]`,
   typed seeded `World`, stores the 32-byte seed only if unset; the callback gets ≈ 260k CU, so no
   generation there; fulfilled in ~110 ms locally) → chunk (0,0). `create_world` arms the day crank
-  itself (World PDA = task authority, +~7k CU); `schedule_day_crank` (permissionless, idempotent
-  replace) is the watchdog's re-arm. `request_seed(client_seed)` mixes a client nonce into the caller seed.
+  itself (World PDA = task authority, +~7k CU); `schedule_day_crank` (permissionless, World
+  read-only, no-op unless the crank is stale) is the client-driven watchdog's re-arm. `request_seed(client_seed)` mixes a client nonce into the caller seed.
 - `join_world` — creates `PlayerState` at spawn, health 20, food 20.
 - `move_player(pos, vel, on_ground)` ~8 Hz — speed bound vs elapsed time, AABB collision vs solid
   blocks, fall damage `max(0, fall_start_y − y − 3)` (water cancels), presence update/migration,

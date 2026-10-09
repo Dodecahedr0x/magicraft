@@ -388,6 +388,10 @@ impl TimeAnchor {
     }
 }
 
+/// A crank (day or chunk tick) counts as stalled, and may be re-armed, when its last tick
+/// is older than this, ms (3 ticks at the 1 s day cadence).
+pub const CRANK_STALE_MS: i64 = 3_000;
+
 /// Largest day advance per `tick_day`, ms (see [`World::advance_day`]).
 pub const DAY_MAX_STEP_MS: i64 = STALE_MS;
 
@@ -433,6 +437,34 @@ impl World {
         self.seed = randomness;
         self.seed_set = true;
         Ok(())
+    }
+
+    /// `tick_day`. Seeded world: re-anchors the clock and advances the day. Unseeded
+    /// (VRF pending, nobody can play yet): cheap liveness only — records `last_tick_ms`
+    /// (read-only clock estimate) and `day_ticks`, no re-anchor, `time_of_day_ms` stays 0
+    /// (the first day starts at sunrise once the seed lands).
+    pub fn tick(&mut self, clock: &Clock) {
+        if self.seed_set {
+            let now = self.tick_clock(clock);
+            self.advance_day(now);
+        } else {
+            let now = self.chain_ms_ro(clock).ms;
+            self.last_tick_ms = self.last_tick_ms.max(now);
+            self.day_ticks = self.day_ticks.wrapping_add(1);
+        }
+    }
+
+    /// `schedule_day_crank` re-arms only when this is true (a replace restarts the task's
+    /// timer and executes at once, so unconditional re-arms would let callers drive the tick
+    /// rate): no tick for more than [`CRANK_STALE_MS`], or never ticked and created more
+    /// than that ago (`clock.anchor_ms` is the creation anchor until the first re-anchor).
+    pub fn day_crank_stale(&self, now_ms: i64) -> bool {
+        let since = if self.last_tick_ms == 0 {
+            self.clock.anchor_ms
+        } else {
+            self.last_tick_ms
+        };
+        now_ms.saturating_sub(since) > CRANK_STALE_MS
     }
 
     /// `tick_day`: advances `time_of_day_ms` by the chain time since the last tick (at
@@ -1278,6 +1310,39 @@ mod tests {
             error!(MagicraftError::SeedAlreadySet)
         );
         assert_eq!(w.seed, [7; 32]);
+    }
+
+    #[test]
+    fn day_crank_staleness() {
+        let mut w = test_world();
+        w.clock = TimeAnchor::new(0, 1_000); // anchor_ms = 1_000_500
+        assert!(!w.day_crank_stale(1_000_500 + CRANK_STALE_MS));
+        assert!(w.day_crank_stale(1_000_501 + CRANK_STALE_MS));
+        w.last_tick_ms = 2_000_000;
+        assert!(!w.day_crank_stale(2_000_000 + CRANK_STALE_MS));
+        assert!(w.day_crank_stale(2_000_001 + CRANK_STALE_MS));
+        assert!(!w.day_crank_stale(i64::MIN));
+    }
+
+    #[test]
+    fn unseeded_tick_is_liveness_only() {
+        let mut w = test_world();
+        w.clock = TimeAnchor::new(100, 1_000);
+        let before = w.clock;
+        let clock = Clock {
+            slot: 120,
+            unix_timestamp: 1_001,
+            ..Default::default()
+        };
+        w.tick(&clock);
+        assert_eq!(w.clock, before);
+        assert_eq!(w.time_of_day_ms, 0);
+        assert_eq!(w.day_ticks, 1);
+        assert_eq!(w.last_tick_ms, before.estimate(120));
+        w.seed_set = true;
+        w.tick(&clock);
+        assert_ne!(w.clock, before);
+        assert_eq!(w.day_ticks, 2);
     }
 
     #[test]

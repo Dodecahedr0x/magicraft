@@ -494,7 +494,19 @@ Test: `tests/11-world.spec.ts`. Measured on the local stack (CU of the whole ix)
 
 - VRF seed fulfilled in 79-94 ms after `request_seed`.
 - Re-arming the day crank 3× from 0-lamport strangers: 4 ticks / 4 s before and after (replace, not
-  duplicate). Identical ER txs (same signer, blockhash, data) are rejected as "already processed",
+  duplicate).
+- **Replace restarts the timer and executes at once.** Ungated re-arm every ~500 ms for ~5.5 s on
+  the 1 s day crank: **10 ticks** (one per re-arm; the regular 1 s tick never came due). So
+  unconditional re-arms let any caller drive (or, slower than the interval, merely shift) the
+  tick rate. Fix: `schedule_day_crank` is a no-op unless the crank is stale
+  (`World::day_crank_stale`, `CRANK_STALE_MS` = 3 s); gated spam: 5 ticks in ~5.5 s, no-op re-arm
+  2.2k CU. The same rule applies to chunk-crank re-arms (Task 20).
+- **Read-only signer at `ScheduleTask` account 0 works** (World passed read-only, `AccountMeta`
+  signer, not writable): task replaced and kept ticking; 4.9k CU vs 7.3k with the World writable.
+  `scheduler::schedule` passes the authority's writability through.
+- **Deploy guard:** `pnpm test` leaves a `localnet` build (test VRF queue) in `target/`. For
+  devnet/mainnet use `scripts/build-release.sh` (`pnpm build:release`): plain `anchor build`, then
+  fails unless the IDL's `request_seed.oracle_queue` is `DEFAULT_EPHEMERAL_QUEUE`. Identical ER txs (same signer, blockhash, data) are rejected as "already processed",
   so repeated re-arms from one signer need distinct txs.
 - **VRF queue capacity:** two `request_seed` ixs in one tx, or two concurrent txs, fail the second
   with `AccountDataTooSmall` in the VRF program (`Idx: 9488`): the local test queue arrives full of
@@ -502,4 +514,6 @@ Test: `tests/11-world.spec.ts`. Measured on the local stack (CU of the whole ix)
   `SeedAlreadySet`" path could not be produced end to end locally; it is covered by the unit test
   `state::tests::set_seed_only_once` and the e2e test tolerates the queue rejection. **Production:**
   a full `DEFAULT_EPHEMERAL_QUEUE` makes `request_seed` fail; the client should retry (the world
-  stays usable for re-requests while `seed_set == false`).
+  stays usable for re-requests while `seed_set == false`). Any session-authed delegated Player may
+  pay `request_seed` (VRF output is unbiasable). While `!seed_set`, `tick_day` only records
+  liveness (no re-anchor, `time_of_day` stays 0).

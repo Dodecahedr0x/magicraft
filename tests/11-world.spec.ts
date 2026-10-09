@@ -236,7 +236,8 @@ describe("world", () => {
     expect(err?.code, String(err)).to.equal("SeedAlreadySet");
   });
 
-  it("request_seed by someone else's wallet → Unauthorized", async () => {
+  it("any delegated Player (not only the creator) can pay request_seed", async () => {
+    const w = await newWorld();
     const other = await setupPlayer({ depositSol: 0.01 });
     const ix = await other.er.methods
       .requestSeed([...randomBytes(32)])
@@ -244,11 +245,20 @@ describe("world", () => {
         signer: other.authority.publicKey,
         player: other.player,
         sessionToken: null,
-        world,
+        world: w,
         oracleQueue: ER_TEST_QUEUE,
       })
       .instruction();
-    const err = await fails(sendEr([ix], [other.authority]));
+    await sendEr([ix], [other.authority]);
+    expect(await waitSeed(w), "seed set").to.not.equal(null);
+  });
+
+  it("request_seed with another wallet's Player → Unauthorized", async () => {
+    const w = await newWorld();
+    const rando = web3.Keypair.generate();
+    const err = await fails(
+      sendEr([await requestSeedIx(w, { signer: rando.publicKey })], [rando])
+    );
     expect(err?.code, String(err)).to.equal("Unauthorized");
   });
 
@@ -345,7 +355,7 @@ describe("world", () => {
     console.log(`    tick_day CU: ${await cu(sig)}`);
   });
 
-  it("schedule_day_crank (anyone, same id) replaces the task: tick rate unchanged", async () => {
+  it("schedule_day_crank while the crank is alive is a no-op: tick rate unchanged", async () => {
     const rate = async (ms: number) => {
       const a = (await fetchWorld(world))!.acc.dayTicks;
       await sleep(ms);
@@ -365,7 +375,15 @@ describe("world", () => {
         ],
         [stranger]
       );
-      if (i === 0) console.log(`    schedule_day_crank CU: ${await cu(sig)}`);
+      const tx = await erConn.getTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      expect(tx?.meta?.logMessages?.join("\n")).to.include("not re-armed");
+      if (i === 0)
+        console.log(
+          `    schedule_day_crank (no-op) CU: ${tx?.meta?.computeUnitsConsumed}`
+        );
     }
     await sleep(500);
     const after = await rate(4_000);
@@ -376,6 +394,26 @@ describe("world", () => {
     expect(after).to.be.within(3, 5);
     const acc = (await fetchWorld(world))!.acc;
     expect(BigInt(acc.dayTaskId.toString())).to.equal(dayTaskId(world));
+  });
+
+  it("re-arm spam (every ~500 ms for 5 s) does not starve the day crank", async () => {
+    const a = (await fetchWorld(world))!.acc.dayTicks;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5_000) {
+      await sendEr(
+        [
+          await erProgram.methods
+            .scheduleDayCrank()
+            .accountsPartial({ world })
+            .instruction(),
+        ],
+        [web3.Keypair.generate()]
+      );
+      await sleep(500);
+    }
+    const ticks = (await fetchWorld(world))!.acc.dayTicks - a;
+    console.log(`    ticks during 5 s of re-arm spam: ${ticks}`);
+    expect(ticks).to.be.within(4, 7);
   });
 
   describe("session keys", () => {

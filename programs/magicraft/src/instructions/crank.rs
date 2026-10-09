@@ -44,20 +44,25 @@ pub fn arm_day_crank<'info>(world_ai: &AccountInfo<'info>, world: &World) -> Res
 
 #[derive(Accounts)]
 pub struct ScheduleDayCrank<'info> {
-    /// Task authority (signs the Magic-program CPI with its PDA seeds).
-    #[account(mut)]
+    /// Task authority (signs the Magic-program CPI with its PDA seeds). Read-only.
     pub world: Account<'info, World>,
     pub magic_program: Program<'info, MagicProgram>,
 }
 
-/// (Re)arms the World's day crank. Idempotent: the task id is derived from the World PDA,
-/// so a repeat replaces the task (fresh iteration count) instead of adding a second one.
-/// `create_world` arms it already; this is for the watchdog / clients when `last_tick_ms`
-/// stalls (e.g. the scheduler dropped the task).
+/// Re-arms the World's day crank **only if it looks stalled**
+/// ([`World::day_crank_stale`]); otherwise a no-op. `create_world` arms it; clients send
+/// this when they see `last_tick_ms` stale (e.g. the scheduler dropped the task). The task
+/// id is derived from the World PDA, so a re-arm replaces the task rather than adding one.
+/// The World is read-only here (`ScheduleTask` accepts a read-only signer at account 0),
+/// so a re-arm never write-locks it.
 pub fn schedule_day_crank(ctx: Context<ScheduleDayCrank>) -> Result<()> {
-    let world_ai = ctx.accounts.world.to_account_info();
-    let id = arm_day_crank(&world_ai, &ctx.accounts.world)?;
-    ctx.accounts.world.day_task_id = id;
+    let world = &ctx.accounts.world;
+    let now = world.chain_ms_ro(&Clock::get()?).ms;
+    if !world.day_crank_stale(now) {
+        msg!("day crank alive; not re-armed");
+        return Ok(());
+    }
+    arm_day_crank(&world.to_account_info(), world)?;
     Ok(())
 }
 
@@ -71,12 +76,11 @@ pub struct TickDay<'info> {
     pub world: Account<'info, World>,
 }
 
-/// Re-anchors the chain clock and advances `time_of_day_ms`. Never fails on world state
-/// (a failing crank is dropped by the scheduler after ~26 s).
+/// [`World::tick`]: re-anchors the chain clock and advances `time_of_day_ms` (liveness
+/// only while the seed is pending). Never fails on world state (a failing crank is
+/// dropped by the scheduler after ~26 s).
 pub fn tick_day(ctx: Context<TickDay>) -> Result<()> {
     let clock = Clock::get()?;
-    let world = &mut ctx.accounts.world;
-    let now = world.tick_clock(&clock);
-    world.advance_day(now);
+    ctx.accounts.world.tick(&clock);
     Ok(())
 }

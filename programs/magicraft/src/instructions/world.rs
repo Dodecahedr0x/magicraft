@@ -1,5 +1,5 @@
 //! Worlds: `create_world` (ephemeral World sponsored by the Player, arms the day crank),
-//! `request_seed` (VRF inside the ER, the creator's Player PDA pays), `callback_seed`.
+//! `request_seed` (VRF inside the ER, any delegated Player PDA pays), `callback_seed`.
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke_signed;
@@ -112,17 +112,15 @@ pub fn create_world(
 #[vrf]
 #[derive(Accounts, Session)]
 pub struct RequestSeed<'info> {
-    /// Wallet or session key of the world's creator.
+    /// Wallet or session key of `player`'s authority (any player, not only the creator:
+    /// the VRF output is unbiasable, so who pays does not matter).
     pub signer: Signer<'info>,
-    /// The creator's delegated Player: the VRF payer (signs via its seeds).
+    /// A delegated Player: the VRF payer (signs via its seeds; mut ⇒ delegated on the ER).
     #[account(mut, seeds = [PLAYER_SEED, player.authority.as_ref()], bump = player.bump)]
     pub player: Account<'info, Player>,
     #[session(signer = signer, authority = player.authority.key())]
     pub session_token: Option<Account<'info, SessionTokenV2>>,
-    #[account(
-        constraint = world.creator == player.authority @ MagicraftError::Unauthorized,
-        constraint = !world.seed_set @ MagicraftError::SeedAlreadySet
-    )]
+    #[account(constraint = !world.seed_set @ MagicraftError::SeedAlreadySet)]
     pub world: Account<'info, World>,
     /// CHECK: the ER VRF queue (address-constrained).
     #[account(mut, address = VRF_QUEUE)]
@@ -157,7 +155,7 @@ pub fn request_seed(ctx: Context<RequestSeed>, client_seed: [u8; 32]) -> Result<
     });
     // Not `invoke_signed_vrf`: it signs with the identity seed only, and the payer here is
     // a PDA, so both seed sets are needed.
-    let creator = a.player.authority;
+    let authority = a.player.authority;
     let pbump = [a.player.bump];
     invoke_signed(
         &ix,
@@ -170,7 +168,7 @@ pub fn request_seed(ctx: Context<RequestSeed>, client_seed: [u8; 32]) -> Result<
         ],
         &[
             &[VRF_IDENTITY_SEED, &[ctx.bumps.program_identity]],
-            &player_seeds(&creator, &pbump),
+            &player_seeds(&authority, &pbump),
         ],
     )?;
     Ok(())
