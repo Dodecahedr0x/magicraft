@@ -1,0 +1,7 @@
+# The root package (program tests) + the browser client.
+packages:
+  - app
+onlyBuiltDependencies:
+  - bufferutil
+  - utf-8-validate
+  - esbuild

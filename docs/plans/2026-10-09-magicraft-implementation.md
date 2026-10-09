@@ -364,6 +364,19 @@ and closed after respawn (≥ 1 exact-refund close). Notes: `docs/notes/spikes.m
 - `player.ts`: builders for the onboarding tx (`init_player` + `deposit` + `delegate_player`, see `tests/helpers/player.ts`) and top-up via `lamportsDelegatedTransferIx` from `@magicblock-labs/ephemeral-rollups-sdk` (fresh random 32-byte salt per call).
 - Commit `feat(app): scaffold and chain layer`.
 
+**Done (Task 22):** pnpm workspace (`pnpm-workspace.yaml`: root + `app`, one lockfile); Vite 8.3.1,
+Vitest 5.0.2, TS 5.9.3, three 0.186.1; `vite-plugin-node-polyfills` (Buffer/process/global; the
+MagicBlock SDK uses the global `Buffer`), off under Vitest. IDL + types are committed in
+`app/src/idl/` and refreshed from `target/` by `scripts/sync-idl.mjs` (pre-dev/build/test).
+Cluster addresses come from `VITE_*` env (`chain/config.ts`, defaults = local stack); `idlFor`
+rewrites the program id (and accounts pinned to it) and the VRF queue in the IDL. Modules:
+`chain/{config,connections,program,pdas,layout,session,sender,player,actions,index}.ts`.
+`actions.ts` takes an `Exists` predicate (chunk store) instead of RPC lookups (`fetchExisting`
+for the RPC path). `ErSender`: per-key lanes (one in flight, newest waiting wins), shared status
+poller, error `kind` (snapback / topup / retry / renewSession / notReady / timeout / send).
+Fixture: `app/src/chain/__fixtures__/gen_0_0.bin` (`pnpm -C app fixtures`). Tests in
+`tests/helpers` still have their own copies (CJS ts-mocha vs ESM app); not shared yet.
+
 ### Task 23: Onboarding and world picker UI
 
 **Files:** `app/src/ui/{onboarding,worlds,createWorld,hud}.ts`, `app/src/style.css`.

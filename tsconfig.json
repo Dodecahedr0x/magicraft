@@ -9,5 +9,6 @@
     "resolveJsonModule": true,
     "strict": true,
     "skipLibCheck": true
-  }
+  },
+  "exclude": ["app", "node_modules", "target"]
 }
