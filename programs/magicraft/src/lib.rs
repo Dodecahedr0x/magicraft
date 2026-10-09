@@ -83,6 +83,26 @@ pub mod magicraft {
     pub fn spike_commit(ctx: Context<SpikeCommit>, undelegate: bool) -> Result<()> {
         instructions::spike::spike_commit(ctx, undelegate)
     }
+
+    // ----- TEMPORARY VRF / session spikes (Task 5; remove in Task 6) -----
+
+    pub fn spike_vrf(
+        ctx: Context<SpikeVrf>,
+        cx: i32,
+        cz: i32,
+        caller_seed: [u8; 32],
+        payer_mode: u8,
+    ) -> Result<()> {
+        instructions::spike::spike_vrf(ctx, cx, cz, caller_seed, payer_mode)
+    }
+
+    pub fn spike_vrf_callback(ctx: Context<SpikeVrfCallback>, randomness: [u8; 32]) -> Result<()> {
+        instructions::spike::spike_vrf_callback(ctx, randomness)
+    }
+
+    pub fn spike_session_ping(ctx: Context<SpikeSessionPing>, cx: i32, cz: i32) -> Result<()> {
+        instructions::spike::spike_session_ping(ctx, cx, cz)
+    }
 }
 
 #[derive(Accounts)]

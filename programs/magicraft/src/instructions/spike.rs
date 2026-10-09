@@ -1,4 +1,4 @@
-//! TEMPORARY spike instructions (Tasks 3-4). Remove in Task 6.
+//! TEMPORARY spike instructions (Tasks 3-5). Remove in Task 6.
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::anchor::MagicProgram;
 use ephemeral_rollups_sdk::consts::EPHEMERAL_VAULT_ID;
@@ -151,10 +151,14 @@ const TICK_OFFSET: usize = 0;
 /// (set it with `spike_fill(mode 1, 0xFF)`), to see what a failing crank does.
 pub const TICK_FAIL_MARKER: u8 = 0xFF;
 
-#[error_code]
+// Offset 6100: `session_auth_or` emits session_keys::SessionError, which uses
+// 6000-6003 inside this program, so the default offset would collide.
+#[error_code(offset = 6100)]
 pub enum SpikeError {
     #[msg("spike_tick forced failure")]
     ForcedFailure,
+    #[msg("signer is neither the player authority nor a valid session key")]
+    NotPlayerAuthority,
 }
 
 #[derive(Accounts)]
@@ -292,5 +296,146 @@ pub fn spike_commit(ctx: Context<SpikeCommit>, undelegate: bool) -> Result<()> {
         &a.magic_program.to_account_info(),
         None,
     )?;
+    Ok(())
+}
+
+// ---------- Task 5: VRF + session keys in the ER (TEMPORARY, remove in Task 6) ----------
+
+use anchor_lang::Discriminator;
+use ephemeral_rollups_sdk::anchor::{vrf, vrf_callback};
+use ephemeral_rollups_sdk::vrf::consts::IDENTITY as VRF_IDENTITY_SEED;
+use ephemeral_rollups_sdk::vrf::instructions::{
+    create_request_randomness_ix, RequestRandomnessParams,
+};
+use ephemeral_rollups_sdk::vrf::types::SerializableAccountMeta;
+use session_keys::{session_auth_or, Session, SessionError, SessionTokenV2};
+
+/// Chunk bytes [16, 48) receive the VRF output; bytes [8, 16) are the session
+/// ping counter (u64 LE). Bytes [0, 8) are the Task 4 tick counter.
+pub const VRF_OFFSET: usize = 16;
+pub const PING_OFFSET: usize = 8;
+
+/// Who pays the VRF request.
+pub const VRF_PAYER_WALLET: u8 = 0;
+pub const VRF_PAYER_PLAYER: u8 = 1;
+
+#[vrf]
+#[derive(Accounts)]
+#[instruction(cx: i32, cz: i32)]
+pub struct SpikeVrf<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    /// CHECK: Player PDA of `authority` (optionally the VRF payer, signing via seeds).
+    #[account(mut, seeds = [PLAYER_SEED, authority.key().as_ref()], bump)]
+    pub player: UncheckedAccount<'info>,
+    /// CHECK: ephemeral chunk PDA that the callback writes into.
+    #[account(
+        seeds = [b"chunk", player.key().as_ref(), &cx.to_le_bytes(), &cz.to_le_bytes()],
+        bump
+    )]
+    pub chunk: UncheckedAccount<'info>,
+    /// CHECK: VRF queue; validated by the VRF program (spike: any queue, so the
+    /// test can try both the ER and the base queue).
+    #[account(mut)]
+    pub oracle_queue: UncheckedAccount<'info>,
+}
+
+/// Requests randomness for `chunk`; the callback is `spike_vrf_callback`.
+/// `payer_mode` 0: the authority wallet pays (`invoke_signed_vrf`), 1: the
+/// Player PDA pays (manual `invoke_signed` with both the identity and Player seeds).
+pub fn spike_vrf(
+    ctx: Context<SpikeVrf>,
+    _cx: i32,
+    _cz: i32,
+    caller_seed: [u8; 32],
+    payer_mode: u8,
+) -> Result<()> {
+    let a = &ctx.accounts;
+    let payer = if payer_mode == VRF_PAYER_PLAYER {
+        a.player.to_account_info()
+    } else {
+        a.authority.to_account_info()
+    };
+    let ix = create_request_randomness_ix(RequestRandomnessParams {
+        payer: payer.key(),
+        oracle_queue: a.oracle_queue.key(),
+        callback_program_id: crate::ID,
+        callback_discriminator: crate::instruction::SpikeVrfCallback::DISCRIMINATOR.to_vec(),
+        caller_seed,
+        accounts_metas: Some(vec![SerializableAccountMeta {
+            pubkey: a.chunk.key(),
+            is_signer: false,
+            is_writable: true,
+        }]),
+        ..Default::default()
+    });
+    if payer_mode == VRF_PAYER_PLAYER {
+        let authority = a.authority.key();
+        invoke_signed(
+            &ix,
+            &[
+                payer,
+                a.program_identity.to_account_info(),
+                a.oracle_queue.to_account_info(),
+                a.system_program.to_account_info(),
+                a.slot_hashes.to_account_info(),
+            ],
+            &[
+                &[VRF_IDENTITY_SEED, &[ctx.bumps.program_identity]],
+                &[PLAYER_SEED, authority.as_ref(), &[ctx.bumps.player]],
+            ],
+        )?;
+    } else {
+        a.invoke_signed_vrf(&payer, &ix)?;
+    }
+    Ok(())
+}
+
+#[vrf_callback]
+#[derive(Accounts)]
+pub struct SpikeVrfCallback<'info> {
+    /// CHECK: spike chunk owned by this program.
+    #[account(mut, owner = crate::ID)]
+    pub chunk: UncheckedAccount<'info>,
+}
+
+/// VRF callback: writes the 32 random bytes into the chunk. Only callable with
+/// the scoped VRF identity PDA as signer (`#[vrf_callback]`).
+pub fn spike_vrf_callback(ctx: Context<SpikeVrfCallback>, randomness: [u8; 32]) -> Result<()> {
+    let mut data = ctx.accounts.chunk.try_borrow_mut_data()?;
+    data[VRF_OFFSET..VRF_OFFSET + 32].copy_from_slice(&randomness);
+    msg!("spike_vrf_callback: {:?}", &randomness[..4]);
+    Ok(())
+}
+
+#[derive(Accounts, Session)]
+#[instruction(cx: i32, cz: i32)]
+pub struct SpikeSessionPing<'info> {
+    /// Wallet or session key. Not the fee payer necessarily.
+    pub signer: Signer<'info>,
+    #[account(seeds = [PLAYER_SEED, player.authority.as_ref()], bump = player.bump)]
+    pub player: Account<'info, Player>,
+    #[session(signer = signer, authority = player.authority.key())]
+    pub session_token: Option<Account<'info, SessionTokenV2>>,
+    /// CHECK: ephemeral spike chunk of `player`.
+    #[account(
+        mut,
+        owner = crate::ID,
+        seeds = [b"chunk", player.key().as_ref(), &cx.to_le_bytes(), &cz.to_le_bytes()],
+        bump
+    )]
+    pub chunk: UncheckedAccount<'info>,
+}
+
+/// Increments the ping counter in the chunk, signed by the wallet or a session key.
+#[session_auth_or(
+    ctx.accounts.player.authority == ctx.accounts.signer.key(),
+    SpikeError::NotPlayerAuthority
+)]
+pub fn spike_session_ping(ctx: Context<SpikeSessionPing>, _cx: i32, _cz: i32) -> Result<()> {
+    let mut data = ctx.accounts.chunk.try_borrow_mut_data()?;
+    let c = &mut data[PING_OFFSET..PING_OFFSET + 8];
+    let n = u64::from_le_bytes(c.try_into().unwrap()) + 1;
+    c.copy_from_slice(&n.to_le_bytes());
     Ok(())
 }

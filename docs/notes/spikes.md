@@ -98,16 +98,16 @@ Local ER validator identity: `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`
   after the ER has cloned it, so the script fetches the account on the ER first,
   then starts a second oracle on 7799/7800. Its log shows
   `Processing queue: Sc9MJ...`.
-- **Not yet verified:** a VRF request made inside the ER being fulfilled end to
-  end (the callback landing). Task 4/5 must test this first. If it fails, check
+- **Verified in Task 5 (see below):** a VRF request made inside the ER is fulfilled end to
+  end in ~110 ms. Original note: Task 4/5 must test this first. If it fails, check
   `.localnet/vrf-er.log`, and check whether the oracle needs funds on the ER.
   The docs' sample uses `WEBSOCKET_URL=ws://localhost:8999`, which looks like a
   typo; the base WS is 8900.
 
 ### Session keys
 
-The gpl_session program is executable on both layers. Creating a session token
-locally has not been exercised yet (Task 4/5).
+The gpl_session program is executable on both layers. Session tokens are exercised
+end to end in Task 5 (see below).
 
 ### Node 25 + ts-mocha
 
@@ -323,3 +323,100 @@ the init+delegate tx. Re-check that the global rent PDA is funded on the target 
 - Absolute CU in `01-spike-chunk` was ~3k higher in this run (no-op fill baseline 7.9k vs 4.8k,
   per-byte hash 122.6k vs 119.4k). That matches the run-to-run bump-search variance noted in
   Task 3; deltas between modes are unchanged.
+
+## 2026-10-09: VRF inside the ER + session keys on the ER (Task 5)
+
+Test: `tests/04-spike-vrf-session.spec.ts` (12 tests, all passing in `pnpm test`). Temporary ixs in
+`instructions/spike.rs` (remove in Task 6): `spike_vrf(cx, cz, caller_seed, payer_mode)`,
+`spike_vrf_callback(randomness)`, `spike_session_ping(cx, cz)`. Spike chunk layout: bytes 0..8 tick
+counter (Task 4), 8..16 session ping counter, 16..48 VRF output.
+
+Sources: docs pages `verifiable-randomness-functions-vrfs/how-to-guide/quickstart.md`,
+`.../introduction/technical-details.md`, `tools/session-keys/{integrating-sessions-in-your-program,
+how-do-session-keys-work,security}.md`, `ephemeral-rollups-ers/introduction/fees-and-commit-economics.md`;
+crates `ephemeral-vrf-sdk 0.17.3` (+ `ephemeral-vrf-sdk-vrf-macro`), `session-keys 3.1.1`
+(+ macros); GitHub `magicblock-labs/magicblock-engine-examples` (`roll-dice/anchor/programs/roll-dice-delegated`,
+`session-keys/anchor`) and `magicblock-labs/ephemeral-vrf` (main, 2026-09-18:
+`program/src/{request_randomness,fees}.rs`, `vrf-oracle/src/oracle/processor.rs`, `api/src/error.rs`).
+
+### VRF API as used (0.17.3)
+
+- Request accounts struct: `#[vrf]` above `#[derive(Accounts)]`; it must have an `oracle_queue` field and
+  injects `program_identity` (`["identity"]` PDA of our program), `vrf_program`, `slot_hashes`,
+  `system_program`, plus a generated `invoke_signed_vrf(&payer, &ix)`.
+- Builder: `ephemeral_rollups_sdk::vrf::instructions::create_request_randomness_ix(RequestRandomnessParams { payer,
+  oracle_queue, callback_program_id: crate::ID, callback_discriminator: instruction::X::DISCRIMINATOR.to_vec(),
+  caller_seed, accounts_metas: Some(vec![chunk writable]), .. })`. In 0.17.3 this **is** the scoped request
+  (discriminator 10); `create_request_scoped_randomness_ix`, used by the current examples repo, does not
+  exist in 0.17.3. `invoke_signed_vrf` also rewrites any legacy discriminator to the scoped one.
+- Callback: `#[vrf_callback]` above `#[derive(Accounts)]` injects
+  `#[account(address = scoped_vrf_identity(&crate::ID))] vrf_program_identity: Signer` as the **first**
+  account; then the `accounts_metas` follow. The handler gets `randomness: [u8; 32]` as its first arg
+  (then any `callback_args` bytes).
+
+### VRF findings (evidence: `04-spike-vrf-session.spec.ts` + ER tx inspection)
+
+| Question | Answer |
+|---|---|
+| Does an ER request on `DEFAULT_EPHEMERAL_TEST_QUEUE` get fulfilled locally? (tested) | **Yes.** Callback landed **~110 ms** after the request (3 runs: 109-113 ms; one PDA-payer run 208 ms). No script changes were needed: the second oracle (`vrf-er`, RPC 7799/WS 7800) fulfils it. The earlier "no callback observed" was just never having sent a request. |
+| Does the callback reach an **ephemeral** account? (tested) | **Yes.** 32 non-zero bytes appear at chunk[16..48] of the 16 896-byte ephemeral chunk. |
+| Must the payer be a wallet, or can the delegated Player PDA pay? (tested on ER; base path from source) | **On the ER queue the Player PDA works** (`payer_mode 1`: manual `invoke_signed` with the identity seeds **and** the Player seeds; `invoke_signed_vrf` itself only signs with the identity seed, so it cannot be used for a PDA payer). The VRF program only checks `payer.is_signer()`; ephemeral queues (`DEFAULT_EPHEMERAL_QUEUE`, and the test queue in builds with the `ephemeral-test-queue` feature) are **fee-exempt** (`fees.rs::is_fee_exempt_ephemeral_queue`). Lamport deltas on the ER: wallet 0, Player 0, for both modes. **On a base-layer queue** the program `system_instruction::transfer`s 500 000 lamports (800 000 high priority) from the payer to the queue, which needs a system-owned, data-less payer: a Player PDA (program-owned, with data) could not pay there. |
+| Who pays the fulfilment? (tested) | The oracle identity `paywJ…` is the fee payer of the fulfil tx; ER fee 0. It sets a compute limit of 300 000 (regular) / 400 000 (high priority); the callback CPI saw **~262k CU available** (`consumed 3826 of 261651`), the VRF program itself used ~42k in total. **Do not generate terrain in the callback**; store the seed only. |
+| CU of the request (tested) | `spike_vrf` 34.5k CU total (VRF program 11.8k); the rest is Anchor + PDA bump searches (`#[vrf]`'s `program_identity` seeds, `invoke_signed_vrf`'s runtime `try_find_program_address`). |
+| Forged callback (tested) | Calling `spike_vrf_callback` with a random keypair as `vrf_program_identity` (signed) → `ConstraintAddress` (2012). |
+| Local queue noise (observed) | The dumped test queue `Sc9MJ…` arrives with ~53 stale devnet requests (e.g. callback program `AMwxv…`, not deployed locally). The ER oracle retries them and they fail with VRF error 13 (`OracleMustProvideInDifferentSlot`); ~1 000 failed oracle txs on the queue in the first ~270 slots, then it stopped. Harmless locally (fee 0), but don't use `getSignaturesForAddress(queue)` to find our fulfilment. |
+
+Design implication: the World seed request can be made inside the ER with the **Player PDA (or World
+PDA) as payer**, the callback writes the seed into the ephemeral World account in ~100 ms. No base-layer
+fallback needed. A base-layer request would need a wallet payer and costs 0.0005 SOL.
+
+### Session keys API as used
+
+- `session_keys::{session_auth_or, Session, SessionError, SessionTokenV2}`; `#[derive(Accounts, Session)]`,
+  `#[session(signer = signer, authority = player.authority.key())] session_token: Option<Account<'info, SessionTokenV2>>`,
+  `#[session_auth_or(ctx.accounts.player.authority == ctx.accounts.signer.key(), SpikeError::NotPlayerAuthority)]`.
+  The macro pastes the expression into the handler body, so it must go through `ctx.accounts.…`
+  (`player.authority…` alone does not compile), and `SessionError` must be imported (the macro uses
+  it unqualified for `InvalidToken`).
+- **V2 tokens** (`SessionTokenV2`, seeds `["session_token_v2", target_program, session_signer, authority]`).
+  The derive picks V1/V2 from the field type. We use V2 because the current MagicBlock example does, its
+  rent goes back to the recorded `fee_payer`, and `revoke_session_v2` needs the authority's signature
+  while the token is still active (**V1 `revoke_session` is callable by anyone**). Both are in the
+  local gpl_session dump.
+- Validity: `valid_until` (i64 unix seconds) can be anything up to now + 7 days (`ValidityTooLong`);
+  past values are accepted at creation. Default (None) is now + 1 h. Checked against the **ER's**
+  `Clock` when the ix runs on the ER.
+- Error numbers: `SessionError` is compiled into our program with the default offset (6000
+  `ValidityTooLong`, 6001 `InvalidToken`, 6002 `NoToken`, 6003 `InvalidAuthority`), so our own
+  `#[error_code]` now uses `offset = 6100` (`ForcedFailure` 6100, `NotPlayerAuthority` 6101). Anchor 1.0's
+  IDL build allows only **one** `#[error_code]` enum per program ("Multiple error definitions are not
+  allowed"), and SessionError is not in our IDL; clients must map 6000-6003 themselves.
+- JS client: **no npm dependency added.** `@magicblock-labs/gum-sdk` 3.0.10 pulls `@coral-xyz/anchor`
+  0.30 (we use `@anchor-lang/core` 1.0), axios and graphql. The two gpl_session ixs are hand-built in
+  the test (`createSessionIx`, `revokeSessionIx`: Anchor discriminator `sha256("global:<name>")[..8]`
+  + borsh `Option<bool>`, `Option<i64>`, `Option<u64>`). Account order for `create_session_v2`:
+  token (w), session_signer (w, s), fee_payer (w, s), authority (s), target_program, system_program.
+
+### Session findings (evidence: `04-spike-vrf-session.spec.ts`)
+
+| Question | Answer |
+|---|---|
+| Session key signs a gameplay ix on the ER (tested) | **PASS.** Token created on base (wallet = authority + fee payer, top-up 0.01 SOL, 1 h), session key signs `spike_session_ping` on the ER as signer **and** fee payer; ping counter in the ephemeral chunk increments. |
+| Wallet signs without a token (tested) | **PASS** (fallback expression). |
+| Random keypair, no token (tested) | Rejected: `NotPlayerAuthority` (6101). |
+| Random keypair presenting the real token (tested) | Rejected: `InvalidToken` (6001) (token PDA does not match the signer). |
+| Expired token (tested) | Rejected: `InvalidToken` (6001), both for `valid_until` = now − 60 at creation and for a 4 s token that worked once and failed ~2 s later on the ER (`valid_until` was taken from base `getBlockTime`, which lagged wall clock by ~1 s). |
+| Is the SessionToken (owned by gpl_session, created on base) cloned into the ER? (tested) | **Yes, on demand**, both when first referenced by an ER tx and on `getAccountInfo`. ER copy: owner gpl_session, 144 B, identical data. It is a non-delegated clone, so read-only on the ER (Task 2 rule; not separately tested). |
+| Are base changes to the token followed? (tested) | **Yes.** After `revoke_session_v2` confirmed on base, the very first ER ping (5 ms later) failed with `AccountNotInitialized`: the ER had already dropped the clone. |
+| Must the session signer have lamports on the ER / does the ER charge fees? (tested; fee docs) | **No.** A session key created without top-up (0 lamports, account does not exist on base) was the sole signer and fee payer on the ER and the tx succeeded. A topped-up signer's ER balance is unchanged after txs. Fee docs: "Normal ER transactions cost `0` in the current release". The 0.01 SOL top-up is only needed for base-layer txs signed by the session key; **plan for no top-up** (or a small one) and re-check if ER fees are introduced. |
+| Can tokens be created/revoked while the Player is delegated? (tested) | **Yes.** Tokens do not reference the Player at all (seeds: program, session signer, wallet), so they are plain base-layer txs at any time; all tokens in the test were created and one revoked while the Player was delegated. |
+
+### Decisions
+
+1. World seed: request VRF inside the ER on `DEFAULT_EPHEMERAL_QUEUE` (local: `DEFAULT_EPHEMERAL_TEST_QUEUE`), payer =
+   a delegated PDA via `invoke_signed` with both seed sets; callback (`#[vrf_callback]`) only copies the 32
+   bytes into the World account. Constrain `oracle_queue` to the queue constant in the real ix.
+2. Gameplay auth: `SessionTokenV2` + `#[session_auth_or]`; the client creates the token on base right after
+   (or in the same tx as) Player init/delegation, with `top_up` off or small, and signs ER txs with the session key
+   as fee payer.
+3. Program errors start at 6100 (`#[error_code(offset = 6100)]`) to stay clear of SessionError.
