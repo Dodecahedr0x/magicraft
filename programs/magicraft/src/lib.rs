@@ -35,7 +35,7 @@ pub mod magicraft {
         instructions::player::delegate_player(ctx, validator)
     }
 
-    // ----- TEMPORARY spikes (Task 3; remove in Task 6) -----
+    // ----- TEMPORARY chunk spikes (Task 3; remove in Task 6) -----
 
     pub fn spike_chunk(ctx: Context<SpikeChunk>, cx: i32, cz: i32, len: u32) -> Result<()> {
         instructions::spike::spike_chunk(ctx, cx, cz, len)
@@ -43,6 +43,10 @@ pub mod magicraft {
 
     pub fn spike_resize(ctx: Context<SpikeChunk>, cx: i32, cz: i32, new_len: u32) -> Result<()> {
         instructions::spike::spike_resize(ctx, cx, cz, new_len)
+    }
+
+    pub fn spike_close(ctx: Context<SpikeChunk>, cx: i32, cz: i32) -> Result<()> {
+        instructions::spike::spike_close(ctx, cx, cz)
     }
 
     pub fn spike_fill(
@@ -53,6 +57,31 @@ pub mod magicraft {
         mode: u8,
     ) -> Result<()> {
         instructions::spike::spike_fill(ctx, cx, cz, value, mode)
+    }
+
+    // ----- TEMPORARY crank / economics spikes (Task 4; remove in Task 6) -----
+
+    pub fn spike_tick(ctx: Context<SpikeTick>) -> Result<()> {
+        instructions::spike::spike_tick(ctx)
+    }
+
+    pub fn spike_schedule(
+        ctx: Context<SpikeSchedule>,
+        cx: i32,
+        cz: i32,
+        task_id: i64,
+        interval_ms: i64,
+        iterations: i64,
+    ) -> Result<()> {
+        instructions::spike::spike_schedule(ctx, cx, cz, task_id, interval_ms, iterations)
+    }
+
+    pub fn spike_cancel(ctx: Context<SpikeCancel>, task_id: i64) -> Result<()> {
+        instructions::spike::spike_cancel(ctx, task_id)
+    }
+
+    pub fn spike_commit(ctx: Context<SpikeCommit>, undelegate: bool) -> Result<()> {
+        instructions::spike::spike_commit(ctx, undelegate)
     }
 }
 

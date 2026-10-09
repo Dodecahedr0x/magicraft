@@ -105,10 +105,13 @@ export function parseTxError(logs: string[], err?: unknown): TxError {
   return new TxError(`transaction failed: ${raw}\n${logs.join("\n")}`, logs);
 }
 
-/** Send a transaction on the ER (first signer pays). Throws TxError on failure. */
+/** Send a transaction on the ER (first signer pays). Throws TxError on failure.
+ *  Polls getSignatureStatuses instead of confirmTransaction: some failures
+ *  (e.g. InvalidRealloc) otherwise confirm only at blockhash expiry (~30 s). */
 export async function sendEr(
   txOrIxs: web3.Transaction | web3.TransactionInstruction[],
-  signers: web3.Keypair[]
+  signers: web3.Keypair[],
+  timeoutMs = 30_000
 ): Promise<string> {
   const tx = Array.isArray(txOrIxs)
     ? new web3.Transaction().add(...txOrIxs)
@@ -120,15 +123,27 @@ export async function sendEr(
   const sig = await erConn.sendRawTransaction(tx.serialize(), {
     skipPreflight: true,
   });
-  const res = await erConn.confirmTransaction({ signature: sig, ...bh });
-  if (res.value.err) {
-    const info = await erConn.getTransaction(sig, {
-      commitment: "confirmed",
-      maxSupportedTransactionVersion: 0,
-    });
-    throw parseTxError(info?.meta?.logMessages ?? [], res.value.err);
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const st = (await erConn.getSignatureStatuses([sig])).value[0];
+    if (st?.err) {
+      const info = await erConn.getTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      throw parseTxError(info?.meta?.logMessages ?? [], st.err);
+    }
+    if (
+      st?.confirmationStatus === "confirmed" ||
+      st?.confirmationStatus === "finalized"
+    ) {
+      return sig;
+    }
+    if (Date.now() > deadline) {
+      throw new TxError(`ER tx ${sig} not confirmed in ${timeoutMs} ms`, []);
+    }
+    await new Promise((r) => setTimeout(r, 50));
   }
-  return sig;
 }
 
 /** Poll until `pk` exists on `conn` and satisfies `predicate`. */

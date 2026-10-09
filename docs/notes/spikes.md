@@ -190,10 +190,116 @@ plan for 1.4M or staged generation (`gen_stage`).
    yourself. This also avoids the macro's extra runtime `find_program_address` calls.
 3. Player = sponsor works as `Account<Player>` with `mut, seeds, bump = player.bump, has_one = authority`.
 
-### Open questions
+### Open questions (answered in Task 4 below)
 
 - Top-up path for an already delegated Player: `deposit` needs an undelegated Player. Options are
   commit + undelegate → deposit → re-delegate, or a transfer on the ER side.
 - How ER-side lamport changes (rent moved from the Player into the ephemeral vault) settle to base
   on commit/undelegate. Does the base Player balance drop by the rent, and is closing chunks before
   undelegating required to get it back?
+
+## 2026-10-09: Cranks on ephemeral accounts + Player economics (Task 4)
+
+Tests: `tests/02-spike-crank.spec.ts`, `tests/03-spike-economics.spec.ts` (shared setup in
+`tests/helpers/spike.ts`). Temporary ixs in `instructions/spike.rs` (remove in Task 6):
+`spike_tick`, `spike_schedule(cx, cz, task_id, interval_ms, iterations)`, `spike_cancel(task_id)`,
+`spike_commit(undelegate)`, `spike_close(cx, cz)`. `sendEr` now polls `getSignatureStatuses`, so the
+InvalidRealloc failure from Task 3 is reported in milliseconds instead of ~30 s.
+
+Sources: docs pages `tools/crank/{introduction,implementation}.md`,
+`ephemeral-rollups-ers/introduction/fees-and-commit-economics.md`, quickstart "Top-up delegated
+account"; crates `magicblock-magic-program-api 0.14.10` (`instruction.rs`, `args.rs`, `pda.rs`),
+`ephemeral-rollups-sdk 0.17.3` (`crank/`); validator source at tag `v0.14.10`
+(`programs/magicblock/src/schedule_task/*`, `magicblock-task-scheduler/src/{service,db}.rs`,
+`magicblock-config/src/config/scheduler.rs`).
+
+### API (what we call)
+
+- `magicblock_magic_program_api::instruction::MagicBlockInstruction::ScheduleTask(
+  magicblock_magic_program_api::args::ScheduleTaskArgs { task_id: i64, execution_interval_millis: i64,
+  iterations: i64, instructions: Vec<Instruction> })`, bincode-serialized, CPI to `MAGIC_PROGRAM_ID`.
+  Accounts: `[payer (writable, signer), ...accounts the task uses]`. In 0.14.10 only account 0 is read
+  (the api doc comment's "task context account" is stale; the validator never looks at it).
+- `MagicBlockInstruction::CancelTask { task_id }`, accounts `[task authority (signer)]`.
+- The `Instruction` in `ScheduleTaskArgs` is the solana-program 3.x type and is identical to
+  `anchor_lang::solana_program::instruction::Instruction`; no conversion needed. We use the 0.14
+  api crate directly and did **not** enable the SDK's `crank` feature: it brings `hydra-api`
+  (the SDK marks the Magic-program `ScheduleCrankCpi`/`CancelCrankCpi` deprecated in favour of
+  `crank::hydra::*`), but the Hydra program (`Hydra17i1...`) is not in the local stack's dumps, so
+  it cannot be tested locally. The Magic-program path works on ER 0.14.10. **Re-check Hydra before
+  devnet/mainnet.**
+
+### Findings (evidence: `02-spike-crank.spec.ts`)
+
+| Question | Answer |
+|---|---|
+| Can a crank target an ix on an **ephemeral** account? | **Yes.** `spike_tick` on the 16 896-byte ephemeral chunk: 100 ms × 10 → counter = 10 after ~915 ms, still 10 one second later. |
+| Can the payer be a PDA? | **Yes.** The delegated Player PDA signs the ScheduleTask/CancelTask CPI via `invoke_signed` with its seeds. The validator only checks that account 0 is a signer. The PDA becomes the task **authority** (only it can cancel/replace). |
+| Who pays, how much? | **Nobody, currently.** Player and wallet ER lamport deltas are 0 for scheduling and for all 10 executions. The scheduler sends each execution as a tx **signed and fee-paid by the validator identity** (`ExecuteCrank` + noop), and ER txs cost 0 in this release. No crank price is in the fee docs. |
+| Signers inside a cranked ix | Only the crank-signer PDA `find_program_address(["crank-executor", authority], Crank1111...)` may be marked signer (and not writable); the validator authority may not appear. So tick ixs must be **permissionless** or verify that crank PDA as signer. |
+| `task_id` scope | **Global per validator** (SQLite primary key, not per payer). Another authority scheduling the same live id: the tx **succeeds** (`Scheduled task request` is logged in-tx), but the service rejects it later (`UnauthorizedReplacing`, ER log only). Its cancel is ignored too (`Task authority ... does not match`). Test: A's replacement never ran (0 ticks); B kept ticking (10 per second). **Derive ids that cannot collide** (e.g. from a hash of the chunk PDA) and never trust that a schedule tx means the task exists. |
+| Re-schedule with the same id (same authority) | **Replaces** the task (`INSERT OR REPLACE`; iterations/interval/ixs reset, queue entry replaced). 100 ms × 1000 then rescheduled × 2 → exactly 2 more ticks. This is the "reschedule" primitive for chunk ticks. |
+| Cancel | Works: 100 ms × 1000, cancel after 500 ms → 0 further ticks. Cancelling an unknown id is a silent no-op. |
+| Target ix fails | The ER RPC rejects the crank tx (`-32003 transaction verification error`; the failed attempts are still recorded: 5 failed sigs on the chunk in 3 s). The scheduler **retries without consuming an iteration**, with backoff 100, 200, 400 … ms capped at 5 s. If the ix works again within the window the task resumes and **catches up** missed ticks (fixed-rate cadence: 90 ticks in 6 s after a 3 s outage at 100 ms). After 10 retries (~26 s of continuous failure) the task is **dropped** (moved to `failed_tasks`): 0 ticks after a 35 s outage even once the ix worked again. Retries/drops are only visible at `RUST_LOG=magicblock_task_scheduler=debug`. |
+| Limits | `iterations >= 1` (i64, no max); `0 < interval < u32::MAX` ms, then clamped up to the validator's `[task-scheduler] min-interval` (default **10 ms**); `instructions` non-empty; privileged Magic ixs rejected. Tasks persist in SQLite across validator restarts. |
+| CU | `spike_schedule` (1 tick ix) 12.6k CU incl. Anchor + bincode; `spike_cancel` 4.5k. |
+
+Design consequences: tick handlers take no user signer (or check the crank PDA of World/Player);
+store the task id in the chunk/world account; on neighbour appearance just call ScheduleTask
+again with the same id (replace), no cancel needed; long-running ticks need to tolerate (or avoid)
+failure, because ~26 s of failures kills the task silently; a watchdog (e.g. the world day crank
+or the client) should re-schedule ticks whose `last_tick` stalls.
+
+### Economics (evidence: `03-spike-economics.spec.ts`; Player delegated with 0.05 SOL)
+
+**Settlement is delta-based.** A commit applies the Player's ER-side lamport change *since the
+last sync* (delegation or previous commit) to its base balance; it does not overwrite base with the
+ER balance.
+
+| Step | ER Player | base Player |
+|---|---|---|
+| delegated | 51 621 680 | 51 621 680 |
+| (ii) plain base `SystemProgram.transfer` 0.01 SOL to the delegated PDA | unchanged (ER never sees it) | +10 000 000 |
+| (iii) `lamportsDelegatedTransferIx` 0.02 SOL (one **base** tx) | +20 000 000 after 50-100 ms | unchanged |
+| create 2 chunks (rent → ephemeral vault) | −1 085 184 (2 × 542 592) | unchanged |
+| `commit` | 70 536 496 | 61 621 680 → 80 536 496 (Δ = ER Δ = +18 914 816; the top-up's lamports PDA on base 20 890 880 → 0) |
+| close chunk 0 (refund), then `commit_and_undelegate` | +542 592 | +542 592; owner = magicraft again |
+| chunk 1 (still open) after undelegation | stays on the ER (16 896 B, 0 lamports); `spike_close` fails `InvalidWritableAccount` (sponsor not delegated) | — |
+| (i) `deposit` 0.01 + `delegate_player` (one base tx) | re-cloned with the base balance | +10 000 000 |
+| close the stranded chunk 1 | +542 592 | (settles on next commit) |
+
+Answers:
+
+- **(b) Settlement:** yes, the base balance drops by the rent spent on the ER, at the first
+  commit (not only at undelegation). Closing a chunk refunds the rent on the ER and the next commit
+  carries the refund to base. An open chunk **survives** its sponsor's undelegation, and its rent is
+  stranded until the Player is delegated again (then closing works and refunds). So: close (or
+  account for) chunks before undelegating a Player, or re-delegate to reclaim. Note base also keeps
+  lamports that only exist on base (the plain transfer was not overwritten).
+- **(a)(ii) Plain base transfer to the delegated PDA:** allowed and kept on base across commits,
+  but the ER never sees it, so it cannot fund ER rent. **Not a top-up path.**
+- **(a)(i) Undelegate → deposit → re-delegate:** works (deposit + delegate in one base tx; the
+  ER re-clones with the new balance in < 1 s). Costs a commit+undelegate round trip, a new
+  delegation session (3 000 000-lamport session charge per the fee docs, taken from the delegation
+  deposit at undelegation), and the Player is unusable on the ER meanwhile.
+- **(a)(iii) `lamportsDelegatedTransferIx`** (`@magicblock-labs/ephemeral-rollups-sdk`, e-SPL
+  program `SPLxh1...`): one base tx signed by any wallet; the ER credits the delegated Player in
+  ~50-100 ms with **no undelegation**. Cost to the wallet: amount + 300 000 setup charge + base tx
+  fee (5 000). It needs a fresh 32-byte salt per call. The e-SPL global rent PDA (`4RvdEG...`,
+  seeds `["rent"]`) sponsors the single-use lamports PDA's delegation (its balance fell by a net
+  6 764 400 lamports for one top-up locally). It is pre-funded on MagicBlock clusters; locally the test funds it with 1 SOL. On commit,
+  the lamports PDA's balance moves into the Player on base.
+
+**Recommendation: (iii) `lamportsDelegatedTransferIx`** as the top-up path (cheapest, no
+downtime, works for a delegated PDA, any wallet can pay). Keep `deposit` for the initial funding in
+the init+delegate tx. Re-check that the global rent PDA is funded on the target cluster.
+
+### Other notes
+
+- `commit` needs no extra account besides `magic_context`/`magic_program` (SDK
+  `ephem::commit_accounts` / `commit_and_undelegate_accounts`, re-exported from the deprecated v0
+  module; the newer API is `MagicIntentBundleBuilder`). The first commit to land on base took about
+  8 s in one run and < 0.5 s in the next.
+- Absolute CU in `01-spike-chunk` was ~3k higher in this run (no-op fill baseline 7.9k vs 4.8k,
+  per-byte hash 122.6k vs 119.4k). That matches the run-to-run bump-search variance noted in
+  Task 3; deltas between modes are unchanged.

@@ -103,8 +103,8 @@ describe("spike: ephemeral chunk sponsored by Player", () => {
       .spikeChunk(0, 0, CHUNK_LEN)
       .accounts({ authority: authority.publicKey })
       .instruction();
-    // Slow (~30 s): the ER confirms this InvalidRealloc failure only once the
-    // blockhash expires (see docs/notes/spikes.md).
+    // confirmTransaction reported this InvalidRealloc failure only at blockhash
+    // expiry (~30 s); sendEr now polls getSignatureStatuses and sees it at once.
     const err = await sendEr([ix], [authority]).then(
       () => null,
       (e: TxError) => e
