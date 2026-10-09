@@ -35,6 +35,46 @@ pub mod magicraft {
     pub fn delegate_player(ctx: Context<DelegatePlayer>, validator: Option<Pubkey>) -> Result<()> {
         instructions::player::delegate_player(ctx, validator)
     }
+
+    // ----- TEMPORARY crank-authority spike -----
+
+    pub fn spike_chunk(ctx: Context<SpikeChunk>, cx: i32, cz: i32) -> Result<()> {
+        instructions::spike::spike_chunk(ctx, cx, cz)
+    }
+
+    pub fn spike_tick(ctx: Context<SpikeTick>) -> Result<()> {
+        instructions::spike::spike_tick(ctx)
+    }
+
+    pub fn spike_chunk_schedule(
+        ctx: Context<SpikeChunkTask>,
+        owner: Pubkey,
+        cx: i32,
+        cz: i32,
+        task_id: i64,
+        interval_ms: i64,
+        iterations: i64,
+    ) -> Result<()> {
+        instructions::spike::spike_chunk_schedule(
+            ctx,
+            owner,
+            cx,
+            cz,
+            task_id,
+            interval_ms,
+            iterations,
+        )
+    }
+
+    pub fn spike_chunk_cancel(
+        ctx: Context<SpikeChunkTask>,
+        owner: Pubkey,
+        cx: i32,
+        cz: i32,
+        task_id: i64,
+    ) -> Result<()> {
+        instructions::spike::spike_chunk_cancel(ctx, owner, cx, cz, task_id)
+    }
 }
 
 #[derive(Accounts)]
