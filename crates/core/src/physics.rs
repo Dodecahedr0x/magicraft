@@ -8,16 +8,30 @@
 //!
 //! # Units
 //! Positions are FP (`FP` = 256 units per block), `pos` = feet center. Speeds are FP/s,
-//! gravity FP/s², times are milliseconds (the caller must pass **millisecond** onchain
-//! time, e.g. derived from the slot; `Clock::unix_timestamp` is whole seconds).
+//! gravity FP/s², times are milliseconds.
+//!
+//! # Time model
+//! Each update carries the client's timestamp `client_ms` (on the chain's clock — the
+//! client keeps an offset estimate from accepted updates / RPC). The program passes its
+//! own estimate `chain_ms`. Speed allowances use client time, so network jitter and
+//! bunched tx arrival don't matter; the chain clock only bounds how far the client may
+//! drift: `prev.last_ms < client_ms ≤ chain_ms + LEAD_MS (250)` and
+//! `client_ms ≥ chain_ms − LAG_MS (2000)`, else [`MoveError::TimeSkew`]. A client
+//! claiming time faster than real gains at most `LEAD_MS + LAG_MS` of extra travel once,
+//! then is rejected. `dt = client_ms − prev.last_ms`, capped at [`MAX_DT_MS`] = 2 s.
+//!
+//! Recommended `chain_ms` source (implemented by the program, not here):
+//! `Clock::unix_timestamp` has 1 s resolution, so the `World` account stores
+//! `anchor_slot`, `anchor_ms`, `ms_per_slot` (default 50) and estimates
+//! `chain_ms = anchor_ms + (slot − anchor_slot) · ms_per_slot`; when that estimate drifts
+//! more than 2 s from `unix_timestamp · 1000` it re-anchors to
+//! (`slot`, `unix_timestamp · 1000`).
 //!
 //! # Rules (in check order) and tolerances
 //! 0. Params must [`WorldParams::validate`]; `prev`/new coordinates must be within
 //!    [`XZ_LIMIT`] / [`Y_MIN`]..=[`Y_MAX`]; reported velocity components within 2× the
 //!    largest relevant param speed. Otherwise [`MoveError::InvalidState`].
-//! 1. `dt = now − prev.last_ms`, `now < last` counts as `dt = 0` (and `last_ms` never moves
-//!    backwards); `dt` is capped at [`MAX_DT_MS`] = 2 s, so a long gap grants at most 2 s
-//!    of travel.
+//! 1. Time as above → `TimeSkew`.
 //! 2. Horizontal: `|Δxz| ≤ speed·dt·5/4 + 0.25 block` (squared, `i64`, no sqrt) where
 //!    `speed` = `swim_speed` if both the previous and the new position are in water, else
 //!    `sprint_speed`. → [`MoveError::MoveTooFast`].
@@ -33,51 +47,65 @@
 //!    solid block whose top is within [`GROUND_EPS`] (0.05 block) below the feet (or
 //!    [`FEET_EPS`] above) **and** a non-solid block on top of it (a real surface, so
 //!    pressing against a wall is not ground) → [`MoveError::NotOnGround`].
-//! 6. Airborne ceiling (no flying): if the new position is neither on ground nor in water,
-//!    `y ≤ support_y + rise(t) + 0.25 block`, where `support_y`/`support_ms` are the y and
-//!    time of the last update that was on ground or in water, `t = now − support_ms −`
-//!    [`AIR_SLACK_MS`], and `rise(t)` is the highest point of a jump at time `t`: `H` up to
-//!    the apex, then `H` minus the ballistic fall (gravity, capped at `max_fall_speed`).
-//!    → `Flying`.
-//! 7. Swept path (cheap anti-wall-phase): an L-shaped path is checked — vertical at the
-//!    old xz up to `top = max(y_old, y_new)`, horizontal at `top`, vertical down at the new
-//!    xz. Vertical legs are one tall box (exact); the horizontal leg samples the box every
-//!    ≤ [`SAMPLE_STEP`] (0.5 block, per axis) — at most [`MAX_SAMPLES`] samples. If the
-//!    box at the *old* position is already obstructed (a block was placed into the
-//!    player), the sweep is skipped so the player can step out. → `Collision`.
-//! 8. Outcome: `in_water` = the feet or head voxel (at the xz center) is water. Fall
-//!    damage on a grounded update: `max(0, fall_start_y − y − 3 blocks)` in whole blocks
-//!    (floor), 0 if in water or `params.fall_damage == 0`, capped at 255. `fall_start_y` =
-//!    highest y since the last on-ground / in-water update.
+//! 6. Airborne (neither on ground nor in water at the new position):
+//!    - *Support refresh*: if `prev` was on ground / in water, lift-off happened no
+//!      later than now, so the support becomes (`prev.y`, `client_ms`) — idle, then jump
+//!      works however long the idle gap.
+//!    - *Implicit ground*: the highest surface (solid top with non-solid above) under the
+//!      footprint of the previous or new position, within `H + 0.25 block` below it. If
+//!      one exists and `y ≤ ground + H + 0.25 block`, the player may have landed and
+//!      jumped between updates: accepted, the support restarts at (ground, `client_ms`)
+//!      and this counts as a landing for fall damage (below).
+//!    - Otherwise the ballistic ceiling applies: `y ≤ support_y + rise(t) + 0.25 block`,
+//!      `t = client_ms − support_ms −` [`AIR_SLACK_MS`] (0.1 s), `rise(t)` = `H` up to the
+//!      apex, then `H` minus the fall under gravity capped at `max_fall_speed`. → `Flying`.
+//! 7. Swept path (cheap anti-wall-phase): an L-shaped path must be free, in either order —
+//!    vertical at the old xz to `max(y_old, y_new)`, horizontal, vertical at the new xz;
+//!    or the same via `min(y_old, y_new)` (up-then-across or across-then-up). Vertical
+//!    legs are one tall box (exact); horizontal legs sample the box every ≤
+//!    [`SAMPLE_STEP`] (0.5 block, per axis), at most [`MAX_SAMPLES`] samples. If the box at
+//!    the *old* position is already obstructed (a block was placed into the player), the
+//!    sweep is skipped so the player can step out. → `Collision`.
+//! 8. Outcome: `in_water` = the feet or head voxel (at the xz center) is water (any water
+//!    byte, flowing levels included — puddles count). Fall damage on an explicit landing
+//!    (`on_ground`, not in water) at `y`, or an implicit one at the ground height:
+//!    `max(0, fall_start_y − land_y − 3 blocks)` in whole blocks (floor), 0 if
+//!    `params.fall_damage == 0`, capped at 255. `fall_start_y` = highest y since the last
+//!    explicit/implicit support (reset by water).
 //!
 //! # What is caught / not caught
-//! Caught: speed hacks (> 1.25× sprint + 0.25 block per update), teleports, walking into
-//! or through full-block walls/floors/ceilings, claiming ground in mid-air (incl. wall
-//! hugging), flying/hovering (after `t_apex + 0.5 s` the ceiling falls ballistically),
-//! climbing faster than repeated jumps allow, fall-damage avoidance by never landing (the
-//! ceiling eventually forces the player down to the ground, and the first grounded update
-//! pays the damage from the remembered `fall_start_y`).
-//! Not caught: ~25 % speed boost (+0.25 block per update, ≈ +2 b/s at 8 Hz); up to
-//! `t_apex + 0.5 s` (≈ 0.78 s) of hover per jump; slightly higher jumps (+0.25 block);
-//! clipping a corner diagonally between horizontal samples; sweeping through a block
-//! when params make the horizontal leg longer than `MAX_SAMPLES × 0.5` blocks (never with
-//! default params); passing a block placed *into* the player; no air-control limits
-//! (a player may change direction mid-air); reported velocity is only loosely bounded.
+//! Caught: speed hacks (> 1.25× sprint + 0.25 block per update), teleports, clock
+//! speed-up beyond `LEAD_MS + LAG_MS`, walking into or through full-block walls / floors /
+//! ceilings, claiming ground in mid-air (incl. wall hugging), flying or hovering over gaps
+//! (more than `H + 0.25` above any surface, after the jump arc), climbing faster than
+//! repeated jumps allow, fall-damage avoidance (coming within a jump height of a surface
+//! is an implicit landing that pays the damage).
+//! Not caught: ~25 % speed boost (+0.25 block per update, ≈ +2 b/s at 8 Hz); one-off
+//! ≤ 2.25 s of extra travel from clock skew; **hovering indefinitely up to `H + 0.25`
+//! (1.5 blocks) above a surface** (indistinguishable from bunny-hopping between 8 Hz
+//! updates), which also lets a player cross gaps a little wider than a jump; jumps
+//! 0.25 block higher; clipping a corner diagonally between horizontal samples; sweeping
+//! through a block when params make a horizontal leg longer than `MAX_SAMPLES × 0.5`
+//! blocks (never with default params); passing a block placed *into* the player; no
+//! air-control limits; reported velocity only loosely bounded.
 //!
 //! # Client parity requirements
-//! - Horizontal speed ≤ `sprint_speed` (≤ `swim_speed` while in water by the rule above:
-//!   feet voxel at `y + FEET_EPS` or head voxel at `y + BODY_H − 1` is water); no water
-//!   currents/knockback that would exceed it.
-//! - Jump: `vy = jump_velocity` only from ground; gravity `gravity`, fall capped at
-//!   `max_fall_speed`; clamp frame dt (≤ 50 ms). No auto step-up without a jump.
+//! - Horizontal speed ≤ `sprint_speed`; ≤ `swim_speed` when both the previous sent and
+//!   the current position are in water (feet voxel at `y + FEET_EPS` or head voxel at
+//!   `y + BODY_H − 1` is any water byte — flowing water / puddles count as water). No
+//!   water currents.
+//! - Jump: `vy = jump_velocity` from ground, and also while the feet are in water
+//!   (water-jump / swim up); gravity `gravity`, fall capped at `max_fall_speed`; clamp
+//!   frame dt (≤ 50 ms). No auto step-up without a jump.
+//! - Knockback: not yet allowed. Planned: hits grant an impulse allowance
+//!   (`bonus_dist` FP until `bonus_until_ms`, reserved bytes in [`MoveState`]); until
+//!   then knockback must fit within the tolerances above.
 //! - Box 0.6 × 1.8 × 0.6; snap y exactly to the block top on landing; send FP positions
 //!   rounded to nearest.
-//! - Send updates at ≥ 8 Hz **plus one in every frame `on_ground` changes** (landing and
-//!   lift-off). The airborne ceiling is measured from the last *reported* support, so a
-//!   bunny-hopping client (grounded for one frame per hop) that only sends at 8 Hz gets
-//!   `Flying` within a few hops (test `simulated_bunny_hop_accepted`). Long gaps
-//!   (> ~0.5 s) can be rejected (hop over an obstacle inside one update, multi-jump
-//!   climbs); on any rejection the client snaps back to the last accepted state.
+//! - Send at 8 Hz (no extra sends needed on landing / lift-off; dropped updates are
+//!   fine); timestamps on the chain clock within `−2 s .. +0.25 s` of it; on any rejection
+//!   snap back to the last accepted state. Long gaps (> ~0.5 s) can still be rejected
+//!   (e.g. a hop over an obstacle inside one update).
 //! - `on_ground` true only when resting on a block top.
 //!
 //! # Block access
@@ -90,19 +118,23 @@
 //! A block read through [`ChunkQuad`] ≈ 25 CU (range checks, div/rem by 16, index, load,
 //! flags lookup). Validation + arithmetic ≈ 400 CU. A box check is ≤ 12 reads
 //! (2 × 3 × 2 voxels).
-//! - Typical 8 Hz sprint step: 14 reads mid-block, ≤ ~60 near block edges
-//!   (test `worst_case_reads_bounded`) → **≈ 0.8–2 k CU**.
+//! - Typical 8 Hz grounded sprint step: 14 reads mid-block, ≤ ~60 near block edges
+//!   (test `worst_case_reads_bounded`) → **≈ 0.8–2 k CU**. Airborne steps add the
+//!   implicit-ground probe: ≤ 2 positions × 3 rows × 4 columns × 2 reads ≈ 50 reads.
 //! - Worst case with default params (2 s gap, 14-block diagonal + 40-block fall): 270
-//!   reads → **≈ 7.5 k CU**.
-//! - Absolute bound (any valid params): vertical leg ≤ 84 rows × 4 = 336 reads, horizontal
-//!   leg ≤ [`MAX_SAMPLES`] × 12 = 768, plus destination/origin/ground/water ≈ 40 →
-//!   ≈ 1.15 k reads → **≈ 29 k CU**.
+//!   reads → **≈ 7.5 k CU**; when the first L-path is blocked the second costs as much
+//!   again (≈ 15 k CU).
+//! - Absolute bound (any valid params): per L-path ≤ 2 vertical legs sharing ≤ 84 rows
+//!   × 4 = 336 reads + horizontal leg ≤ [`MAX_SAMPLES`] × 12 = 768; two paths ≈ 2.2 k,
+//!   implicit probe (H ≤ 8 blocks) ≤ 160, misc ≈ 40 → ≈ 2.4 k reads → **≈ 60 k CU**
+//!   (only reachable with extreme params; the program can restrict `create_world` ranges
+//!   further if needed).
 //!
-//! `bench_check_move` (native release, ignored): typical step ≈ 40 ns, default-params
-//! worst case ≈ 570 ns.
+//! `bench_check_move` (native release, ignored): typical step ≈ 40–70 ns, default-params
+//! worst case ≈ 0.6–1.2 µs.
 //!
 //! # SBF stack
-//! No arrays besides `[i32; 3]`s; `check_move` frame holds two `MoveState`s (56 B each)
+//! No arrays besides `[i32; 3]`s; `check_move` frame holds two `MoveState`s (≈ 56 B each in memory)
 //! and scalars, well under 512 B.
 
 use crate::blocks::{is_fluid_u8, is_solid_u8, Block};
@@ -131,9 +163,13 @@ pub const SPEED_NUM: i64 = 5;
 pub const SPEED_DEN: i64 = 4;
 /// Additive distance tolerance per update (horizontal and vertical), FP: 0.25 block.
 pub const DIST_TOL: i64 = 64;
-/// Grace between the last supported update and the actual lift-off (jitter, one 8 Hz
-/// interval, tx latency), ms.
-pub const AIR_SLACK_MS: i64 = 500;
+/// Extra airborne time granted before the ceiling starts to fall (client integration
+/// differences), ms.
+pub const AIR_SLACK_MS: i64 = 100;
+/// How far `client_ms` may run ahead of the onchain time estimate, ms.
+pub const LEAD_MS: i64 = 250;
+/// How far `client_ms` may lag behind the onchain time estimate, ms.
+pub const LAG_MS: i64 = 2000;
 /// Airborne time beyond this is treated as this (the ceiling is long gone by then), ms.
 pub const MAX_AIR_MS: i64 = 60_000;
 /// Horizontal sweep sample spacing per axis, FP (0.5 block).
@@ -356,6 +392,12 @@ impl WorldParams {
 /// | 48 | `on_ground` | u8 (0/1) |
 /// | 49 | `in_water` | u8 (0/1) |
 /// | 50 | reserved | [u8; 6] (written 0, ignored) |
+/// | 56 | reserved: planned `bonus_until_ms` | i64 (written 0, ignored) |
+/// | 64 | reserved: planned `bonus_dist` | i32 (written 0, ignored) |
+/// | 68 | reserved | [u8; 4] (written 0, ignored) |
+///
+/// The planned knockback impulse allowance (`bonus_dist` FP of extra travel until
+/// `bonus_until_ms`, granted by mob/player hits) will live in the reserved bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct MoveState {
     /// Feet center, FP.
@@ -366,19 +408,19 @@ pub struct MoveState {
     pub on_ground: bool,
     /// Highest y since the last on-ground / in-water update, FP.
     pub fall_start_y: i32,
-    /// Time of the last accepted update, ms (never decreases).
+    /// Client timestamp of the last accepted update, ms (strictly increasing).
     pub last_ms: i64,
     /// Feet or head voxel is water.
     pub in_water: bool,
-    /// y of the last update that was on ground or in water, FP.
+    /// y of the last (explicit or implicit) support, FP.
     pub support_y: i32,
-    /// Time of the last update that was on ground or in water, ms.
+    /// Client time of the last (explicit or implicit) support, ms.
     pub support_ms: i64,
 }
 
 impl MoveState {
     /// Serialized size in bytes.
-    pub const SIZE: usize = 56;
+    pub const SIZE: usize = 72;
 
     /// Fresh state at `pos` (spawn / respawn / teleport): airborne, supported now.
     pub fn spawn(pos: [i32; 3], now_ms: i64) -> Self {
@@ -457,6 +499,8 @@ pub enum MoveError {
     Flying = 3,
     /// Params, coordinates, velocity or stored state out of range.
     InvalidState = 4,
+    /// `client_ms` not after `prev.last_ms`, or too far from the onchain time estimate.
+    TimeSkew = 5,
 }
 
 /// Accepted move: damage to apply and the state to store.
@@ -550,14 +594,58 @@ fn rise(p: &WorldParams, t: i64) -> i64 {
     h - fall
 }
 
+/// Highest block top with a non-solid block above it under the [`GROUND_HALF_W`]
+/// footprint at `(x, z)`, in `[y − reach, y + FEET_EPS]` (FP), if any.
+fn implicit_ground(w: &impl BlockAccess, x: i64, y: i64, z: i64, reach: i64) -> Option<i64> {
+    let hi = blk(y + FEET_EPS as i64) - 1;
+    let lo = blk(y - reach + FPL - 1) - 1;
+    let h = GROUND_HALF_W as i64;
+    let mut row = hi;
+    while row >= lo {
+        for bz in blk(z - h)..=blk(z + h - 1) {
+            for bx in blk(x - h)..=blk(x + h - 1) {
+                if is_solid_u8(w.get(bx, row, bz)) && !is_solid_u8(w.get(bx, row + 1, bz)) {
+                    return Some((row as i64 + 1) * FPL);
+                }
+            }
+        }
+        row -= 1;
+    }
+    None
+}
+
+/// The L-path `prev → (prev.xz, level) → (new.xz, level) → new` is free of solids:
+/// vertical legs as one tall box each, the horizontal leg sampled every
+/// [`SAMPLE_STEP`] per axis (at most [`MAX_SAMPLES`]).
+fn path_clear(w: &impl BlockAccess, p: [i64; 3], n: [i64; 3], level: i64) -> bool {
+    let [px, py, pz] = p;
+    let [nx, ny, nz] = n;
+    if level != py && !box_clear(w, px, py.min(level), py.max(level), pz) {
+        return false;
+    }
+    if level != ny && !box_clear(w, nx, ny.min(level), ny.max(level), nz) {
+        return false;
+    }
+    let (dx, dz) = (nx - px, nz - pz);
+    let steps = ((dx.abs() + SAMPLE_STEP - 1) / SAMPLE_STEP)
+        .max((dz.abs() + SAMPLE_STEP - 1) / SAMPLE_STEP)
+        .min(MAX_SAMPLES);
+    (1..steps).all(|k| box_clear(w, px + dx * k / steps, level, level, pz + dz * k / steps))
+}
+
 /// Validates one movement update; see the module docs for the rules.
+///
+/// `client_ms` is the client's timestamp of the reported position (on the chain's clock,
+/// see the module docs), `chain_ms` the program's estimate of the current onchain time.
+#[allow(clippy::too_many_arguments)]
 pub fn check_move(
     params: &WorldParams,
     prev: &MoveState,
     new_pos: [i32; 3],
     new_vel: [i32; 3],
     on_ground: bool,
-    now_ms: i64,
+    client_ms: i64,
+    chain_ms: i64,
     blocks: &impl BlockAccess,
 ) -> Result<MoveOutcome, MoveError> {
     use MoveError::*;
@@ -579,9 +667,14 @@ pub fn check_move(
         return Err(InvalidState);
     }
 
-    // 1. Time.
-    let now = now_ms.max(prev.last_ms);
-    let dt = now.saturating_sub(prev.last_ms).min(MAX_DT_MS);
+    // 1. Time: client timestamps, bounded by the onchain estimate.
+    if client_ms <= prev.last_ms
+        || client_ms > chain_ms.saturating_add(LEAD_MS)
+        || client_ms < chain_ms.saturating_sub(LAG_MS)
+    {
+        return Err(TimeSkew);
+    }
+    let dt = client_ms.saturating_sub(prev.last_ms).min(MAX_DT_MS);
 
     let [px, py, pz] = prev.pos.map(i64::from);
     let [nx, ny, nz] = new_pos.map(i64::from);
@@ -600,12 +693,13 @@ pub fn check_move(
     }
 
     // 3. Vertical speed.
+    let jump = p.jump_height() + DIST_TOL;
     if dy < 0 && -dy > travel(p.max_fall_speed, dt) + DIST_TOL {
         return Err(MoveTooFast);
     }
     if dy > 0 {
         let cycle = (2 * p.apex_ms()).max(1);
-        let mut up = (p.jump_height() + DIST_TOL) * (1 + dt / cycle);
+        let mut up = jump * (1 + dt / cycle);
         if prev.in_water || water {
             up += travel(p.swim_speed, dt);
         }
@@ -624,60 +718,75 @@ pub fn check_move(
         return Err(NotOnGround);
     }
 
-    // 6. Airborne ceiling.
+    // 6. Airborne ceiling. Lift-off from an explicit support happened at or before now.
+    let (mut support_y, mut support_ms) = if prev.on_ground || prev.in_water {
+        (py, client_ms)
+    } else {
+        (prev.support_y as i64, prev.support_ms)
+    };
+    let mut implicit = None;
     if !on_ground && !water {
-        let air = now.saturating_sub(prev.support_ms).clamp(0, MAX_AIR_MS);
-        let t = (air - AIR_SLACK_MS).max(0);
-        if ny > prev.support_y as i64 + rise(p, t) + DIST_TOL {
-            return Err(Flying);
-        }
-    }
-
-    // 7. Swept L-path, unless the player is already stuck in a block.
-    if box_clear(blocks, px, py, py, pz) {
-        let top = py.max(ny);
-        if (top > py && !box_clear(blocks, px, py, top, pz))
-            || (top > ny && !box_clear(blocks, nx, ny, top, nz))
-        {
-            return Err(Collision);
-        }
-        let steps = ((dx.abs() + SAMPLE_STEP - 1) / SAMPLE_STEP)
-            .max((dz.abs() + SAMPLE_STEP - 1) / SAMPLE_STEP)
-            .min(MAX_SAMPLES);
-        for k in 1..steps {
-            let sx = px + dx * k / steps;
-            let sz = pz + dz * k / steps;
-            if !box_clear(blocks, sx, top, top, sz) {
-                return Err(Collision);
+        let g = implicit_ground(blocks, px, py, pz, jump)
+            .max(implicit_ground(blocks, nx, ny, nz, jump));
+        match g {
+            Some(gy) if ny <= gy + jump => {
+                implicit = Some(gy);
+                support_y = gy;
+                support_ms = client_ms;
+            }
+            _ => {
+                let air = client_ms.saturating_sub(support_ms).clamp(0, MAX_AIR_MS);
+                let t = (air - AIR_SLACK_MS).max(0);
+                if ny > support_y + rise(p, t) + DIST_TOL {
+                    return Err(Flying);
+                }
             }
         }
     }
 
-    // 8. Outcome.
-    let start = prev.fall_start_y.max(prev.pos[1]);
+    // 7. Swept L-path (either order), unless the player is already stuck in a block.
+    if box_clear(blocks, px, py, py, pz) {
+        let (a, b) = ([px, py, pz], [nx, ny, nz]);
+        if !path_clear(blocks, a, b, py.max(ny)) && !path_clear(blocks, a, b, py.min(ny)) {
+            return Err(Collision);
+        }
+    }
+
+    // 8. Outcome. Explicit landing on ground (not water) or an implicit one pays damage.
+    let start = prev.fall_start_y.max(prev.pos[1]) as i64;
+    let land_y = match implicit {
+        Some(gy) => Some(gy),
+        None if on_ground && !water => Some(ny),
+        None => None,
+    };
     let mut fall_damage = 0u8;
-    if on_ground && !water && p.fall_damage != 0 {
-        let d = (start as i64 - ny - 3 * FPL).div_euclid(FPL);
+    if let (Some(ly), true) = (land_y, p.fall_damage != 0) {
+        let d = (start - ly - 3 * FPL).div_euclid(FPL);
         fall_damage = d.clamp(0, u8::MAX as i64) as u8;
     }
     let supported = on_ground || water;
+    let fall_start_y = if supported {
+        ny
+    } else if let Some(gy) = implicit {
+        gy.max(ny)
+    } else {
+        start.max(ny)
+    };
+    let (support_y, support_ms) = if supported {
+        (ny, client_ms)
+    } else {
+        (support_y, support_ms)
+    };
+    // All values are within [Y_MIN, Y_MAX] (positions) or block tops near them.
     let state = MoveState {
         pos: new_pos,
         vel: new_vel,
         on_ground,
-        fall_start_y: if supported {
-            new_pos[1]
-        } else {
-            start.max(new_pos[1])
-        },
-        last_ms: now,
+        fall_start_y: fall_start_y as i32,
+        last_ms: client_ms,
         in_water: water,
-        support_y: if supported {
-            new_pos[1]
-        } else {
-            prev.support_y
-        },
-        support_ms: if supported { now } else { prev.support_ms },
+        support_y: support_y as i32,
+        support_ms,
     };
     Ok(MoveOutcome { fall_damage, state })
 }
@@ -762,7 +871,10 @@ mod tests {
     /// - tower: x -20..=-11, z 0..=9: Stone up to y 19 (top at 20);
     /// - wall: x = 20, z -50..=50, y 10..=12;
     /// - step: x 30..=32, z 0..=9, y = 10 (top at 11);
-    /// - platform: x 40..=42, z 0..=9, y 10..=12 (top at 13).
+    /// - platform: x 40..=42, z 0..=9, y 10..=12 (top at 13);
+    /// - overhang: x = 25, z 0..=9, y = 12;
+    /// - stairs: x 50..=69, z 0..=9, top at `11 + (x - 50) / 2`;
+    /// - pit: x 70..=79, z 0..=9, top at 2.
     struct TestWorld {
         reads: Cell<u32>,
     }
@@ -771,6 +883,10 @@ mod tests {
         TestWorld {
             reads: Cell::new(0),
         }
+    }
+
+    fn stair_top(x: i32) -> i32 {
+        11 + (x - 50) / 2
     }
 
     fn block_at(x: i32, y: i32, z: i32) -> u8 {
@@ -792,6 +908,15 @@ mod tests {
         }
         if (-20..=-11).contains(&x) && zin && y < 20 {
             return STONE;
+        }
+        if x == 25 && zin && y == 12 {
+            return STONE;
+        }
+        if (50..=69).contains(&x) && zin {
+            return if y < stair_top(x) { STONE } else { AIR };
+        }
+        if (70..=79).contains(&x) && zin {
+            return if y < 2 { STONE } else { AIR };
         }
         if x == 20 && (-50..=50).contains(&z) && (10..=12).contains(&y) {
             return STONE;
@@ -856,6 +981,7 @@ mod tests {
             pos,
             [0; 3],
             on_ground,
+            now,
             now,
             &world(),
         )
@@ -1072,18 +1198,75 @@ mod tests {
     }
 
     #[test]
-    fn hovering_rejected() {
-        // Left the ground 1 s ago at y = 10 and still claims y = 11.
-        let prev = airborne([HOME[0], bf(11, 0), HOME[2]], 1000, HOME[1], 0);
+    fn hovering_over_a_gap_rejected() {
+        // Over the pit (floor 9 blocks down), left the ground 1 s ago at y = 10.
+        let pos = [bf(75, 128), bf(11, 0), bf(5, 0)];
+        let prev = airborne(pos, 1000, bf(10, 0), 0);
+        assert_eq!(mv(&prev, pos, false, 1125), Err(MoveError::Flying));
+        // Gliding level across the pit is caught too.
+        let prev = airborne([bf(72, 0), bf(10, 0), bf(5, 0)], 1000, bf(10, 0), 0);
         assert_eq!(
-            mv(&prev, [HOME[0], bf(11, 0), HOME[2]], false, 1125),
+            mv(&prev, [bf(72, 150), bf(10, 0), bf(5, 0)], false, 1125),
             Err(MoveError::Flying)
         );
-        // Hovering just above the floor without ever landing gets caught as well.
-        let prev = airborne([HOME[0], bf(10, 40), HOME[2]], 2000, bf(10, 40), 0);
+    }
+
+    #[test]
+    fn low_hover_over_ground_not_caught() {
+        // Documented limitation: within a jump height above a surface, an airborne
+        // player may have touched it and jumped again between updates.
+        let pos = [HOME[0], bf(11, 0), HOME[2]];
+        let prev = airborne(pos, 5000, HOME[1], 0);
+        mv(&prev, pos, false, 5125).unwrap();
+    }
+
+    #[test]
+    fn implicit_landing_charges_fall_damage() {
+        // Fell from y = 20 and never claims ground, hovering 1 block above the floor:
+        // the implicit landing still costs 7.
+        let prev = airborne([bf(-9, 128), bf(12, 0), bf(5, 0)], 1000, bf(20, 0), 200);
+        let out = mv(&prev, [bf(-9, 128), bf(11, 0), bf(5, 0)], false, 1125).unwrap();
+        assert_eq!(out.fall_damage, 7);
+        assert_eq!(out.state.fall_start_y, bf(11, 0));
+        assert_eq!(out.state.support_y, bf(10, 0));
+        // ... and landing afterwards is free.
+        let out = mv(&out.state, [bf(-9, 128), bf(10, 0), bf(5, 0)], true, 1250).unwrap();
+        assert_eq!(out.fall_damage, 0);
+    }
+
+    #[test]
+    fn idle_then_jump_ok() {
+        // 10 s without updates on the ground (tower top, edge), then a jump off the edge.
+        let prev = grounded([bf(-11, 0), bf(20, 0), bf(5, 0)], 0);
+        let out = mv(&prev, [bf(-10, 0), bf(21, 0), bf(5, 0)], false, 10_000).unwrap();
+        assert_eq!(out.state.support_ms, 10_000);
+        let out = mv(
+            &out.state,
+            [bf(-10, 128), bf(21, 64), bf(5, 0)],
+            false,
+            10_125,
+        )
+        .unwrap();
+        mv(
+            &out.state,
+            [bf(-10, 200), bf(20, 128), bf(5, 0)],
+            false,
+            10_250,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn l_path_either_order() {
+        // Jumping out from under the overhang at (25, 12): straight up is blocked, the
+        // across-then-up path is clear.
+        let prev = grounded([bf(25, 128), bf(10, 0), bf(5, 0)], 0);
+        mv(&prev, [bf(26, 77), bf(11, 0), bf(5, 0)], false, 125).unwrap();
+        // Up-then-across through the wall top still fails when both orders are blocked.
+        let prev = grounded([bf(19, 154), bf(10, 0), bf(5, 0)], 0);
         assert_eq!(
-            mv(&prev, [HOME[0], bf(10, 40), HOME[2]], false, 2125),
-            Err(MoveError::Flying)
+            mv(&prev, [bf(21, 102), bf(11, 0), bf(5, 0)], false, 300),
+            Err(MoveError::Collision)
         );
     }
 
@@ -1130,6 +1313,7 @@ mod tests {
             [bf(-9, 128), bf(10, 0), bf(5, 0)],
             [0; 3],
             true,
+            1125,
             1125,
             &world(),
         )
@@ -1186,14 +1370,45 @@ mod tests {
     }
 
     #[test]
-    fn time_going_backwards_is_dt_zero() {
+    fn time_skew_rejected() {
         let prev = grounded(HOME, 1000);
-        assert_eq!(
-            mv(&prev, [HOME[0] + 128, HOME[1], HOME[2]], true, 500),
-            Err(MoveError::MoveTooFast)
-        );
-        let out = mv(&prev, [HOME[0] + 51, HOME[1], HOME[2]], true, 500).unwrap();
-        assert_eq!(out.state.last_ms, 1000);
+        let step = [HOME[0] + 51, HOME[1], HOME[2]];
+        // Client time must advance.
+        assert_eq!(mv(&prev, step, true, 1000), Err(MoveError::TimeSkew));
+        assert_eq!(mv(&prev, step, true, 500), Err(MoveError::TimeSkew));
+        let p = WorldParams::default();
+        let w = world();
+        // Ahead of the chain by more than LEAD_MS, or behind by more than LAG_MS.
+        let at =
+            |client: i64, chain: i64| check_move(&p, &prev, step, [0; 3], true, client, chain, &w);
+        assert_eq!(at(1300, 1000), Err(MoveError::TimeSkew));
+        at(1250, 1000).unwrap();
+        assert_eq!(at(1100, 3200), Err(MoveError::TimeSkew));
+        at(1100, 3100).unwrap();
+        assert_eq!(at(1100, i64::MIN), Err(MoveError::TimeSkew));
+        at(i64::MAX, i64::MAX).unwrap();
+    }
+
+    #[test]
+    fn client_clock_running_fast_is_caught() {
+        // Claims 250 ms per update while only 125 ms pass onchain: free extra travel until
+        // the lead exceeds LEAD_MS.
+        let p = WorldParams::default();
+        let w = world();
+        let mut st = grounded([bf(5, 128), bf(10, 0), bf(-30, 128)], 0);
+        let mut rejected_at = None;
+        for k in 1..=10i64 {
+            let pos = [st.pos[0], st.pos[1], st.pos[2] + 358];
+            match check_move(&p, &st, pos, [0; 3], true, 250 * k, 125 * k, &w) {
+                Ok(o) => st = o.state,
+                Err(e) => {
+                    assert_eq!(e, MoveError::TimeSkew);
+                    rejected_at = Some(k);
+                    break;
+                }
+            }
+        }
+        assert_eq!(rejected_at, Some(3));
     }
 
     #[test]
@@ -1211,7 +1426,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            check_move(&bad, &prev, HOME, [0; 3], true, 125, &world()),
+            check_move(&bad, &prev, HOME, [0; 3], true, 125, 125, &world()),
             Err(MoveError::InvalidState)
         );
         assert_eq!(
@@ -1221,6 +1436,7 @@ mod tests {
                 HOME,
                 [i32::MAX, 0, 0],
                 true,
+                125,
                 125,
                 &world()
             ),
@@ -1232,7 +1448,8 @@ mod tests {
         );
     }
 
-    /// Integer replica of a 60 fps client (semi-implicit Euler, positions in milli-FP).
+    /// Integer replica of a 60 fps client (semi-implicit Euler, positions in milli-FP,
+    /// box half-width 77 FP, stops at block faces).
     struct Client {
         x: i64,
         y: i64,
@@ -1240,28 +1457,48 @@ mod tests {
         on_ground: bool,
     }
 
-    /// Runs `frames` frames sprinting +x, jumping whenever grounded if `hop`; sends every
-    /// 8 frames and on every ground-contact change (landing / lift-off, a client parity
-    /// requirement), asserting each update is accepted. Returns total fall damage.
-    fn simulate(start: [i32; 3], frames: i64, hop: bool, ground_y: impl Fn(i64) -> i64) -> u32 {
+    /// Top (blocks) of the highest column under the client's box at milli-FP `x`.
+    fn top_under(heights: &impl Fn(i32) -> i32, x: i64) -> i64 {
+        let x = x / 1000;
+        let (lo, hi) = (blk(x - 77), blk(x + 76));
+        (lo..=hi).map(heights).max().unwrap_or(0) as i64 * 256 * 1000
+    }
+
+    struct Sim<H: Fn(i32) -> i32> {
+        start: [i32; 3],
+        frames: i64,
+        hop: bool,
+        /// Column tops (blocks) along x at the sim's z.
+        heights: H,
+        /// `drop(k)`: the k-th 8 Hz update is lost.
+        drop: fn(i64) -> bool,
+        /// `chain(k, client_ms)`: onchain time estimate when update k is processed.
+        chain: fn(i64, i64) -> i64,
+    }
+
+    /// Sprints +x (jumping whenever grounded if `hop`), sends every 8 frames only, and
+    /// asserts every delivered update is accepted. Returns (total fall damage, final y).
+    fn simulate<H: Fn(i32) -> i32>(sim: Sim<H>) -> (u32, i32) {
         let p = WorldParams::default();
         let mut c = Client {
-            x: start[0] as i64 * 1000,
-            y: start[1] as i64 * 1000,
+            x: sim.start[0] as i64 * 1000,
+            y: sim.start[1] as i64 * 1000,
             vy: 0,
             on_ground: true,
         };
-        let mut st = grounded(start, 0);
+        let mut st = grounded(sim.start, 0);
         let mut dmg = 0u32;
-        for f in 1..=frames {
-            if hop && c.on_ground {
+        for f in 1..=sim.frames {
+            if sim.hop && c.on_ground {
                 c.vy = p.jump_velocity as i64 * 1000;
             }
-            c.x += p.sprint_speed as i64 * 1000 / 60;
+            let nx = c.x + p.sprint_speed as i64 * 1000 / 60;
+            if top_under(&sim.heights, nx) <= c.y {
+                c.x = nx;
+            }
             c.vy = (c.vy - p.gravity as i64 * 1000 / 60).max(-(p.max_fall_speed as i64) * 1000);
             c.y += c.vy / 60;
-            let was_on_ground = c.on_ground;
-            let g = ground_y(c.x / 1000) * 1000;
+            let g = top_under(&sim.heights, c.x);
             if c.y <= g {
                 c.y = g;
                 c.vy = 0;
@@ -1269,36 +1506,118 @@ mod tests {
             } else {
                 c.on_ground = false;
             }
-            if f % 8 == 0 || c.on_ground != was_on_ground {
-                let pos = [(c.x / 1000) as i32, (c.y / 1000) as i32, start[2]];
+            let k = f / 8;
+            if f % 8 == 0 && !(sim.drop)(k) {
+                let pos = [(c.x / 1000) as i32, (c.y / 1000) as i32, sim.start[2]];
                 let vel = [p.sprint_speed as i32, (c.vy / 1000) as i32, 0];
                 let now = f * 1000 / 60;
-                let out = check_move(&p, &st, pos, vel, c.on_ground, now, &world())
+                let chain = (sim.chain)(k, now);
+                let out = check_move(&p, &st, pos, vel, c.on_ground, now, chain, &world())
                     .unwrap_or_else(|e| panic!("frame {f} pos {pos:?} rejected: {e:?}"));
                 dmg += out.fall_damage as u32;
                 st = out.state;
             }
         }
-        dmg
+        (dmg, st.pos[1])
+    }
+
+    fn no_drop(_: i64) -> bool {
+        false
+    }
+
+    fn every_third_dropped(k: i64) -> bool {
+        k % 3 == 2
+    }
+
+    fn on_time(_: i64, t: i64) -> i64 {
+        t + 40
+    }
+
+    /// Pairs of updates arrive together: the even one late, both within ~10 ms.
+    fn bunched(k: i64, t: i64) -> i64 {
+        if k % 2 == 0 {
+            t + 133 + 80 + k % 7
+        } else {
+            t + 80 + k % 5
+        }
+    }
+
+    fn flat(_: i32) -> i32 {
+        10
     }
 
     #[test]
     fn simulated_bunny_hop_accepted() {
-        let dmg = simulate([bf(0, 128), bf(10, 0), bf(5, 128)], 180, true, |_| 10 * 256);
+        let start = [bf(0, 128), bf(10, 0), bf(5, 128)];
+        for (drop, chain) in [
+            (no_drop as fn(i64) -> bool, on_time as fn(i64, i64) -> i64),
+            (every_third_dropped, on_time),
+            (no_drop, bunched),
+            (every_third_dropped, bunched),
+        ] {
+            let (dmg, _) = simulate(Sim {
+                start,
+                frames: 180,
+                hop: true,
+                heights: flat,
+                drop,
+                chain,
+            });
+            assert_eq!(dmg, 0);
+        }
+    }
+
+    #[test]
+    fn simulated_sprint_with_bunched_arrivals_accepted() {
+        let (dmg, _) = simulate(Sim {
+            start: [bf(0, 128), bf(10, 0), bf(5, 128)],
+            frames: 180,
+            hop: false,
+            heights: flat,
+            drop: no_drop,
+            chain: bunched,
+        });
         assert_eq!(dmg, 0);
     }
 
     #[test]
-    fn simulated_walk_off_tower_deals_seven() {
-        // Client box half-width 77: over the tower while its box overlaps x < -10.
-        let dmg = simulate([bf(-12, 0), bf(20, 0), bf(5, 0)], 120, false, |x| {
-            if x - 77 < -10 * 256 {
-                20 * 256
+    fn simulated_bunny_hop_uphill_accepted() {
+        let heights = |x: i32| {
+            if (50..=69).contains(&x) {
+                stair_top(x)
             } else {
-                10 * 256
+                10
             }
-        });
-        assert_eq!(dmg, 7);
+        };
+        for drop in [no_drop as fn(i64) -> bool, every_third_dropped] {
+            let (dmg, y) = simulate(Sim {
+                start: [bf(46, 0), bf(10, 0), bf(5, 0)],
+                frames: 210,
+                hop: true,
+                heights,
+                drop,
+                chain: bunched,
+            });
+            assert_eq!(dmg, 0);
+            assert!(y >= bf(15, 0), "climbed only to {y}");
+        }
+    }
+
+    #[test]
+    fn simulated_walk_off_tower_deals_seven() {
+        let heights = |x: i32| if (-20..=-11).contains(&x) { 20 } else { 10 };
+        for drop in [no_drop as fn(i64) -> bool, every_third_dropped] {
+            let (dmg, y) = simulate(Sim {
+                start: [bf(-12, 0), bf(20, 0), bf(5, 0)],
+                frames: 120,
+                hop: false,
+                heights,
+                drop,
+                chain: on_time,
+            });
+            assert_eq!(dmg, 7);
+            assert_eq!(y, bf(10, 0));
+        }
     }
 
     #[test]
@@ -1412,6 +1731,7 @@ mod tests {
                 vel,
                 r.next().is_multiple_of(2),
                 now,
+                now.wrapping_add((r.next() % 3000) as i64 - 1500),
                 &w,
             );
             if !garbage && res.is_ok() {
@@ -1440,6 +1760,7 @@ mod tests {
             [0; 3],
             true,
             2000,
+            2000,
             &w,
         );
         assert!(res.is_ok(), "{res:?}");
@@ -1455,7 +1776,17 @@ mod tests {
     }
 
     fn mv_on(w: &TestWorld, prev: &MoveState, pos: [i32; 3]) {
-        check_move(&WorldParams::default(), prev, pos, [0; 3], true, 125, w).unwrap();
+        check_move(
+            &WorldParams::default(),
+            prev,
+            pos,
+            [0; 3],
+            true,
+            125,
+            125,
+            w,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1468,7 +1799,7 @@ mod tests {
         let t = std::time::Instant::now();
         for i in 0..n {
             let x = HOME[0] + 179 + (i % 3) as i32;
-            let r = check_move(&p, &prev, [x, HOME[1], HOME[2]], [0; 3], true, 125, &w);
+            let r = check_move(&p, &prev, [x, HOME[1], HOME[2]], [0; 3], true, 125, 125, &w);
             assert!(r.is_ok());
         }
         println!("typical sprint step: {:?}/call", t.elapsed() / n);
@@ -1482,6 +1813,7 @@ mod tests {
                 [x, bf(10, 0), bf(-31, 0)],
                 [0; 3],
                 true,
+                2000,
                 2000,
                 &w,
             );
