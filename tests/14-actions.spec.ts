@@ -548,6 +548,8 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
     expect(s.inv.every((x) => x.item === 0 && x.count === 0)).to.equal(true);
     expect(s.move.pos).to.deep.equal(center(...spawn));
     expect(s.move.lastMs).to.be.within(t0 - 1_000, t0 + 2_000);
+    // Pending damage on entries last seen before this is dropped (presence::upsert).
+    expect(s.acc.respawnMs.toNumber()).to.equal(s.move.lastMs);
     expect([s.acc.cx, s.acc.cz]).to.deep.equal(chunkOfBlock(spawn));
     // The route's edits may have removed the block under the spawn.
     const below = await blockAt([spawn[0], spawn[1] - 1, spawn[2]]);

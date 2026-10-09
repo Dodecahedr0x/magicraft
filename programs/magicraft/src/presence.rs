@@ -75,8 +75,15 @@ pub fn new_entry(me: &Pubkey, pos: [i32; 3], now: i64) -> PresenceEntry {
 /// players with `now − last_seen_ms > STALE_MS` ([`DAMAGED_STALE_MS`] with pending damage)
 /// (swap-remove), then updates `me`'s entry
 /// (position, `last_seen_ms = now`, takes and zeroes `pending_damage`) or inserts it into a
-/// freed slot; if no slot is free, reports `grow`.
-pub fn upsert(entries: &mut [PresenceEntry], me: &Pubkey, pos: [i32; 3], now: i64) -> Upsert {
+/// freed slot; if no slot is free, reports `grow`. Pending damage of an own entry last seen
+/// before `since` (the player's last respawn) is dropped, not taken: it hit the dead body.
+pub fn upsert(
+    entries: &mut [PresenceEntry],
+    me: &Pubkey,
+    pos: [i32; 3],
+    now: i64,
+    since: i64,
+) -> Upsert {
     let n = entries.len();
     let mut own = None;
     let mut stale = [0usize; MAX_PRUNE];
@@ -112,7 +119,9 @@ pub fn upsert(entries: &mut [PresenceEntry], me: &Pubkey, pos: [i32; 3], now: i6
     match own {
         Some(i) => {
             let e = &mut entries[i];
-            pending = e.pending_damage;
+            if e.last_seen_ms.get() >= since {
+                pending = e.pending_damage;
+            }
             e.pending_damage = 0;
             e.pos = pos.map(LeI32::new);
             e.last_seen_ms.set(now);
@@ -132,10 +141,16 @@ pub fn upsert(entries: &mut [PresenceEntry], me: &Pubkey, pos: [i32; 3], now: i6
 }
 
 /// Pure: removes `me`'s entry (swap-remove). Returns the new count and its
-/// `pending_damage`, or `None` if `me` is not listed.
-pub fn remove(entries: &mut [PresenceEntry], me: &Pubkey) -> Option<(usize, u8)> {
+/// `pending_damage` (0 if the entry was last seen before `since`, as in [`upsert`]), or
+/// `None` if `me` is not listed.
+pub fn remove(entries: &mut [PresenceEntry], me: &Pubkey, since: i64) -> Option<(usize, u8)> {
     let i = entries.iter().position(|e| e.player == *me)?;
-    let pending = entries[i].pending_damage;
+    let e = &entries[i];
+    let pending = if e.last_seen_ms.get() >= since {
+        e.pending_damage
+    } else {
+        0
+    };
     let last = entries.len() - 1;
     entries[i] = entries[last];
     Some((last, pending))
@@ -167,12 +182,13 @@ pub fn enter_or_update<'info>(
     me: &Pubkey,
     pos: [i32; 3],
     now: i64,
+    since: i64,
     sponsor: &Sponsor<'_, 'info>,
 ) -> Result<u8> {
     let (n, r) = {
         let (mut h, mut e) = presence_of(presence, chunk)?;
         let n = e.len();
-        let r = upsert(&mut e, me, pos, now);
+        let r = upsert(&mut e, me, pos, now, since);
         if !r.grow {
             h.count.set(r.count as u16);
         }
@@ -201,11 +217,12 @@ pub fn leave<'info>(
     presence: &AccountInfo<'info>,
     chunk: &Pubkey,
     me: &Pubkey,
+    since: i64,
     sponsor: &Sponsor<'_, 'info>,
 ) -> Result<u8> {
     let removed = {
         let (mut h, mut e) = presence_of(presence, chunk)?;
-        let r = remove(&mut e, me);
+        let r = remove(&mut e, me, since);
         if let Some((count, _)) = r {
             h.count.set(count as u16);
         }
@@ -242,7 +259,7 @@ mod tests {
     fn update_own_takes_pending_damage() {
         let me = Pubkey::new_from_array([1; 32]);
         let mut l = vec![entry(2, 9_000, 0), entry(1, 1_000, 7)];
-        let r = upsert(&mut l, &me, [5, 6, 7], 10_000);
+        let r = upsert(&mut l, &me, [5, 6, 7], 10_000, i64::MIN);
         assert_eq!(
             r,
             Upsert {
@@ -262,10 +279,10 @@ mod tests {
     fn insert_grows_when_nothing_is_freed() {
         let me = Pubkey::new_from_array([1; 32]);
         let mut l = vec![entry(2, 9_000, 0)];
-        let r = upsert(&mut l, &me, [0; 3], 10_000);
+        let r = upsert(&mut l, &me, [0; 3], 10_000, i64::MIN);
         assert_eq!((r.count, r.grow, r.pruned), (1, true, 0));
         let mut empty: Vec<PresenceEntry> = vec![];
-        assert!(upsert(&mut empty, &me, [0; 3], 0).grow);
+        assert!(upsert(&mut empty, &me, [0; 3], 0, i64::MIN).grow);
     }
 
     #[test]
@@ -273,7 +290,7 @@ mod tests {
         let me = Pubkey::new_from_array([1; 32]);
         // 5 000 ms old is still fresh; 5 001 is stale.
         let mut l = vec![entry(2, 5_000, 3), entry(3, 4_999, 0), entry(4, 9_000, 0)];
-        let r = upsert(&mut l, &me, [0; 3], 10_000);
+        let r = upsert(&mut l, &me, [0; 3], 10_000, i64::MIN);
         assert_eq!((r.count, r.grow, r.pruned, r.pending), (3, false, 1, 0));
         assert_eq!(keys(&l[..3]), vec![1, 2, 4]);
     }
@@ -283,14 +300,14 @@ mod tests {
         let me = Pubkey::new_from_array([1; 32]);
         let mut l: Vec<_> = (2..8).map(|k| entry(k, 0, 0)).collect(); // 6 stale
         l.push(entry(1, 0, 9)); // own entry last: moves when swapped
-        let r = upsert(&mut l, &me, [1; 3], 100_000);
+        let r = upsert(&mut l, &me, [1; 3], 100_000, i64::MIN);
         assert_eq!((r.count, r.grow, r.pruned, r.pending), (3, false, 4, 9));
         assert_eq!(keys(&l[..3]), vec![1, 6, 7]);
         let own = l[..3].iter().find(|e| e.player == me).unwrap();
         assert_eq!(own.last_seen_ms.get(), 100_000);
         // Next call prunes the remaining two.
         let mut l2 = l[..3].to_vec();
-        let r = upsert(&mut l2, &me, [1; 3], 100_001);
+        let r = upsert(&mut l2, &me, [1; 3], 100_001, i64::MIN);
         assert_eq!((r.count, r.pruned), (1, 2));
         assert_eq!(keys(&l2[..1]), vec![1]);
     }
@@ -300,15 +317,18 @@ mod tests {
         let me = Pubkey::new_from_array([1; 32]);
         // At 60 s: the plain entry (> 5 s) goes, the damaged one (not > 60 s) stays.
         let mut l = vec![entry(2, 0, 3), entry(3, 0, 0)];
-        let r = upsert(&mut l, &me, [0; 3], 60_000);
+        let r = upsert(&mut l, &me, [0; 3], 60_000, i64::MIN);
         assert_eq!((r.count, r.pruned, r.grow), (2, 1, false));
         assert_eq!(keys(&l[..2]), vec![1, 2]);
         // The owner collects it on its own move.
         let owner = Pubkey::new_from_array([2; 32]);
-        assert_eq!(upsert(&mut l[..2], &owner, [0; 3], 60_001).pending, 3);
+        assert_eq!(
+            upsert(&mut l[..2], &owner, [0; 3], 60_001, i64::MIN).pending,
+            3
+        );
         // An abandoned damaged entry is pruned after 60 s.
         let mut l = vec![entry(2, 0, 3)];
-        let r = upsert(&mut l, &me, [0; 3], 60_001);
+        let r = upsert(&mut l, &me, [0; 3], 60_001, i64::MIN);
         assert_eq!((r.count, r.pruned, r.grow), (1, 1, false));
         assert_eq!(keys(&l[..1]), vec![1]);
     }
@@ -317,20 +337,36 @@ mod tests {
     fn stale_check_is_total() {
         let me = Pubkey::new_from_array([1; 32]);
         let mut l = vec![entry(2, i64::MIN, 0), entry(3, i64::MAX, 0)];
-        let r = upsert(&mut l, &me, [0; 3], i64::MAX);
+        let r = upsert(&mut l, &me, [0; 3], i64::MAX, i64::MIN);
         assert_eq!((r.count, r.pruned), (2, 1));
-        let r = upsert(&mut l[..2], &me, [0; 3], i64::MIN);
+        let r = upsert(&mut l[..2], &me, [0; 3], i64::MIN, i64::MIN);
         assert_eq!(r.pruned, 0);
+    }
+
+    #[test]
+    fn pending_from_before_respawn_is_dropped() {
+        let me = Pubkey::new_from_array([1; 32]);
+        // Own entry last seen at 1 000 with 7 damage; respawned at 2 000.
+        let mut l = vec![entry(1, 1_000, 7)];
+        let r = upsert(&mut l, &me, [0; 3], 3_000, 2_000);
+        assert_eq!((r.pending, l[0].pending_damage), (0, 0));
+        // Damage taken after the respawn (entry seen since) counts.
+        l[0].pending_damage = 4;
+        assert_eq!(upsert(&mut l, &me, [0; 3], 4_000, 2_000).pending, 4);
+        let mut l = vec![entry(1, 1_000, 7), entry(2, 0, 0)];
+        assert_eq!(remove(&mut l, &me, 2_000), Some((1, 0)));
+        let mut l = vec![entry(1, 2_000, 7)];
+        assert_eq!(remove(&mut l, &me, 2_000), Some((0, 7)));
     }
 
     #[test]
     fn remove_swaps_last_in() {
         let me = Pubkey::new_from_array([1; 32]);
         let mut l = vec![entry(1, 0, 4), entry(2, 0, 0), entry(3, 0, 0)];
-        assert_eq!(remove(&mut l, &me), Some((2, 4)));
+        assert_eq!(remove(&mut l, &me, i64::MIN), Some((2, 4)));
         assert_eq!(keys(&l[..2]), vec![2, 3]);
-        assert_eq!(remove(&mut l[..2], &me), None);
+        assert_eq!(remove(&mut l[..2], &me, i64::MIN), None);
         let mut empty: Vec<PresenceEntry> = vec![];
-        assert_eq!(remove(&mut empty, &me), None);
+        assert_eq!(remove(&mut empty, &me, i64::MIN), None);
     }
 }

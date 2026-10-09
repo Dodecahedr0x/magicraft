@@ -67,7 +67,8 @@
 //! | 374 | `break_until_ms` | i64 |
 //! | 382 | `attack_until_ms` | i64 |
 //! | 390 | `food_tick_ms` | i64 (last hunger / regen step) |
-//! | 398 | `_reserved` | [u8; 34] |
+//! | 398 | `respawn_ms` | i64 (chain ms of the last `respawn`, 0 = never; own presence entries last seen before it lose their `pending_damage`) |
+//! | 406 | `_reserved` | [u8; 26] |
 //!
 //! # `Chunk` (ephemeral), PDA `["chunk", world, cx i32 LE, cz i32 LE]`
 //! Created at [`CHUNK_INITIAL_LEN`] (10 240) bytes, then resized to [`CHUNK_FULL_LEN`]
@@ -529,7 +530,10 @@ pub struct PlayerState {
     pub attack_until_ms: i64,
     /// Last hunger / regeneration step, chain ms.
     pub food_tick_ms: i64,
-    pub _reserved: [u8; 34],
+    /// Chain ms of the last `respawn` (0 = never). Pending damage on an own presence entry
+    /// last seen before it hit the dead body and is dropped (`presence::upsert`).
+    pub respawn_ms: i64,
+    pub _reserved: [u8; 26],
 }
 
 const _: () = assert!(MoveState::SIZE == 72 && Inventory::SIZE == 216);
@@ -1211,7 +1215,8 @@ mod tests {
             break_until_ms: 100,
             attack_until_ms: 200,
             food_tick_ms: 300,
-            _reserved: [0; 34],
+            respawn_ms: 400,
+            _reserved: [0; 26],
         };
         s.set_move_state(&ms);
         s.set_inventory(&inv);
@@ -1231,6 +1236,7 @@ mod tests {
         assert_eq!(&b[374..382], &100i64.to_le_bytes());
         assert_eq!(&b[382..390], &200i64.to_le_bytes());
         assert_eq!(&b[390..398], &300i64.to_le_bytes());
+        assert_eq!(&b[398..406], &400i64.to_le_bytes());
         assert!(!s.is_dead());
         s.health = 0;
         assert!(s.is_dead());

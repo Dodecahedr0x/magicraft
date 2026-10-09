@@ -83,9 +83,12 @@
 //! `held_slot` (< 36, `BadSlot`) — the tool used by `break_block` / `attack_mob`.
 //! `respawn`: only at health 0 (`NotDead`); clears the inventory, health/food 20,
 //! exhaustion 0, cooldowns 0, `MoveState::spawn(World.spawn, chain_ms)` (the client's next
-//! move must carry `client_ms > last_ms`), `cx/cz` = the spawn chunk. The presence entry in
-//! the death chunk is left alone: it is stale (no moves while dead) so it blocks nothing,
-//! and movers prune it (≤ 5 s, or 60 s with pending damage).
+//! move must carry `client_ms > last_ms`), `cx/cz` = the spawn chunk, `respawn_ms = now`.
+//! The presence entry in the death chunk is left alone: it is stale (no moves while dead) so
+//! it blocks nothing, and movers prune it (≤ 5 s, or 60 s with pending damage). Its
+//! `pending_damage` is never applied to the new life: `move_player` drops the pending damage
+//! of an own entry last seen before `respawn_ms` (`presence::upsert` / `remove`), e.g. when
+//! the player walks back into the death chunk, or respawns into it.
 
 use core::cell::RefMut;
 
@@ -406,9 +409,15 @@ fn check_presence_overlap(
         let (ncx, ncz) = (cx.wrapping_add(dx), cz.wrapping_add(dz));
         let ai = next()?;
         if *ai.owner == crate::ID {
-            // An existing chunk, then its presence list. A chunk also passed as
-            // `chunk_n/s/e/w` is already validated (and mutably borrowed).
-            let validated = nbr.iter().flatten().any(|c| c.key == ai.key);
+            // An existing chunk, then its presence list. Only the `chunk_n/s/e/w` slot
+            // of exactly this offset counts as already validated (and is mutably
+            // borrowed); any other account gets the stored-identity check for
+            // `(ncx, ncz)`, so a chunk passed for another side can't stand in for it.
+            let validated = NBR_OFF
+                .iter()
+                .position(|&o| o == (dx, dz))
+                .and_then(|i| nbr[i])
+                .is_some_and(|c| c.key == ai.key);
             if !validated {
                 let h = chunk_header(ai)?;
                 require!(
@@ -882,6 +891,7 @@ pub fn respawn(ctx: Context<Respawn>) -> Result<()> {
     ps.attack_until_ms = 0;
     ps.cx = chunk_of(pos[0]);
     ps.cz = chunk_of(pos[2]);
+    ps.respawn_ms = now;
     Ok(())
 }
 
@@ -1029,5 +1039,248 @@ mod tests {
         assert!(!fluid_near(&hood, 8, 5, 8));
         // Diagonal neighbours are not in the set.
         assert!(!fluid_near(&hood, 10, 10, 9));
+    }
+
+    // ----- account-level tests (overlap neighbours, cross-border fluid) -----
+
+    use crate::presence::new_entry;
+    use crate::state::{
+        chunk_header_from, init_chunk_header, init_presence_header, presence_len,
+        CHUNK_BLOCKS_OFFSET, CHUNK_FULL_LEN, GEN_DONE, PRESENCE_ENTRY_SIZE, PRESENCE_HEADER_SIZE,
+    };
+
+    struct Acc {
+        key: Pubkey,
+        owner: Pubkey,
+        lamports: u64,
+        data: Vec<u8>,
+    }
+
+    impl Acc {
+        fn info(&mut self) -> AccountInfo<'_> {
+            AccountInfo::new(
+                &self.key,
+                false,
+                true,
+                &mut self.lamports,
+                &mut self.data,
+                &self.owner,
+                false,
+            )
+        }
+    }
+
+    /// A ready (generated) chunk `(cx, cz)` of `world`, all Air.
+    fn chunk_acc(world: &Pubkey, cx: i32, cz: i32) -> Acc {
+        let mut data = vec![0u8; CHUNK_FULL_LEN];
+        init_chunk_header(&mut data, Pubkey::new_unique(), *world, cx, cz, 255)
+            .unwrap()
+            .gen_stage = GEN_DONE;
+        Acc {
+            key: Pubkey::new_unique(),
+            owner: crate::ID,
+            lamports: 1,
+            data,
+        }
+    }
+
+    /// The presence list of `chunk` with `entries` (player, feet FP, last seen ms).
+    fn presence_acc(chunk: &Pubkey, entries: &[([i32; 3], i64)]) -> Acc {
+        let mut data = vec![0u8; presence_len(entries.len())];
+        init_presence_header(&mut data, *chunk, 255).unwrap();
+        data[42..44].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (i, &(pos, seen)) in entries.iter().enumerate() {
+            let o = PRESENCE_HEADER_SIZE + i * PRESENCE_ENTRY_SIZE;
+            let e = new_entry(&Pubkey::new_unique(), pos, seen);
+            data[o..o + PRESENCE_ENTRY_SIZE].copy_from_slice(bytemuck::bytes_of(&e));
+        }
+        Acc {
+            key: Pubkey::new_unique(),
+            owner: crate::ID,
+            lamports: 1,
+            data,
+        }
+    }
+
+    const NOW: i64 = 1_000_000;
+
+    #[test]
+    fn overlap_neighbours_are_bound_to_their_offset() {
+        let world = Pubkey::new_unique();
+        // Block (16, 40, 8): chunk (1, 0), lx 0 → the west chunk (0, 0) is required.
+        let b = [16, 40, 8];
+        let mut own_c = chunk_acc(&world, 1, 0);
+        let mut own_p = presence_acc(&own_c.key, &[]);
+        // A player in the west chunk whose box reaches across the border into the block.
+        let victim = ([16 * B - 10, 40 * B, 8 * B + 128], NOW);
+        assert!(box_overlaps_block(victim.0, b));
+        let mut west_c = chunk_acc(&world, 0, 0);
+        let mut west_p = presence_acc(&west_c.key, &[victim]);
+        let mut east_c = chunk_acc(&world, 2, 0);
+        let mut east_p = presence_acc(&east_c.key, &[]);
+        let (own_key, west_key, east_key) = (own_c.key, west_c.key, east_c.key);
+        let own_c = own_c.info();
+        let own_p = own_p.info();
+        let (wc, wp) = (west_c.info(), west_p.info());
+        let (ec, ep) = (east_c.info(), east_p.info());
+        let check = |nbr: [Option<&AccountInfo>; 4], extra: &[AccountInfo]| {
+            check_presence_overlap(&world, b, &own_key, &own_p, nbr, extra, NOW)
+        };
+        let none = [None, None, None, None];
+
+        // The real west neighbour: the victim blocks the placement.
+        let e = check(none, &[wc.clone(), wp.clone()]).unwrap_err();
+        assert_eq!(e, error!(MagicraftError::SelfOverlap));
+        // Same, with the west chunk also passed in its own `chunk_w` slot.
+        let e = check([None, None, None, Some(&wc)], &[wc.clone(), wp.clone()]).unwrap_err();
+        assert_eq!(e, error!(MagicraftError::SelfOverlap));
+        // Regression: the east chunk (passed as `chunk_e`) standing in for the west one.
+        let e = check([None, None, Some(&ec), None], &[ec.clone(), ep.clone()]).unwrap_err();
+        assert_eq!(e, error!(MagicraftError::InvalidChunk));
+        // … or put into the `chunk_w` slot: `edit_block` validates every slot against
+        // its own offset first (stored identity says (2, 0)), before any overlap check.
+        let e = edit_block(
+            &own_c,
+            [None, None, None, Some(&ec)],
+            &world,
+            b,
+            |_, _, _| panic!("must not get here"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(e, error!(MagicraftError::InvalidChunk));
+        // Missing neighbour accounts.
+        let e = check(none, &[]).unwrap_err();
+        assert_eq!(e, error!(MagicraftError::InvalidPresence));
+        let e = check(none, std::slice::from_ref(&wc)).unwrap_err();
+        assert_eq!(e, error!(MagicraftError::InvalidPresence));
+        // Presence without its chunk; presence of another chunk.
+        let e = check(none, std::slice::from_ref(&wp)).unwrap_err();
+        assert_eq!(e, error!(MagicraftError::InvalidChunk));
+        let e = check(none, &[wc.clone(), ep.clone()]).unwrap_err();
+        assert_eq!(e, error!(MagicraftError::InvalidPresence));
+        let _ = (west_key, east_key);
+        // A stale victim does not block.
+        assert!(check_presence_overlap(
+            &world,
+            b,
+            &own_key,
+            &own_p,
+            none,
+            &[wc.clone(), wp.clone()],
+            NOW + STALE_MS + 1
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn overlap_missing_neighbour_must_be_its_empty_pda() {
+        let world = Pubkey::new_unique();
+        let b = [16, 40, 8];
+        let mut own_c = chunk_acc(&world, 1, 0);
+        let mut own_p = presence_acc(&own_c.key, &[]);
+        let own_key = own_c.key;
+        let _ = own_c.info();
+        let own_p = own_p.info();
+        let pda = Pubkey::find_program_address(
+            &[
+                CHUNK_SEED,
+                world.as_ref(),
+                &0i32.to_le_bytes(),
+                &0i32.to_le_bytes(),
+            ],
+            &crate::ID,
+        )
+        .0;
+        let mut missing = Acc {
+            key: pda,
+            owner: Pubkey::default(),
+            lamports: 0,
+            data: vec![],
+        };
+        let mut wrong = Acc {
+            key: Pubkey::new_unique(),
+            owner: Pubkey::default(),
+            lamports: 0,
+            data: vec![],
+        };
+        let none = [None, None, None, None];
+        let r = check_presence_overlap(&world, b, &own_key, &own_p, none, &[missing.info()], NOW);
+        assert!(r.is_ok());
+        let e = check_presence_overlap(&world, b, &own_key, &own_p, none, &[wrong.info()], NOW)
+            .unwrap_err();
+        assert_eq!(e, error!(MagicraftError::InvalidPresence));
+    }
+
+    #[test]
+    fn break_next_to_water_enqueues_across_the_border() {
+        let world = Pubkey::new_unique();
+        let idx = |x: usize, y: usize, z: usize| CHUNK_BLOCKS_OFFSET + block_index(x, y, z);
+        let make = || {
+            let mut c = chunk_acc(&world, 0, 0);
+            c.data[idx(14, 10, 5)] = Block::WaterSource as u8;
+            c.data[idx(15, 10, 5)] = Block::Stone as u8;
+            for x in 0..16 {
+                for z in 0..16 {
+                    c.data[idx(x, 9, z)] = Block::Stone as u8; // floor
+                }
+            }
+            c
+        };
+        let mut east = chunk_acc(&world, 1, 0);
+        for x in 0..16 {
+            for z in 0..16 {
+                east.data[idx(x, 9, z)] = Block::Stone as u8;
+            }
+        }
+        // Breaking (15, 10, 5) with the east chunk passed: its (0, 10, 5) is queued there.
+        let mut center = make();
+        {
+            let (c, e) = (center.info(), east.info());
+            let r = edit_block(
+                &c,
+                [None, None, Some(&e), None],
+                &world,
+                [15, 10, 5],
+                |old, _, _| {
+                    assert_eq!(old, Block::Stone as u8);
+                    Ok(AIR)
+                },
+            )
+            .unwrap();
+            assert!(r.has_work[0] && r.has_work[EAST]);
+        }
+        let q = chunk_header_from(&east.data).unwrap().fluid_queue();
+        assert!(q.buf[..q.len()].contains(&(block_index(0, 10, 5) as u16)));
+        let h = chunk_header_from(&center.data).unwrap();
+        assert_eq!(h.edited, 1);
+        assert!(h
+            .fluid_queue()
+            .buf
+            .contains(&(block_index(15, 10, 5) as u16)));
+
+        // Without the east chunk: the center still queues the voxel, the east is untouched.
+        let mut center = make();
+        let mut east2 = chunk_acc(&world, 1, 0);
+        {
+            let c = center.info();
+            let r = edit_block(&c, [None; 4], &world, [15, 10, 5], |_, _, _| Ok(AIR)).unwrap();
+            assert!(r.has_work[0] && !r.has_work[EAST]);
+        }
+        assert!(chunk_header_from(&east2.data)
+            .unwrap()
+            .fluid_queue()
+            .is_empty());
+        let _ = east2.info();
+
+        // No water around and not on a border: nothing is queued (crank stays asleep).
+        let mut dry = chunk_acc(&world, 0, 0);
+        dry.data[idx(5, 10, 5)] = Block::Dirt as u8;
+        {
+            let c = dry.info();
+            let r = edit_block(&c, [None; 4], &world, [5, 10, 5], |_, _, _| Ok(AIR)).unwrap();
+            assert_eq!(r.has_work, [false; 5]);
+        }
+        assert_eq!(chunk_header_from(&dry.data).unwrap().edited, 1);
     }
 }

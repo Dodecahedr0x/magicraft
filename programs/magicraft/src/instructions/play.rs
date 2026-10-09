@@ -251,7 +251,8 @@ pub fn join_world(ctx: Context<JoinWorld>) -> Result<()> {
         break_until_ms: 0,
         attack_until_ms: 0,
         food_tick_ms: now,
-        _reserved: [0; 34],
+        respawn_ms: 0,
+        _reserved: [0; 26],
     };
     s.set_move_state(&MoveState::spawn(pos, now));
     s.try_serialize(&mut &mut ps_ai.try_borrow_mut_data()?[..])?;
@@ -401,9 +402,18 @@ pub fn move_player(
             .old_presence
             .as_ref()
             .ok_or(MagicraftError::InvalidPresence)?;
-        pending += presence::leave(old, &old_chunk, &me, &sponsor)? as u32;
+        pending +=
+            presence::leave(old, &old_chunk, &me, a.player_state.respawn_ms, &sponsor)? as u32;
     }
-    pending += presence::enter_or_update(&a.presence, &new_chunk, &me, pos, t.ms, &sponsor)? as u32;
+    pending += presence::enter_or_update(
+        &a.presence,
+        &new_chunk,
+        &me,
+        pos,
+        t.ms,
+        a.player_state.respawn_ms,
+        &sponsor,
+    )? as u32;
 
     let ps = &a.player_state;
     let mut v = Vitals {

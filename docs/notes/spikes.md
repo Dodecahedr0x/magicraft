@@ -753,7 +753,16 @@ Decisions:
 - **Drops nonce** `(mob.id << 32) ^ chain_ms ^ slot`: not retryable in the same slot; the killer
   can still choose the timing of the last blow (it only shifts a 1–3 item roll).
 - **Respawn** resets inventory, vitals, cooldowns, `MoveState::spawn(spawn, chain_ms)` and
-  `cx/cz`; the old presence entry is left to pruning (stale, so it blocks nothing).
+  `cx/cz`, and records `PlayerState.respawn_ms` (from the reserved bytes, offset 398); the old
+  presence entry is left to pruning (stale, so it blocks nothing). `presence::upsert` / `remove`
+  drop (not apply) the `pending_damage` of an own entry last seen before `respawn_ms`, so damage
+  that hit the dead body never carries into the new life (e.g. walking back into the death
+  chunk within 60 s, or respawning into it).
+- **Review fix (neighbour aliasing):** a `place_block` neighbour chunk counts as pre-validated
+  only if it sits in the `chunk_n/s/e/w` slot of exactly that offset; first version accepted any
+  passed slot, so e.g. the east chunk + its (empty) presence could stand in for the west one and
+  a player across the west border could be built into. Unit tests cover aliasing, missing/wrong
+  `remaining_accounts`, cross-border overlap, the empty-PDA case and cross-border fluid enqueue.
 - Fall damage and death are now tested end to end (pillar of 8 → 5-ish damage; pillar to
   `g2 + 24` and step off → dead; `move`/`break`/`select`/`eat` → `Dead`).
 - Observed: the route's digging can remove the block under the world spawn (respawned players
