@@ -1,0 +1,57 @@
+# Toolchain and dependency versions
+
+Recorded 2026-10-09 when scaffolding the workspace (Task 1). `anchor build` and
+`cargo test -p magicraft-core` pass with this set.
+
+## Toolchain
+
+| Tool | Version |
+|---|---|
+| anchor-cli | 1.0.1 (`[toolchain] anchor_version` in `Anchor.toml`) |
+| solana-cli (Agave) | 4.2.1 |
+| cargo-build-sbf | 4.1.0, platform-tools v1.54 (rustc 1.89.0 for SBF) |
+| host rustc | 1.96 nightly (default toolchain; no `rust-toolchain.toml` needed) |
+| pnpm | 10.12.4 |
+
+## Rust crates (resolved in `Cargo.lock`)
+
+| Crate | Requirement | Resolved |
+|---|---|---|
+| anchor-lang | `=1.0.1` | 1.0.1 (and every `anchor-attribute-*`, `anchor-derive-*`, `anchor-syn` at 1.0.1) |
+| ephemeral-rollups-sdk | `0.17`, features `anchor`, `vrf` | 0.17.3 (pulls ephemeral-vrf-sdk 0.17.3) |
+| session-keys | `3`, feature `no-entrypoint` | 3.1.1 |
+| magicblock-magic-program-api | `0.14` | 0.14.10 |
+| bincode | `1` | 1.3.3 |
+| magicraft-core | path `crates/core` | 0.1.0 |
+
+## npm
+
+| Package | Version |
+|---|---|
+| @anchor-lang/core | 1.0.1 (Anchor 1.x renamed `@coral-xyz/anchor`) |
+| @magicblock-labs/ephemeral-rollups-sdk | 0.17.3 |
+
+## Notes and reasoning
+
+- **No conflict between the MagicBlock crates and Anchor 1.x.** ephemeral-rollups-sdk
+  0.17.3's `anchor` feature maps to `anchor-modern`, which depends on
+  `anchor-lang = "1.0"` (its `anchor-compat` feature is the `<1.0` path, not used).
+  session-keys 3.1.1 accepts `anchor-lang >=0.28, <2.0`. So everything unifies on a
+  single anchor-lang.
+- **Anchor pinned to exactly 1.0.1 to match the CLI.** A plain `"1.0.1"` requirement
+  resolved anchor-lang to 1.2.1. Because anchor-lang 1.0.1 itself depends on its
+  macro crates with caret requirements, pinning only anchor-lang left
+  `anchor-attribute-*`/`anchor-syn` at 1.2.1 (a mixed set). Fix: `anchor-lang = "=1.0.1"`
+  in `programs/magicraft/Cargo.toml` plus `cargo update -p <crate> --precise 1.0.1` for
+  each anchor macro crate; the committed `Cargo.lock` keeps them there. If the CLI is
+  upgraded, bump all of these together (`cargo update -p anchor-lang` etc.).
+- **Two magicblock-magic-program-api versions in the graph.** ephemeral-rollups-sdk
+  0.17.3 depends internally on magicblock-magic-program-api 0.10.1, while the program
+  depends directly on 0.14.10 (needed for newer magic-program instructions such as
+  ephemeral accounts / crank scheduling). They build side by side, but types from the
+  two versions are distinct: do not pass 0.14 types into SDK APIs that expect the
+  SDK's re-exported 0.10 types (or vice versa).
+- ephemeral-rollups-sdk pulls both solana-program 2.3 and 3.0 (anchor-lang 1.0.1 itself uses the
+  modular 3.x crates); this compiles cleanly for SBF.
+- The `#[ephemeral]` macro adds a `process_undelegation` instruction to the IDL next to
+  `ping`.

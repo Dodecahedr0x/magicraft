@@ -1,0 +1,7 @@
+target/
+node_modules/
+test-ledger/
+.anchor/
+app/dist/
+.DS_Store
+**/*.rs.bk

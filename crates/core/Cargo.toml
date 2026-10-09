@@ -1,0 +1,7 @@
+[package]
+name = "magicraft-core"
+version = "0.1.0"
+description = "Deterministic game logic for Magicraft"
+edition = "2021"
+
+[dependencies]
