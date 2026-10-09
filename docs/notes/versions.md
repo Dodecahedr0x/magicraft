@@ -45,6 +45,8 @@ Recorded 2026-10-09 when scaffolding the workspace (Task 1). `anchor build` and
   in `programs/magicraft/Cargo.toml` plus `cargo update -p <crate> --precise 1.0.1` for
   each anchor macro crate; the committed `Cargo.lock` keeps them there. If the CLI is
   upgraded, bump all of these together (`cargo update -p anchor-lang` etc.).
+  **Never run bare `cargo update`; run `scripts/check-anchor-pin.sh` after dependency
+  changes.**
 - **Two magicblock-magic-program-api versions in the graph.** ephemeral-rollups-sdk
   0.17.3 depends internally on magicblock-magic-program-api 0.10.1, while the program
   depends directly on 0.14.10 (needed for newer magic-program instructions such as
