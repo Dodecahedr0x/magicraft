@@ -25,6 +25,7 @@ ephemeral-rollups-sdk = { version = "0.17", features = ["anchor", "vrf"] }
 session-keys = { version = "3", features = ["no-entrypoint"] }
 magicblock-magic-program-api = "0.14"
 bincode = "1"
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 magicraft-core = { path = "../../crates/core" }
 
 [lints.rust]

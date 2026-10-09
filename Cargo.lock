@@ -1288,6 +1288,7 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "bincode",
+ "bytemuck",
  "ephemeral-rollups-sdk",
  "magicblock-magic-program-api 0.14.10",
  "magicraft-core",

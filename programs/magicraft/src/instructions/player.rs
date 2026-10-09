@@ -1,8 +1,11 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{transfer, Transfer};
-use ephemeral_rollups_sdk::anchor::delegate;
+use ephemeral_rollups_sdk::anchor::{delegate, MagicProgram};
+use ephemeral_rollups_sdk::consts::MAGIC_CONTEXT_ID;
 use ephemeral_rollups_sdk::cpi::DelegateConfig;
+use ephemeral_rollups_sdk::ephem::commit_and_undelegate_accounts;
 
+use crate::errors::MagicraftError;
 use crate::state::{Player, PLAYER_SEED};
 
 // ---------- init_player (base layer) ----------
@@ -26,6 +29,7 @@ pub fn init_player(ctx: Context<InitPlayer>) -> Result<()> {
     let player = &mut ctx.accounts.player;
     player.authority = ctx.accounts.authority.key();
     player.bump = ctx.bumps.player;
+    player.open_chunks = 0;
     Ok(())
 }
 
@@ -84,5 +88,66 @@ pub fn delegate_player(ctx: Context<DelegatePlayer>, validator: Option<Pubkey>) 
             ..Default::default()
         },
     )?;
+    Ok(())
+}
+
+// ---------- withdraw (ER): commit + undelegate ----------
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [PLAYER_SEED, authority.key().as_ref()],
+        bump = player.bump,
+        has_one = authority
+    )]
+    pub player: Account<'info, Player>,
+    /// CHECK: Magic context
+    #[account(mut, address = MAGIC_CONTEXT_ID)]
+    pub magic_context: UncheckedAccount<'info>,
+    pub magic_program: Program<'info, MagicProgram>,
+}
+
+/// Step 1 of a withdrawal, sent to the ER: commits the Player (its base balance moves by
+/// the ER-side delta since the last sync) and undelegates it. Never blocked: open
+/// chunks stay on the ER (`open_chunks` is only a UI warning). Wallet-signed only.
+pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
+    let a = &ctx.accounts;
+    commit_and_undelegate_accounts(
+        &a.authority.to_account_info(),
+        vec![&a.player.to_account_info()],
+        &a.magic_context.to_account_info(),
+        &a.magic_program.to_account_info(),
+        None,
+    )?;
+    Ok(())
+}
+
+// ---------- withdraw_base (base layer, after undelegation) ----------
+
+#[derive(Accounts)]
+pub struct WithdrawBase<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [PLAYER_SEED, authority.key().as_ref()],
+        bump = player.bump,
+        has_one = authority
+    )]
+    pub player: Account<'info, Player>,
+}
+
+/// Step 2, on the base layer once the Player is owned by this program again: moves
+/// `lamports` to the wallet, keeping the Player rent-exempt.
+pub fn withdraw_base(ctx: Context<WithdrawBase>, lamports: u64) -> Result<()> {
+    let player = ctx.accounts.player.to_account_info();
+    let min = Rent::get()?.minimum_balance(player.data_len());
+    let available = player.lamports().saturating_sub(min);
+    require!(lamports <= available, MagicraftError::InsufficientFunds);
+    player.sub_lamports(lamports)?;
+    ctx.accounts.authority.add_lamports(lamports)?;
     Ok(())
 }

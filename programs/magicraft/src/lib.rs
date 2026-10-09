@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::anchor::ephemeral;
 
+pub mod auth;
 pub mod errors;
 pub mod instructions;
 pub mod state;
@@ -34,6 +35,16 @@ pub mod magicraft {
 
     pub fn delegate_player(ctx: Context<DelegatePlayer>, validator: Option<Pubkey>) -> Result<()> {
         instructions::player::delegate_player(ctx, validator)
+    }
+
+    /// ER: commit + undelegate the Player (step 1 of a withdrawal).
+    pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
+        instructions::player::withdraw(ctx)
+    }
+
+    /// Base layer, after undelegation: transfer `lamports` to the wallet.
+    pub fn withdraw_base(ctx: Context<WithdrawBase>, lamports: u64) -> Result<()> {
+        instructions::player::withdraw_base(ctx, lamports)
     }
 }
 

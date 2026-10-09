@@ -22,6 +22,7 @@ Recorded 2026-10-09 when scaffolding the workspace (Task 1). `anchor build` and
 | session-keys | `3`, feature `no-entrypoint` | 3.1.1 |
 | magicblock-magic-program-api | `0.14` | 0.14.10 |
 | bincode | `1` | 1.3.3 |
+| bytemuck | `1`, features `derive`, `min_const_generics` (Task 15) | 1.25.2 (+ bytemuck_derive 1.12.1; both were already in the lock via Solana crates, so adding it changed only the magicraft dependency list) |
 | magicraft-core | path `crates/core` | 0.1.0 |
 
 ## npm

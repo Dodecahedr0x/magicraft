@@ -17,7 +17,10 @@ WALLET="${ANCHOR_WALLET:-$HOME/.config/solana/id.json}"
 # Faucet/gossip/dynamic ports are moved off the solana-test-validator defaults
 # (9900, 8000-10000) so another local validator (e.g. a second project's stack) can
 # run alongside.
-BASE_PORT=8899 BASE_WS_PORT=8900 ER_PORT=7799 ER_WS_PORT=7800
+# BASE_PORT / BASE_WS_PORT can be overridden (e.g. when 8899 is taken by a tunnel);
+# point the tests at them with PROVIDER_ENDPOINT / WS_ENDPOINT.
+BASE_PORT="${BASE_PORT:-8899}" BASE_WS_PORT="${BASE_WS_PORT:-$((BASE_PORT + 1))}"
+ER_PORT=7799 ER_WS_PORT=7800
 FAUCET_PORT=9909 GOSSIP_PORT=8100 DYNAMIC_PORTS=8101-8200
 BASE_RPC="http://127.0.0.1:$BASE_PORT" BASE_WS="ws://127.0.0.1:$BASE_WS_PORT"
 ER_RPC="http://127.0.0.1:$ER_PORT" ER_WS="ws://127.0.0.1:$ER_WS_PORT"

@@ -51,9 +51,11 @@ A CPI can grow an account by at most 10 240 bytes, so any account larger than th
 | Account | Seeds | Contents |
 |---|---|---|
 | `World` (≤ 10 240 B) | `["world", creator, nonce]` | name, creator, nonce, bump, `seed: [u8;32]`, `seed_set`, `params: WorldParams`, `time_of_day`, `spawn: (x,y,z)`, day-crank task id, `last_tick`, chunk count |
-| `Chunk` | `["chunk", world, cx, cz]` | payer, bump, `edited`, `gen_stage`, blocks `16×16×64` u8 (16 KB), mob slots (8), fluid queue (ring of 64), tick-crank task id, `last_tick` |
+| `Chunk` (17 152 B = 768 header + 16 384 blocks; rent 550 784) | `["chunk", world, cx, cz]` | payer, bump, `edited`, `gen_stage`, blocks `16×16×64` u8 (16 KB), mob slots (8), fluid queue (ring of 64), tick-crank task id, `last_tick` |
 | `ChunkPresence` | `["presence", chunk]` | growable vec of `{player, pos, last_seen, pending_damage}` (~40 B each), no cap |
 | `PlayerState` | `["pstate", world, player]` | pos, vel, `fall_start_y`, health, food, 36-slot inventory `{item:u16,count:u8,durability:u16}`, cooldowns, last move slot/time |
+
+Exact byte layouts of all accounts: `programs/magicraft/src/state.rs` (module docs).
 
 ### WorldParams (set at `create_world`, immutable, range-checked)
 
