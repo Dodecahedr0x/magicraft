@@ -193,7 +193,7 @@ pub fn classify(t: i32, m: i32, r: i32) -> Biome {
 
 /// Height parameters `(base, amp)` of a biome: `h ≈ base + amp · d/512`.
 #[inline(always)]
-pub fn params(b: Biome) -> (i32, i32) {
+pub const fn params(b: Biome) -> (i32, i32) {
     match b {
         Biome::Plains => (30, 5),
         Biome::Forest => (32, 6),
@@ -202,6 +202,24 @@ pub fn params(b: Biome) -> (i32, i32) {
         Biome::Mountains => (41, 19),
     }
 }
+
+// `height_from` divides unsigned: its numerator is positive because every biome sample has
+// `8·base − lowland − 8·amp > 0` (1/8 blocks, worst lowland depth) and `|d| ≤ 512·BLEND`.
+const _: () = {
+    let all = [
+        Biome::Plains,
+        Biome::Forest,
+        Biome::Desert,
+        Biome::Snowy,
+        Biome::Mountains,
+    ];
+    let mut i = 0;
+    while i < all.len() {
+        let (base, amp) = params(all[i]);
+        assert!(base * 8 - LOWLAND_DEPTH * 8 - amp * 8 > 0);
+        i += 1;
+    }
+};
 
 /// Per-lattice-point blend sample `(base in 1/8 blocks, amp, is_mountain)`.
 #[inline(always)]
@@ -266,7 +284,7 @@ fn height_from(base: i32, amp: i32, mtn: i32, n: i32) -> i32 {
     let den = 8 * BLEND * BLEND * 512;
     let num = base as i64 * BLEND * 512 + amp as i64 * 8 * d;
     // `num > 0`: every sample has `8·base − lowland − 8·amp ≥ 136 > 0` (1/8 blocks; Plains
-    // 240 − 40 − 40, Mountains 328 − 40 − 152; test `height_numerator_positive`) and
+    // 240 − 40 − 40, Mountains 328 − 40 − 152; const-asserted after `params`) and
     // `|d| ≤ 512·BLEND`, so the blend is positive. Unsigned division (one SBF instruction)
     // then equals `div_euclid`; signed `i64` division is a ~200 CU software routine on SBF.
     debug_assert!(num >= 0);
@@ -493,6 +511,11 @@ pub const WIN_LAT: usize = 7;
 /// `-2..18` on both axes), shared by all 8 neighbor parts: an 11×11 lattice sub-grid
 /// instead of one 6×9 (side) or 6×6 (corner) grid per neighbor. Heights are a pure function
 /// of the world column, so [`window_heights`] equals each neighbor's own stage 1 exactly.
+///
+/// Wrap seam: chunk origins are `cx.wrapping_mul(16)` and window/lattice coordinates use
+/// wrapping `i32` arithmetic, exactly as stage 1 and [`heights_cols`] do, so results agree
+/// everywhere; like the noise itself they are discontinuous where world `x`/`z` wraps past
+/// `i32` (|cx| ≥ 2^27 chunks), which no bounded world reaches. Nothing panics there.
 /// SBF-measured ≈ 33k CU; 588 B.
 pub struct WindowSums([[Sums; WIN_LAT]; WIN_LAT]);
 
@@ -561,9 +584,11 @@ fn surface_of(b: Biome, h: i32) -> (Block, Block) {
 /// water/ice in `h+1..=SEA_LEVEL`, and solid blocks at `0..=h` with `h ≥ MIN_HEIGHT`).
 ///
 /// Stage-1 columns are solid exactly up to `h`, so the predicate is monotone in `y` and a
-/// binary search finds `h` in 6 probes (a top-down scan needed up to 57). Chunk blocks are
-/// not playable (so not editable) before `populate_chunk`, so the input is always genuine
-/// stage-1 output. SBF-measured ≈ 13k CU (fixed). Frame < 0.1 KB.
+/// binary search finds `h` in 6 probes (a top-down scan needed up to 57). This relies on the
+/// input being genuine stage-1 output: onchain, the stage-unchecked block accessors
+/// `magicraft::state::chunk_parts_mut` / `chunk_blocks_mut` are for `grow_chunk` /
+/// `populate_chunk` only, and gameplay edits go through `ready_chunk_mut`, which requires
+/// `GEN_DONE` — so nothing can modify the blocks between stage 1 and populate. SBF-measured 30-34k CU (fixed). Frame < 0.1 KB.
 #[inline(never)]
 pub fn stage1_info_from_blocks(
     blocks: &[u8; CHUNK_VOL],
@@ -802,22 +827,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    /// `height_from`'s unsigned division needs a positive numerator: every biome sample has
-    /// `8·base − lowland − 8·amp > 0` (in 1/8 blocks), and `|d| ≤ 512·BLEND`.
-    #[test]
-    fn height_numerator_positive() {
-        for b in [
-            Biome::Plains,
-            Biome::Forest,
-            Biome::Desert,
-            Biome::Snowy,
-            Biome::Mountains,
-        ] {
-            let (base, amp) = params(b);
-            assert!(base * 8 - LOWLAND_DEPTH * 8 - amp * 8 > 0, "{b:?}");
         }
     }
 

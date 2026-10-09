@@ -10,7 +10,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-magicraft-core = { path = "../../crates/core" }
+magicraft-core = { path = "../../crates/core", features = ["bench"] }
 
 # Same release settings as the workspace (root Cargo.toml).
 [profile.release]

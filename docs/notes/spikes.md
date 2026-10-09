@@ -600,7 +600,7 @@ Per-instruction profiles: `SBF_TRACE_DIR=<dir>` (litesvm register tracing) + `ll
 | `stage1_info_from_blocks` | 17k-58k | 30k-34k (fixed) |
 | `generate_stage2` (768 chunks, 3 seeds) | — | median 175k, max 294k |
 | `populate_chunk` ix (local ER) | 587k-802k | 196k-262k (outside core ≈ 4.4k) |
-| worst-case bound | ≈ 1.42M (modeled) | **889k** (`STAGE2_CU_BOUND`, calibrated) |
+| worst-case bound | ≈ 1.42M (modeled) | **898k** (`STAGE2_CU_BOUND`, calibrated) |
 
 Findings / techniques:
 - **Signed `i64` division is a ~200 CU software routine on SBF** (`__divdi3`), even by a
@@ -627,14 +627,25 @@ Findings / techniques:
   syscalls (cheap), the SBF loop around a few loads/stores costs ≈ 6-8 CU per byte.
 
 **Bound (`populate::STAGE2_CU_BOUND`, const-asserted ≤ 950k):** loop counts are hard limits;
-unit costs are measured maxima rounded up ≥ 10%. Ix overhead 15k (measured 4.4k on the ER) +
-Stage1Info 40k + window 118k + worm replay 432 spheres × 290 + 2k (fit over 1 728 chunks:
-≤ 1.2k + 260/sphere) + carving 432 × 290 + 0.9 × `CAVE_OPS_CAP` (380k modeled ops; over 26 712
-sphere geometries — r 1-3, every chunk-edge clip, deep and above-sea ceilings, worst write path —
-carving one sphere costs ≤ 255 + 0.9 × its modeled ops; real chunks ≈ 0.75 CU/op) + trees 116k
-(54 candidates, 48 `biome_at` at 0.68k, 6 own trees ≤ 2.37k, 24 side-neighbor trees ≤ 1.44k,
-24 corner ones ≤ 0.64k) + misc 6k = **889k**. The modeled cave weights and cap are unchanged
-(they decide which spheres are carved, i.e. the output); only their CU calibration is new.
+unit costs are measured maxima rounded up (mostly 10-20%, never below the measurement; the carve
+slope 0.9 CU/op is the fit itself, its margin sits in the per-sphere term). Ix overhead 15k
+(measured 4.4k on the ER) + Stage1Info 40k + window 122k (`WindowSums` 42k, strips ≤ 12.6k incl.
+glue — a z strip measures 10.8k, corners 4.1k, `col_limits` 12k) + worm replay 432 × 300 + 2k
+(measured with every sphere touching, i.e. the real replay plus the clip-and-cost path for the
+misses: ≤ 0.7k + 300/sphere) + carving 432 × 290 + 0.9 × `CAVE_OPS_CAP` (380k modeled ops; over
+26 712 sphere geometries — r 1-3, every chunk-edge clip, deep and above-sea ceilings, worst write
+path — carving one sphere costs ≤ 255 + 0.9 × its modeled ops; real chunks ≈ 0.75 CU/op) + trees
+117k (54 candidates ≤ 40 each, 48 `biome_at` ≤ 0.67k, 6 own trees ≤ 2.38k, 24 side-neighbor trees
+≤ 1.44k, 24 corner ones ≤ 0.64k) + misc 6k = **898k**. The modeled cave weights and cap are
+unchanged (they decide which spheres are carved, i.e. the output); only their CU calibration is new.
+
+`bench/cu/run.sh check` re-measures every unit cost except the ix overhead and fails if one
+exceeds its constant in `populate.rs`; **re-run it after any terrain/caves/populate change and
+after every toolchain upgrade** (platform-tools, rustc, Agave), then raise constants as needed.
+Bench hooks (`bench_carve_one`, `bench_replay_touching`, `bench_col_limits`, `bench_write_tree`,
+public `Lim`) exist only with core's `bench` feature, which only `bench/cu` enables. A golden test
+(`golden_terrain_digest`) pins an FNV digest of stage 1 + stage 2 + spawns over 3 seeds × 36
+chunks; its value was confirmed on the pre-17b build (491994e).
 
 Other: the 12-chunk spec's stage-1 regenerate test re-sent a byte-identical create + grow tx
 within the same ER blockhash once grow got fast ("already processed"); it now uses a different

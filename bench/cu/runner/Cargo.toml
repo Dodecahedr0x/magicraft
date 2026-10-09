@@ -6,6 +6,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+magicraft-core = { path = "../../../crates/core" }
 litesvm = { version = "0.17", features = ["register-tracing"] }
 solana-compute-budget = "4"
 solana-keypair = "3"

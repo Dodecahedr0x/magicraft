@@ -113,8 +113,8 @@ Deterministic integer math on `hash(world.seed, …)`; independent of chunk crea
 - **Stage 2 cost bound:** a chunk over budget would be stuck at `gen_stage 1`, so populate is
   bounded by construction: cave carving stops taking spheres at a modeled 380k ops (measured over
   10^6 chunks: p99.999 288k, max 340k — never hit), and the const `STAGE2_CU_BOUND` (SBF-calibrated
-  CU: hard loop counts × measured unit costs + ≥ 10%, ≈ 889k incl. ix overhead) is asserted
-  ≤ 950k. **SBF-measured (Task 17b, `bench/cu`):** create + grow tx ≈ 186k-200k CU (stage 1
+  CU: hard loop counts × rounded-up measured unit costs, ≈ 898k incl. ix overhead; re-checked by
+  `bench/cu/run.sh check`) is asserted ≤ 950k. **SBF-measured (Task 17b, `bench/cu`):** create + grow tx ≈ 186k-200k CU (stage 1
   150k-175k), populate ≈ 196k-262k (stage 2 median 175k, max 294k over 768 chunks). Task 17's
   numbers (grow 584k-604k, populate 587k-802k, construction bound ≈ 1.42M) were dominated by
   signed `i64` divisions (a ~200 CU routine on SBF) and per-neighbor lattice grids (see

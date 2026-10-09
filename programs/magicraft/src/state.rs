@@ -814,12 +814,16 @@ pub fn chunk_header_mut<'a>(ai: &'a AccountInfo) -> Result<RefMut<'a, ChunkHeade
 }
 
 /// Mutably borrowed blocks of a grown chunk (`ChunkNotReady` before `grow_chunk`).
+/// **Generation only** (`grow_chunk` / `populate_chunk`): the stage is not checked, and
+/// `magicraft_core::terrain::stage1_info_from_blocks` relies on stage-1 blocks staying
+/// untouched until populate. Gameplay must use [`ready_chunk_mut`] (`GEN_DONE`).
 pub fn chunk_blocks_mut<'a>(ai: &'a AccountInfo) -> Result<RefMut<'a, [u8; CHUNK_VOL]>> {
     Ok(chunk_parts_mut(ai)?.1)
 }
 
 /// Header + blocks of a grown chunk (generation stage not checked: for `grow_chunk` /
-/// `populate_chunk`; gameplay uses [`ready_chunk_mut`]).
+/// `populate_chunk` only — `stage1_info_from_blocks` relies on stage-1 blocks staying
+/// untouched until populate; gameplay uses [`ready_chunk_mut`]).
 pub fn chunk_parts_mut<'a>(
     ai: &'a AccountInfo,
 ) -> Result<(RefMut<'a, ChunkHeader>, RefMut<'a, [u8; CHUNK_VOL]>)> {

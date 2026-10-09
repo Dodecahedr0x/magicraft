@@ -4,4 +4,8 @@ version = "0.1.0"
 description = "Deterministic game logic for Magicraft"
 edition = "2021"
 
+[features]
+# SBF CU calibration hooks for `bench/cu` (never enabled by the program).
+bench = []
+
 [dependencies]

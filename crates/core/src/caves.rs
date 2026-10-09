@@ -262,7 +262,14 @@ pub struct CaveStats {
 
 /// Per-column carve ceilings: `y` is carvable iff `y ≤ lo[c] || (SEA_LEVEL < y ≤ top[c])`
 /// (`1 ≤ y` is guaranteed by the bbox clip).
-#[doc(hidden)]
+#[cfg(not(feature = "bench"))]
+struct Lim {
+    lo: [u8; 256],
+    top: [u8; 256],
+}
+
+/// Per-column carve ceilings (public only for the `bench` feature's calibration hooks).
+#[cfg(feature = "bench")]
 pub struct Lim {
     pub lo: [u8; 256],
     pub top: [u8; 256],
@@ -331,16 +338,9 @@ pub fn carve_caves_capped(
             let own = dx == 0 && dz == 0;
             let worms = worms_for_chunk(seed, cx.wrapping_add(dx), cz.wrapping_add(dz));
             for s in worms {
-                let Some(bb) = clip_bbox(s.x - ox, s.y, s.z - oz, s.r) else {
+                let Some(bb) = admit(&mut st, s.x - ox, s.y, s.z - oz, s.r, cap) else {
                     continue;
                 };
-                let w = bb.ops_bound(s.r);
-                st.demand += w;
-                if st.ops + w > cap {
-                    st.skipped += 1;
-                    continue;
-                }
-                st.ops += w;
                 let lim = lim.get_or_insert_with(|| {
                     let mut l = [EMPTY_LIM, EMPTY_LIM];
                     col_limits(win, biomes, &mut l);
@@ -359,11 +359,11 @@ pub fn carve_caves_capped(
     st
 }
 
-/// SBF CU calibration hook (`bench/cu`; not part of the API): the per-sphere work of
+/// SBF CU calibration hook (`bench` feature, `bench/cu`): the per-sphere work of
 /// [`carve_caves`] for one radius-`r` sphere with chunk-local fixed-point centre — clip,
 /// [`BBox::ops_bound`] and the carve under ceilings `lim` — returning the modeled ops (0 if
 /// the sphere misses the chunk).
-#[doc(hidden)]
+#[cfg(feature = "bench")]
 #[inline(never)]
 pub fn bench_carve_one(blocks: &mut [u8; CHUNK_VOL], lim: &Lim, c: (i64, i64, i64), r: i32) -> u32 {
     let Some(bb) = clip_bbox(c.0, c.1, c.2, r) else {
@@ -377,6 +377,47 @@ pub fn bench_carve_one(blocks: &mut [u8; CHUNK_VOL], lim: &Lim, c: (i64, i64, i6
     };
     carve_sphere(blocks, lim, &ctx, &bb);
     bb.ops_bound(r)
+}
+
+/// SBF CU calibration hook (`bench` feature): the worm replay of [`carve_caves`] with every
+/// sphere moved to the chunk centre (x, z), so each one is clipped and costed (the
+/// worst-case replay path); cap 0, nothing is carved. Returns the stats (`skipped` = spheres).
+#[cfg(feature = "bench")]
+#[inline(never)]
+pub fn bench_replay_touching(seed: &Seed, cx: i32, cz: i32) -> CaveStats {
+    let mut st = CaveStats::default();
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            for s in worms_for_chunk(seed, cx.wrapping_add(dx), cz.wrapping_add(dz)) {
+                let c = 8 * FPL + (s.x & (FPL - 1));
+                let _ = admit(&mut st, c, s.y, 8 * FPL + (s.z & (FPL - 1)), s.r, 0);
+            }
+        }
+    }
+    st
+}
+
+/// SBF CU calibration hook (`bench` feature): `col_limits` (the 4 sides must already be
+/// loaded for a pure measurement).
+#[cfg(feature = "bench")]
+#[inline(never)]
+pub fn bench_col_limits(win: &mut HeightWindow, biomes: &[Biome; 256], out: &mut [Lim; 2]) {
+    col_limits(win, biomes, out);
+}
+
+/// Clips a sphere (chunk-local fixed-point centre) and charges its modeled ops against
+/// `cap`: `Some(bbox)` if it is to be carved.
+#[inline(always)]
+fn admit(st: &mut CaveStats, lx: i64, ly: i64, lz: i64, r: i32, cap: u32) -> Option<BBox> {
+    let bb = clip_bbox(lx, ly, lz, r)?;
+    let w = bb.ops_bound(r);
+    st.demand += w;
+    if st.ops + w > cap {
+        st.skipped += 1;
+        return None;
+    }
+    st.ops += w;
+    Some(bb)
 }
 
 const EMPTY_LIM: Lim = Lim {

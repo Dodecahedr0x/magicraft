@@ -9,17 +9,23 @@
 //! `fbm_rect`s, 13 empty (log overhead), 14 `WindowSums::new`, 15/16 `WindowSums::new` then
 //! a window side strip / corner, 17 `generate_stage1` then `stage1_info_from_blocks`,
 //! 20 one carved sphere (`bench_carve_one`; centre i32 ×3, r, lo, top), 21 worm replay
-//! (plain iteration, then `carve_caves_capped` with cap 0), 23 48 × `biome_at`, 24 one tree
-//! write at local `(cx, cz)`.
+//! (plain iteration, `carve_caves_capped` with cap 0, then `bench_replay_touching`), 22
+//! `col_limits`, 18 `WindowSums::new` then a z side strip, 26 54 tree candidates, 23 48 × `biome_at`, 24 one tree write at local `(cx, cz)`, 25 ores + cacti +
+//! animals.
 //! Scratch buffers live in the 32 KB SBF heap region (no allocator is used).
 
-use magicraft_core::caves::{bench_carve_one, carve_caves_capped, worms_for_chunk, Lim};
+use magicraft_core::caves::{
+    bench_carve_one, bench_col_limits, bench_replay_touching, carve_caves_capped, worms_for_chunk,
+    Lim,
+};
 use magicraft_core::consts::CHUNK_VOL;
 use magicraft_core::hash::Seed;
 use magicraft_core::noise::{fbm_chunk, fbm_grid9, fbm_rect};
 use magicraft_core::populate::{
-    bench_write_tree, generate_stage2_stats, HeightWindow, MobSpawn, MAX_SPAWNS,
+    bench_write_tree, generate_stage2_stats, place_cacti, place_ores, spawn_animals, HeightWindow,
+    MobSpawn, MAX_SPAWNS,
 };
+use magicraft_core::populate::{tree_candidate, TREE_CANDIDATES};
 use magicraft_core::terrain::{
     biome_at, biomes_chunk, generate_stage1, heights_chunk, heights_cols, stage1_info_from_blocks,
     window_heights, Stage1Info, WindowSums,
@@ -139,6 +145,30 @@ pub unsafe extern "C" fn entrypoint(input: *mut u8) -> u64 {
             sol_log_compute_units_();
             acc = 0;
         }
+        18 => {
+            let sums = WindowSums::new(&seed, cx, cz);
+            sol_log_compute_units_();
+            window_heights(&seed, &sums, cx, cz, (0, 16), (16, 2), &mut h[..]);
+            sol_log_compute_units_();
+            acc = h[3] as u64;
+        }
+        26 => {
+            sol_log_compute_units_();
+            let mut a = 0u64;
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    for i in 0..TREE_CANDIDATES {
+                        let (tx, tz, roll, t) = tree_candidate(&seed, cx + dx, cz + dz, i);
+                        let (lx, lz) = (tx + dx * 16, tz + dz * 16);
+                        if (-2..18).contains(&lx) && (-2..18).contains(&lz) {
+                            a += roll as u64 + t as u64;
+                        }
+                    }
+                }
+            }
+            sol_log_compute_units_();
+            acc = a;
+        }
         14..=16 => {
             sol_log_compute_units_();
             let sums = WindowSums::new(&seed, cx, cz);
@@ -196,14 +226,43 @@ pub unsafe extern "C" fn entrypoint(input: *mut u8) -> u64 {
             let mut win = HeightWindow::new(&seed, cx, cz, h);
             let st = carve_caves_capped(&seed, cx, cz, blocks, &info.biomes, &mut win, 0);
             sol_log_compute_units_();
+            let all = bench_replay_touching(&seed, cx, cz);
+            sol_log_compute_units_();
             let mut cnt = 0u64;
             for dz in -1..=1 {
                 for dx in -1..=1 {
                     cnt += worms_for_chunk(&seed, cx + dx, cz + dz).count() as u64;
                 }
             }
-            sol_log_64_(cnt, st.skipped as u64, st.demand as u64, n, 0);
+            sol_log_64_(
+                cnt,
+                st.skipped as u64,
+                st.demand as u64,
+                n,
+                all.skipped as u64,
+            );
             acc = 0;
+        }
+        22 => {
+            generate_stage1(&seed, cx, cz, blocks, info);
+            let mut win = HeightWindow::new(&seed, cx, cz, &info.heights);
+            for (x, z) in [(-1, 0), (16, 0), (0, -1), (0, 16)] {
+                win.get(x, z);
+            }
+            let lim = &mut *((HEAP + CHUNK_VOL + 8192) as *mut [Lim; 2]);
+            sol_log_compute_units_();
+            bench_col_limits(&mut win, &info.biomes, lim);
+            sol_log_compute_units_();
+            acc = lim[0].lo[9] as u64;
+        }
+        25 => {
+            generate_stage1(&seed, cx, cz, blocks, info);
+            sol_log_compute_units_();
+            place_ores(&seed, cx, cz, blocks);
+            place_cacti(&seed, cx, cz, blocks, info);
+            let n = spawn_animals(&seed, cx, cz, blocks, info, mobs);
+            sol_log_compute_units_();
+            acc = n as u64;
         }
         23 => {
             sol_log_compute_units_();

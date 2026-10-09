@@ -49,9 +49,9 @@
 //! A chunk whose `populate_chunk` exceeded the 1.4M budget would be stuck at `gen_stage 1`
 //! forever, so every term is bounded by construction (loop counts) and priced with
 //! SBF-measured unit costs ([`STAGE2_CU_BOUND`], const-asserted ≤ 950k; currently
-//! **≈ 889k**): ix overhead 15k + Stage1Info rebuild 40k + height window 118k (shared lattice
-//! sums 42k, 4 strips, 4 corners, column ceilings) + worm replay 127k (432 spheres) +
-//! carving ≤ 432 × 290 + 0.9 × [`CAVE_OPS_CAP`] = 467k + trees 116k + misc 6k. The cave cap
+//! **≈ 898k**): ix overhead 15k + Stage1Info rebuild 40k + height window 122k (shared lattice
+//! sums 42k, 4 strips, 4 corners, column ceilings) + worm replay 132k (432 spheres) +
+//! carving ≤ 432 × 290 + 0.9 × [`CAVE_OPS_CAP`] = 467k + trees 117k + misc 6k. The cave cap
 //! itself is unchanged (380k **modeled** ops, see [`crate::caves`]); the calibration maps
 //! modeled ops to CU (≤ 0.9 CU per op + 290 per sphere, over 26 712 measured geometries).
 //!
@@ -114,27 +114,39 @@ pub const MAX_SPAWNS: usize = 3;
 
 /// # Worst-case CU bound of `populate_chunk` (SBF-calibrated; see module docs, "Cost")
 ///
-/// Every constant is an SBF-measured cost (`bench/cu`: litesvm, platform-tools v1.54, the
-/// workspace release profile; Task 17b, 2026-10-09) rounded up by ≥ 10%, times a loop count
-/// that is a hard limit by construction. Re-run `bench/cu/run.sh calibrate` after changing
-/// terrain, caves or populate code. [`STAGE2_CU_BOUND`] is const-asserted ≤ 950k (limit
-/// 1.4M).
+/// Every `CU_*` unit cost is an SBF-measured maximum (`bench/cu`: litesvm, platform-tools
+/// v1.54, the workspace release profile; Task 17b, 2026-10-09) rounded up — mostly by
+/// 10-20%, never below the measurement — times a loop count that is a hard limit by
+/// construction. The one exception is [`CU_CARVE_PER_OP_PERMILLE`], which is the fitted slope
+/// itself (its margin is in [`CU_CARVE_PER_SPHERE`]). `bench/cu/run.sh check` re-measures
+/// every checkable unit cost and fails if one exceeds its constant: **run it after any change
+/// to terrain / caves / populate code and after every toolchain (platform-tools, rustc,
+/// Agave) upgrade**, then raise the constant if needed. [`STAGE2_CU_BOUND`] is
+/// const-asserted ≤ 950k (limit 1.4M).
 ///
 /// Program part of `populate_chunk` outside core (Anchor dispatch, account checks, header
-/// and mob writes): measured ≈ 4.4k on the local ER.
+/// and mob writes): measured ≈ 4.4k on the local ER (not checked by `run.sh check`).
 pub const CU_IX_OVERHEAD: u32 = 15_000;
 /// [`stage1_info_from_blocks`](crate::terrain::stage1_info_from_blocks): 256 binary
 /// searches of ≤ 6 probes; measured max 33.5k over 1 200 chunks.
 pub const CU_STAGE1_INFO: u32 = 40_000;
-/// Height window: [`HeightWindow::new`] (≈ 0.65k), `col_limits` (≈ 9.7k, data-independent),
-/// [`WindowSums::new`] (max 38.0k), 4 side strips (max 9.6k + ≈ 0.45k load glue each) and
-/// 4 corners (max 3.0k + glue each).
-pub const CU_WINDOW: u32 = 1_000 + 12_000 + 42_000 + 4 * (11_000 + 600) + 4 * (3_500 + 600);
+/// Height window parts: [`HeightWindow::new`] (≈ 0.65k), `col_limits` (9.7k,
+/// data-independent), [`WindowSums::new`] (max 38.0k), one side strip / corner via
+/// [`window_heights`] (max 10.8k for a z strip, 9.6k for an x strip / 3.0k) plus ≈ 0.45k
+/// loader glue (600 allowed).
+pub const CU_WINDOW_NEW: u32 = 1_000;
+pub const CU_COL_LIMITS: u32 = 12_000;
+pub const CU_WINDOW_SUMS: u32 = 42_000;
+pub const CU_WINDOW_SIDE: u32 = 12_000 + 600;
+pub const CU_WINDOW_CORNER: u32 = 3_500 + 600;
+pub const CU_WINDOW: u32 =
+    CU_WINDOW_NEW + CU_COL_LIMITS + CU_WINDOW_SUMS + 4 * CU_WINDOW_SIDE + 4 * CU_WINDOW_CORNER;
 /// Worm replay of the 3×3 neighborhood: every sphere of every worm is generated, clipped and
-/// (if it touches the chunk) costed, carved or not. At most [`MAX_SPHERES`] spheres; fit over
-/// 1 728 chunks: CU ≤ 1.2k + 260 × spheres.
+/// (if it touches the chunk) costed, carved or not. At most [`MAX_SPHERES`] spheres. Measured
+/// worst case with every sphere touching (real replay + the clip-and-cost path for the
+/// spheres that missed, over 1 728 chunks): ≤ 0.7k + 300 × spheres.
 pub const MAX_SPHERES: u32 = 9 * MAX_WORMS as u32 * SEGS.1 as u32;
-pub const CU_REPLAY_PER_SPHERE: u32 = 290;
+pub const CU_REPLAY_PER_SPHERE: u32 = 300;
 pub const CU_REPLAY_FIXED: u32 = 2_000;
 /// Carving one sphere costs ≤ `CU_CARVE_PER_SPHERE` + `CU_CARVE_PER_OP_PERMILLE`/1000 ×
 /// its modeled ops ([`BBox::ops_bound`](crate::caves::BBox::ops_bound)); measured over
@@ -143,11 +155,20 @@ pub const CU_REPLAY_FIXED: u32 = 2_000;
 /// Carved spheres total ≤ [`CAVE_OPS_CAP`] modeled ops, so carving ≤ 432 × 290 + 0.9 × 380k.
 pub const CU_CARVE_PER_SPHERE: u32 = 290;
 pub const CU_CARVE_PER_OP_PERMILLE: u32 = 900;
-/// Trees: 54 candidates (hash + filters), ≤ 48 neighbor [`biome_at`] (measured 0.68k each)
-/// and the tree writes: 6 own trees (max 2.37k each), 24 side-neighbor trees (≤ 2 canopy
-/// columns inside, max 1.44k), 24 corner-neighbor trees (max 0.64k).
-pub const CU_TREES: u32 = 54 * 150 + 48 * 750 + 6 * 2_600 + 24 * 1_600 + 24 * 750;
-/// Ores (fixed loops, ≈ 3.4k), cacti, animals, glue.
+/// Trees: 54 candidates (hash + filters; ≈ 0.1k), ≤ 48 neighbor [`biome_at`] (max 0.68k)
+/// and the tree writes: 6 own trees (max 2.37k), 24 side-neighbor trees (≤ 2 canopy columns
+/// inside, max 1.44k), 24 corner-neighbor trees (max 0.64k).
+pub const CU_TREE_CANDIDATE: u32 = 150;
+pub const CU_BIOME_AT: u32 = 750;
+pub const CU_TREE_OWN: u32 = 2_700;
+pub const CU_TREE_SIDE: u32 = 1_600;
+pub const CU_TREE_CORNER: u32 = 750;
+pub const CU_TREES: u32 = 54 * CU_TREE_CANDIDATE
+    + 48 * CU_BIOME_AT
+    + 6 * CU_TREE_OWN
+    + 24 * CU_TREE_SIDE
+    + 24 * CU_TREE_CORNER;
+/// Ores (fixed loops), cacti, animals (measured max ≈ 3.7k) and glue.
 pub const CU_MISC: u32 = 6_000;
 /// Worst case of `populate_chunk` in SBF CU: cave cap fully used by [`MAX_SPHERES`] spheres
 /// **and** all 8 neighbor parts loaded **and** 54 trees.
@@ -243,7 +264,7 @@ impl HeightWindow {
     }
 
     /// Loads the 4 side strips (no-op for those already loaded).
-    pub fn load_sides(&mut self) {
+    pub(crate) fn load_sides(&mut self) {
         for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
             self.ensure(dx, dz);
         }
@@ -252,7 +273,7 @@ impl HeightWindow {
     /// Row `lz` (`-2..18`) of the window as columns `-2..18`. Only meaningful for loaded
     /// parts (use [`Self::load_sides`] / [`Self::get`] first).
     #[inline(always)]
-    pub fn row(&self, lz: i32) -> &[u8; WIN] {
+    pub(crate) fn row(&self, lz: i32) -> &[u8; WIN] {
         let i = (lz + MARGIN) as usize * WIN;
         self.h[i..i + WIN].try_into().unwrap()
     }
@@ -433,8 +454,8 @@ pub fn place_trees(
     }
 }
 
-/// SBF CU calibration hook (`bench/cu`; not part of the API): one [`place_trees`] tree write.
-#[doc(hidden)]
+/// SBF CU calibration hook (`bench` feature, `bench/cu`): one [`place_trees`] tree write.
+#[cfg(feature = "bench")]
 #[inline(never)]
 pub fn bench_write_tree(
     blocks: &mut [u8; CHUNK_VOL],
@@ -1281,5 +1302,64 @@ mod tests {
         let (x, y, z) = (x as usize, y as usize, z as usize);
         assert_eq!(b[block_index(x, y, z)], Block::Air as u8);
         assert_eq!(b[block_index(x, y + 1, z)], Block::Air as u8);
+    }
+}
+
+/// Golden output: an FNV-1a digest of stage 1 (blocks + biomes), stage 2 (blocks), the animal
+/// spawns and `spawn_point` over 3 seeds × 36 chunks (incl. negative and far coordinates).
+/// Pinned to the Task 17 output (verified equal on the pre-Task-17b build 491994e), so any
+/// optimization that changes generated terrain fails here.
+#[cfg(test)]
+mod golden_tests {
+    use crate::consts::CHUNK_VOL;
+    use crate::hash::Seed;
+    use crate::populate::{generate_stage2, spawn_point, MobSpawn, MAX_SPAWNS};
+    use crate::terrain::{generate_stage1, Stage1Info};
+
+    const GOLDEN_DIGEST: u64 = 0xc650_59a3_028a_0527;
+
+    fn digest() -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |b: &[u8]| {
+            for &x in b {
+                h = (h ^ x as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        let mut blocks = vec![0u8; CHUNK_VOL];
+        let blocks: &mut [u8; CHUNK_VOL] = blocks.as_mut_slice().try_into().unwrap();
+        let mut info = Stage1Info::EMPTY;
+        for tag in [1u8, 77, 200] {
+            let sb: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(53) ^ tag);
+            let s = Seed::new(&sb);
+            for (cx, cz) in (-3..3).flat_map(|a| (-3..3).map(move |b| (a, b))) {
+                let (cx, cz) = if (cx + cz) % 4 == 0 {
+                    (cx * 97 - 5, cz * 131)
+                } else {
+                    (cx, cz)
+                };
+                generate_stage1(&s, cx, cz, blocks, &mut info);
+                eat(&blocks[..]);
+                eat(&info.biomes.map(|b| b as u8));
+                let mut mobs = [MobSpawn::default(); MAX_SPAWNS];
+                let n = generate_stage2(&s, cx, cz, blocks, &info, &mut mobs);
+                eat(&blocks[..]);
+                for m in &mobs[..n] {
+                    eat(&[m.kind, m.x, m.y, m.z]);
+                }
+                let (x, y, z) = spawn_point(blocks);
+                eat(&[n as u8, x, y, z]);
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn golden_terrain_digest() {
+        assert_eq!(
+            digest(),
+            GOLDEN_DIGEST,
+            "generated terrain changed: {:#018x}",
+            digest()
+        );
     }
 }

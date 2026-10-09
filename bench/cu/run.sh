@@ -4,6 +4,9 @@
 #   bench/cu/run.sh stage1            # biomes / heights / generate_stage1 / strip / corner
 #   bench/cu/run.sh stage2 [x z n]    # generate_stage2 over an n×n chunk area (default -8 -8 16)
 #   bench/cu/run.sh calibrate         # unit costs behind populate::STAGE2_CU_BOUND
+#   bench/cu/run.sh check             # fails if a measured unit cost exceeds its constant;
+#                                     # run after terrain/caves/populate changes and after
+#                                     # every toolchain (platform-tools/rustc/Agave) upgrade
 #   bench/cu/run.sh one <kind> <cx> <cz>   # one run with raw logs (kinds: src/lib.rs)
 #   SEEDS=1,2,3 bench/cu/run.sh ...   # seed tags (seed byte i = i·37 + tag)
 #
@@ -37,6 +40,7 @@ case "$mode" in
       done
     done
     ;;
+  check) SEEDS="${SEEDS:-1,2,3}" "$R" "$SO" check ;;
   one) "$R" "$SO" one "$2" "$3" "$4" ;;
   *) echo "unknown mode $mode" >&2; exit 2 ;;
 esac

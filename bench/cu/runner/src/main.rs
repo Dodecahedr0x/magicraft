@@ -128,6 +128,42 @@ fn parse(logs: &[String]) -> (Vec<u64>, Vec<Vec<u64>>) {
     (deltas, vals)
 }
 
+/// Per-sphere carve cost over enumerated geometries: (cu, modeled ops, r, x, y, z).
+fn carve_points(b: &mut Bench) -> Vec<(u64, u64, u8, i32, i32, i32)> {
+    let s = seed_bytes(1);
+    let mut pts = vec![];
+    let ints: Vec<i32> = vec![-3, -2, -1, 0, 1, 2, 7, 13, 14, 15, 16, 17, 18];
+    let fr = [0, 1, 64, 128, 192, 255];
+    for r in 1..=3u8 {
+        for &(y, lo, top) in &[
+            (45 * 256 + 128, 0u8, 63u8),
+            (12 * 256 + 64, 63, 63),
+            (2 * 256, 63, 63),
+            (33 * 256, 0, 63),
+        ] {
+            for &xi in &ints {
+                for &xf in &fr {
+                    for &zi in &ints {
+                        for &zf in &[0, 128, 255] {
+                            let (x, z) = (xi * 256 + xf, zi * 256 + zf);
+                            let mut data = vec![];
+                            for v in [x, y, z] {
+                                data.extend_from_slice(&v.to_le_bytes());
+                            }
+                            data.extend_from_slice(&[r, lo, top]);
+                            let (d, v) = b.run_extra(20, &s, &data);
+                            if v[0][0] > 0 {
+                                pts.push((d[0], v[0][0], r, x, y, z));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pts
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let mut b = Bench::new(&a[1]);
@@ -268,38 +304,7 @@ fn main() {
             );
         }
         "carvecal" => {
-            // Per-sphere carve cost over enumerated geometries; fit cu ≤ c0 + c1·ops.
-            let s = seed_bytes(1);
-            let mut pts = vec![];
-            let ints: Vec<i32> = vec![-3, -2, -1, 0, 1, 2, 7, 13, 14, 15, 16, 17, 18];
-            let fr = [0, 1, 64, 128, 192, 255];
-            for r in 1..=3u8 {
-                for &(y, lo, top) in &[
-                    (45 * 256 + 128, 0u8, 63u8),
-                    (12 * 256 + 64, 63, 63),
-                    (2 * 256, 63, 63),
-                    (33 * 256, 0, 63),
-                ] {
-                    for &xi in &ints {
-                        for &xf in &fr {
-                            for &zi in &ints {
-                                for &zf in &[0, 128, 255] {
-                                    let (x, z) = (xi * 256 + xf, zi * 256 + zf);
-                                    let mut data = vec![];
-                                    for v in [x, y, z] {
-                                        data.extend_from_slice(&v.to_le_bytes());
-                                    }
-                                    data.extend_from_slice(&[r, lo, top]);
-                                    let (d, v) = b.run_extra(20, &s, &data);
-                                    if v[0][0] > 0 {
-                                        pts.push((d[0], v[0][0], r, x, y, z));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let pts = carve_points(&mut b);
             println!("{} geometries", pts.len());
             for c1 in [0.6f64, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3] {
                 let w = pts
@@ -340,6 +345,119 @@ fn main() {
                 w.0,
                 w.1
             );
+        }
+        "check" => {
+            // Fails (exit 1) if a measured unit cost exceeds its constant in
+            // magicraft_core::populate (see the "Worst-case CU bound" docs there).
+            use magicraft_core::populate as p;
+            let mut bad = 0;
+            let mut chk = |name: &str, got: u64, lim: u32| {
+                let ok = got <= lim as u64;
+                bad += !ok as u32;
+                println!(
+                    "{} {name}: measured {got} <= {lim}",
+                    if ok { "ok  " } else { "FAIL" }
+                );
+            };
+            // Carving: max over geometries of cu − slope·ops.
+            let pts = carve_points(&mut b);
+            let rem = pts
+                .iter()
+                .map(|q| q.0 as i64 - (q.1 as i64 * p::CU_CARVE_PER_OP_PERMILLE as i64) / 1000)
+                .max()
+                .unwrap();
+            chk(
+                "carve per sphere (remainder over slope)",
+                rem.max(0) as u64,
+                p::CU_CARVE_PER_SPHERE,
+            );
+            // Replay with every sphere touching: real replay + clip-and-cost for the misses.
+            let mut rows = vec![];
+            let mut e = 0u64;
+            for &t in &tags {
+                let s = seed_bytes(t);
+                for cz in -12..12 {
+                    for cx in -12..12 {
+                        let (d, v, _) = b.run(21, cx, cz, &s);
+                        let n = v[0][0];
+                        e = e.max((d[2].saturating_sub(d[0]) + n - 1) / n.max(1));
+                        rows.push((d[1], n, v[0][1]));
+                    }
+                }
+            }
+            let over = rows
+                .iter()
+                .map(|&(r, n, touch)| {
+                    (r + (n - touch) * e) as i64 - (n * p::CU_REPLAY_PER_SPHERE as u64) as i64
+                })
+                .max()
+                .unwrap();
+            chk(
+                "replay fixed part (all spheres touching)",
+                over.max(0) as u64,
+                p::CU_REPLAY_FIXED,
+            );
+            let mut mx = [0u64; 9];
+            for &t in &tags {
+                let s = seed_bytes(t);
+                for cz in -10..10 {
+                    for cx in -10..10 {
+                        let a = b.run(15, cx, cz, &s).0;
+                        let vals = [
+                            a[0],
+                            a[1],
+                            b.run(18, cx, cz, &s).0[0],
+                            b.run(16, cx, cz, &s).0[1],
+                            b.run(17, cx, cz, &s).0[0],
+                            b.run(23, cx, cz, &s).0[0].div_ceil(48),
+                            b.run(22, cx, cz, &s).0[0],
+                            b.run(25, cx, cz, &s).0[0],
+                            b.run(26, cx, cz, &s).0[0].div_ceil(54),
+                        ];
+                        for (m, v) in mx.iter_mut().zip(vals) {
+                            *m = (*m).max(v);
+                        }
+                    }
+                }
+            }
+            chk("WindowSums::new", mx[0], p::CU_WINDOW_SUMS);
+            chk("window x strip (+600 glue)", mx[1] + 600, p::CU_WINDOW_SIDE);
+            chk("window z strip (+600 glue)", mx[2] + 600, p::CU_WINDOW_SIDE);
+            chk(
+                "window corner (+600 glue)",
+                mx[3] + 600,
+                p::CU_WINDOW_CORNER,
+            );
+            chk("stage1_info_from_blocks", mx[4], p::CU_STAGE1_INFO);
+            chk("biome_at", mx[5], p::CU_BIOME_AT);
+            chk("col_limits", mx[6], p::CU_COL_LIMITS);
+            chk("ores + cacti + animals", mx[7], p::CU_MISC);
+            chk("tree candidate", mx[8], p::CU_TREE_CANDIDATE);
+            let s = seed_bytes(1);
+            let mut tree = |xs: &[i32], zs: &[i32]| {
+                let mut m = 0;
+                for &x in xs {
+                    for &z in zs {
+                        m = m.max(b.run(24, x, z, &s).0[0]);
+                    }
+                }
+                m
+            };
+            let inner: Vec<i32> = (0..16).collect();
+            let own = tree(&inner, &inner);
+            let side = tree(&[-2, -1, 16, 17], &inner).max(tree(&inner, &[-2, -1, 16, 17]));
+            let corner = tree(&[-2, -1, 16, 17], &[-2, -1, 16, 17]);
+            chk("own tree", own, p::CU_TREE_OWN);
+            chk("side-neighbor tree", side, p::CU_TREE_SIDE);
+            chk("corner-neighbor tree", corner, p::CU_TREE_CORNER);
+            println!(
+                "STAGE2_CU_BOUND = {} (not checked here: CU_IX_OVERHEAD, see docs)",
+                p::STAGE2_CU_BOUND
+            );
+            if bad > 0 {
+                eprintln!("{bad} calibrated cost(s) exceeded: raise the constants in populate.rs");
+                std::process::exit(1);
+            }
         }
         m => panic!("mode {m}"),
     }
