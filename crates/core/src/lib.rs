@@ -3,7 +3,9 @@
 pub mod blocks;
 pub mod consts;
 pub mod coords;
+pub mod hash;
 pub mod items;
+pub mod noise;
 
 /// Version of the core game rules.
 pub fn version() -> u32 {
