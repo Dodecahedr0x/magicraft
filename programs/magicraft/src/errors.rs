@@ -155,11 +155,56 @@ mod tests {
 
     #[test]
     fn codes_are_stable() {
-        assert_eq!(u32::from(MagicraftError::Unauthorized), 6100);
-        assert_eq!(u32::from(MagicraftError::ChunkNotReady), 6103);
-        assert_eq!(u32::from(MagicraftError::MoveTooFast), 6115);
-        assert_eq!(u32::from(MagicraftError::TimeSkew), 6120);
-        assert_eq!(u32::from(MagicraftError::MissingFuel), 6141);
+        use MagicraftError::*;
+        // The full sequence: clients map numbers, so variants are append-only.
+        let all = [
+            Unauthorized,
+            InvalidChunk,
+            InvalidPresence,
+            ChunkNotReady,
+            InsufficientSponsorFunds,
+            InsufficientFunds,
+            Overflow,
+            InvalidParams,
+            SeedPending,
+            SeedAlreadySet,
+            NotAdjacent,
+            WrongGenStage,
+            ChunkEdited,
+            ChunkHasMobs,
+            ChunkOccupied,
+            MoveTooFast,
+            Collision,
+            NotOnGround,
+            Flying,
+            InvalidMoveState,
+            TimeSkew,
+            OutOfReach,
+            Cooldown,
+            Unbreakable,
+            InvalidTarget,
+            NotFaceAdjacent,
+            SelfOverlap,
+            NotPlaceable,
+            Dead,
+            NotDead,
+            NoMob,
+            BadSlot,
+            EmptySlot,
+            NotEnoughItems,
+            InvalidCount,
+            NotFood,
+            FoodFull,
+            InventoryFull,
+            UnknownRecipe,
+            WrongStation,
+            MissingInputs,
+            MissingFuel,
+        ];
+        for (i, e) in all.into_iter().enumerate() {
+            assert_eq!(u32::from(e), 6100 + i as u32, "{e:?}");
+        }
+        assert_eq!(all.len(), 42);
     }
 
     #[test]

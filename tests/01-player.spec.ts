@@ -198,6 +198,8 @@ describe("player lifecycle: top-up and withdraw", () => {
   });
 
   it("withdraw (ER) commits and undelegates; base settles by the ER delta", async () => {
+    // Settlement is delta-based: base moves by the ER change since delegation.
+    const erBeforeWithdraw = await lamports(erConn, p.player);
     const sig = await sendEr(
       [
         await p.er.methods
@@ -222,13 +224,18 @@ describe("player lifecycle: top-up and withdraw", () => {
     expect(info, `Player owned by magicraft on base again (ER tx ${sig})`).to
       .not.be.null;
     console.log(`    base settled ${Date.now() - t0} ms after the withdraw tx`);
-    const erSpend = erAtSync + topUp - erBal; // 0 until chunks exist (Task 17)
-    expect(info!.lamports).to.equal(baseAtSync + topUp - erSpend);
-    expect(info!.lamports).to.equal(rentExempt + deposit + topUp);
+    expect(info!.lamports).to.equal(baseAtSync + (erBeforeWithdraw - erAtSync));
+    // No ER spend yet (chunks arrive in Task 17), so the delta is the top-up.
+    expect(erBeforeWithdraw - erAtSync).to.equal(topUp);
     const acc = p.base.coder.accounts.decode("player", info!.data);
     expect(acc.authority.toBase58()).to.equal(p.authority.publicKey.toBase58());
     expect(acc.openChunks).to.equal(0);
   });
+
+  // TODO(Task 17): needs create_chunk.
+  it.skip("withdraw with an open chunk succeeds; base reflects the chunk rent spent on the ER", () => {});
+  // TODO(Task 17): needs create_chunk.
+  it.skip("sponsoring stops at rent_exempt(Player) + margin (InsufficientSponsorFunds)", () => {});
 
   it("withdraw_base rejects more than the balance above rent-exempt", async () => {
     const available = (await lamports(baseConn, p.player)) - rentExempt;

@@ -20,12 +20,13 @@
 //! claiming time faster than real gains at most `LEAD_MS + LAG_MS` of extra travel once,
 //! then is rejected. `dt = client_ms − prev.last_ms`, capped at [`MAX_DT_MS`] = 2 s.
 //!
-//! Recommended `chain_ms` source (implemented by the program, not here):
-//! `Clock::unix_timestamp` has 1 s resolution, so the `World` account stores
-//! `anchor_slot`, `anchor_ms`, `ms_per_slot` (default 50) and estimates
-//! `chain_ms = anchor_ms + (slot − anchor_slot) · ms_per_slot`; when that estimate drifts
-//! more than 2 s from `unix_timestamp · 1000` it re-anchors to
-//! (`slot`, `unix_timestamp · 1000`).
+//! `chain_ms` source (implemented by the program, `state::TimeAnchor`):
+//! `Clock::unix_timestamp` has 1 s resolution, so the `World` account stores an anchor
+//! (`anchor_slot`, `anchor_ms`, `ms_per_slot`) and readers estimate
+//! `chain_ms = anchor_ms + (slot − anchor_slot) · ms_per_slot` without writing. Only the
+//! day crank re-anchors (monotonic: forward jumps when lagging > 750 ms, slew when ahead,
+//! slot rate measured from wall time). A stale/unset anchor gives a *coarse* reading
+//! (wall seconds) and the caller widens its lead tolerance.
 //!
 //! # Rules (in check order) and tolerances
 //! 0. Params must [`WorldParams::validate`]; `prev`/new coordinates must be within

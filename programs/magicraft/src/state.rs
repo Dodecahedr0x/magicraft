@@ -14,6 +14,12 @@
 //!   (`sha256("account:<Name>")[..8]`) but the types are not in the IDL; clients decode them
 //!   from these tables.
 //!
+//! # Sponsoring
+//! Every ix that makes the Player pay ephemeral rent on the ER (create / grow / presence
+//! resize) must first call [`ensure_sponsor_reserve`]: after paying, the Player must keep
+//! `rent_exempt(Player) +` [`SPONSOR_RESERVE_MARGIN`] lamports, else
+//! `InsufficientSponsorFunds` (the client then prompts a top-up).
+//!
 //! # `Player` (base layer, delegated), PDA `["player", authority]`, 105 bytes
 //! | off | field | type |
 //! |---|---|---|
@@ -40,8 +46,8 @@
 //! | 183 | `day_task_id` | i64 (0 = not scheduled) |
 //! | 191 | `last_tick_ms` | i64 (chain ms of the last `tick_day`) |
 //! | 199 | `chunk_count` | u32 |
-//! | 203 | `clock` | [`TimeAnchor`]: `anchor_slot` u64 @203, `anchor_ms` i64 @211, `ms_per_slot` u32 @219 |
-//! | 223 | `_reserved` | [u8; 42] |
+//! | 203 | `clock` | [`TimeAnchor`]: `anchor_slot` u64 @203, `anchor_ms` i64 @211, `ms_per_slot` u32 @219, `base_ms_per_slot` u32 @223, `sync_slot` u64 @227, `sync_ms` i64 @235 |
+//! | 243 | `_reserved` | [u8; 22] |
 //!
 //! # `PlayerState` (ephemeral), PDA `["pstate", world, player]`, 432 bytes
 //! | off | field | type |
@@ -51,17 +57,16 @@
 //! | 40 | `world` | Pubkey |
 //! | 72 | `bump` | u8 |
 //! | 73 | `move_state` | [u8; 72] (`core::physics::MoveState` layout) |
-//! | 145 | `health` | u8 (0..=20; 0 = dead) |
+//! | 145 | `health` | u8 (0..=20; **0 ⇔ dead**, the only death state) |
 //! | 146 | `food` | u8 (0..=20) |
 //! | 147 | `exhaustion` | u16 (hunger accumulator) |
 //! | 149 | `inventory` | [u8; 216] (`core::inventory::Inventory` layout) |
 //! | 365 | `held_slot` | u8 |
-//! | 366 | `dead` | bool |
-//! | 367 | `cx`, `cz` | i32, i32 (current chunk) @367, @371 |
-//! | 375 | `break_until_ms` | i64 |
-//! | 383 | `attack_until_ms` | i64 |
-//! | 391 | `food_tick_ms` | i64 (last hunger / regen step) |
-//! | 399 | `_reserved` | [u8; 33] |
+//! | 366 | `cx`, `cz` | i32, i32 (current chunk) @366, @370 |
+//! | 374 | `break_until_ms` | i64 |
+//! | 382 | `attack_until_ms` | i64 |
+//! | 390 | `food_tick_ms` | i64 (last hunger / regen step) |
+//! | 398 | `_reserved` | [u8; 34] |
 //!
 //! # `Chunk` (ephemeral), PDA `["chunk", world, cx i32 LE, cz i32 LE]`
 //! Created at [`CHUNK_INITIAL_LEN`] (10 240) bytes, then resized to [`CHUNK_FULL_LEN`]
@@ -136,6 +141,30 @@ pub struct Player {
     pub open_chunks: u32,
     /// Padding for future fields (keeps the account size stable).
     pub _reserved: [u8; 60],
+}
+
+/// Lamports a sponsoring Player keeps above its rent-exempt minimum on the ER (a safety
+/// margin, so commits/undelegation never see an under-funded Player).
+pub const SPONSOR_RESERVE_MARGIN: u64 = 100_000;
+
+/// Pure check: can a Player with `lamports` pay `cost` and keep `rent_min + margin`?
+pub fn sponsor_can_pay(lamports: u64, rent_min: u64, cost: u64) -> bool {
+    lamports.checked_sub(cost).is_some_and(|left| {
+        rent_min
+            .checked_add(SPONSOR_RESERVE_MARGIN)
+            .is_some_and(|need| left >= need)
+    })
+}
+
+/// `InsufficientSponsorFunds` unless the Player can pay `cost` lamports of ephemeral rent
+/// and keep its reserve (see the module docs).
+pub fn ensure_sponsor_reserve(player: &AccountInfo, cost: u64) -> Result<()> {
+    let rent_min = Rent::get()?.minimum_balance(player.data_len());
+    require!(
+        sponsor_can_pay(player.lamports(), rent_min, cost),
+        MagicraftError::InsufficientSponsorFunds
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -217,64 +246,144 @@ impl WorldParams {
     }
 }
 
-/// Default slot duration used until the first re-anchor refines it, ms.
+/// Default slot duration used until the first rate measurement, ms.
 pub const DEFAULT_MS_PER_SLOT: u32 = 50;
-/// Re-anchor when the slot-based estimate drifts this far from `unix_timestamp`, ms.
-pub const REANCHOR_DRIFT_MS: i64 = 2_000;
-/// A re-anchor also re-estimates `ms_per_slot` when the old anchor is at least this old
-/// (keeps the 1 s `unix_timestamp` resolution error ≤ 5 %).
-pub const RATE_MIN_SPAN_MS: i64 = 20_000;
+/// [`TimeAnchor::reanchor`] jumps forward when the estimate lags wall time by more than
+/// this, ms (< 1 s; wall time is `unix_timestamp · 1000 + 500`, the midpoint of its second).
+pub const REANCHOR_DRIFT_MS: i64 = 750;
+/// Offsets within this of wall time are left alone (wall time is only ±500 ms exact), ms.
+pub const RATE_DEADBAND_MS: i64 = 500;
+/// The slot rate is re-measured from wall time over spans at least this long, ms
+/// (the 1 s `unix_timestamp` resolution then gives ≤ ~3 % rate error).
+pub const RATE_SPAN_MS: i64 = 30_000;
+/// [`TimeAnchor::read`] falls back to coarse wall time when the anchor is older than this
+/// (the writer stopped re-anchoring) or the estimate is this far off wall time, ms.
+pub const STALE_MS: i64 = 10_000;
 
-/// Chain time estimate with ms resolution (`Clock::unix_timestamp` has 1 s).
-/// See `magicraft_core::physics` "Time model": `chain_ms = anchor_ms + (slot − anchor_slot) ·
-/// ms_per_slot`, re-anchored to (`slot`, `unix_timestamp · 1000`) when the estimate drifts
-/// more than [`REANCHOR_DRIFT_MS`]. All-zero = not yet anchored.
+/// A chain-time reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainTime {
+    /// Chain time, ms.
+    pub ms: i64,
+    /// `true`: anchor unset or stale, `ms` is `unix_timestamp · 1000` (1 s resolution, not
+    /// monotonic with earlier fine readings). Callers widen their tolerance (e.g. a move
+    /// lead of 1000 ms instead of `physics::LEAD_MS`).
+    pub coarse: bool,
+}
+
+/// Chain time with ms resolution (`Clock::unix_timestamp` has 1 s): `chain_ms = anchor_ms +
+/// (slot − anchor_slot) · ms_per_slot`.
+///
+/// - **Readers** (gameplay ixs) call [`Self::read`] on a read-only World: never writes.
+/// - **The writer** is `tick_day` (every ~1 s) plus the initial anchor in `create_world`;
+///   only it calls [`Self::reanchor`]. A re-anchor is **monotonic**: the new anchor is never
+///   below the estimate readers saw at that slot, so fine readings never go backwards.
+///   - Rate: `base_ms_per_slot` is measured from wall time over ≥ [`RATE_SPAN_MS`]
+///     (sync point `sync_slot` / `sync_ms`).
+///   - Offset: lagging by > [`REANCHOR_DRIFT_MS`] → jump forward to wall time; lagging
+///     by more than [`RATE_DEADBAND_MS`] → run 1/8 fast; ahead by more than the deadband →
+///     hold continuity and run 1/8 slow until wall time catches up (slew, never back).
+///     `ms_per_slot` is the effective (slewed) rate readers use.
+///
+/// All-zero (`ms_per_slot == 0`) = not anchored yet.
 #[derive(
     AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, Debug, Default, PartialEq, Eq,
 )]
 pub struct TimeAnchor {
     pub anchor_slot: u64,
     pub anchor_ms: i64,
+    /// Effective rate (base ± slew), ms per slot.
     pub ms_per_slot: u32,
+    /// Measured rate, ms per slot.
+    pub base_ms_per_slot: u32,
+    /// Start of the current rate measurement: slot and wall ms.
+    pub sync_slot: u64,
+    pub sync_ms: i64,
+}
+
+fn wall_ms(unix_timestamp: i64) -> i64 {
+    unix_timestamp.saturating_mul(1000)
 }
 
 impl TimeAnchor {
-    /// Slot-based estimate without re-anchoring.
+    /// First anchor (`create_world`).
+    pub fn new(slot: u64, unix_timestamp: i64) -> Self {
+        TimeAnchor {
+            anchor_slot: slot,
+            anchor_ms: wall_ms(unix_timestamp).saturating_add(500),
+            ms_per_slot: DEFAULT_MS_PER_SLOT,
+            base_ms_per_slot: DEFAULT_MS_PER_SLOT,
+            sync_slot: slot,
+            sync_ms: wall_ms(unix_timestamp),
+        }
+    }
+
+    /// Slot-based estimate (`anchor_ms` for slots before the anchor).
     pub fn estimate(&self, slot: u64) -> i64 {
         let dslot = slot.saturating_sub(self.anchor_slot).min(i64::MAX as u64) as i64;
         self.anchor_ms
             .saturating_add(dslot.saturating_mul(self.ms_per_slot as i64))
     }
 
-    /// Pure: current chain ms and the anchor to store if it changed (`None` = unchanged, so
-    /// callers only need to write the account on a re-anchor).
-    pub fn chain_ms(&self, slot: u64, unix_timestamp: i64) -> (i64, Option<TimeAnchor>) {
-        let wall = unix_timestamp.saturating_mul(1000);
+    /// Read-only chain time: the estimate, or coarse wall time if the anchor is unset or
+    /// stale (see [`ChainTime::coarse`]).
+    pub fn read(&self, slot: u64, unix_timestamp: i64) -> ChainTime {
+        let wall = wall_ms(unix_timestamp);
+        let coarse = ChainTime {
+            ms: wall,
+            coarse: true,
+        };
         if self.ms_per_slot == 0 {
-            // Never anchored.
-            let a = TimeAnchor {
-                anchor_slot: slot,
-                anchor_ms: wall,
-                ms_per_slot: DEFAULT_MS_PER_SLOT,
-            };
-            return (wall, Some(a));
+            return coarse;
         }
         let est = self.estimate(slot);
-        if est.saturating_sub(wall).saturating_abs() <= REANCHOR_DRIFT_MS {
-            return (est, None);
+        let age = est.saturating_sub(self.anchor_ms);
+        if age > STALE_MS || est.saturating_sub(wall).saturating_abs() > STALE_MS {
+            return coarse;
         }
-        let mut ms_per_slot = self.ms_per_slot;
-        let dslot = slot.saturating_sub(self.anchor_slot);
-        let dms = wall.saturating_sub(self.anchor_ms);
-        if dslot > 0 && dms >= RATE_MIN_SPAN_MS {
-            ms_per_slot = (dms as u64 / dslot).clamp(1, 1_000) as u32;
+        ChainTime {
+            ms: est,
+            coarse: false,
         }
-        let a = TimeAnchor {
-            anchor_slot: slot,
-            anchor_ms: wall,
-            ms_per_slot,
+    }
+
+    /// Writer only: re-anchors at `slot` (monotonic, see the type docs) and returns the
+    /// new chain time.
+    pub fn reanchor(&mut self, slot: u64, unix_timestamp: i64) -> i64 {
+        if self.ms_per_slot == 0 {
+            *self = Self::new(slot, unix_timestamp);
+            return self.anchor_ms;
+        }
+        let wall = wall_ms(unix_timestamp);
+        let mut base = self.base_ms_per_slot.clamp(1, 1_000);
+        let dslot = slot.saturating_sub(self.sync_slot);
+        let dms = wall.saturating_sub(self.sync_ms);
+        if dms >= RATE_SPAN_MS && dslot > 0 {
+            base = (dms as u64 / dslot).clamp(1, 1_000) as u32;
+            self.sync_slot = slot;
+            self.sync_ms = wall;
+        } else if dms < 0 || slot < self.sync_slot {
+            // Clock or slot went backwards: restart the measurement.
+            self.sync_slot = slot;
+            self.sync_ms = wall;
+        }
+        let est = self.estimate(slot);
+        let target = wall.saturating_add(500);
+        let err = target.saturating_sub(est); // > 0: the estimate lags
+        let slew = (base / 8).max(1);
+        let mps = if err > RATE_DEADBAND_MS {
+            base.saturating_add(slew).min(1_000)
+        } else if err < -RATE_DEADBAND_MS {
+            base.saturating_sub(slew).max(1)
+        } else {
+            base
         };
-        (wall, Some(a))
+        let ms = if err > REANCHOR_DRIFT_MS { target } else { est };
+        self.anchor_slot = self.anchor_slot.max(slot);
+        self.anchor_ms = ms;
+        self.ms_per_slot = mps;
+        self.base_ms_per_slot = base;
+        ms
     }
 }
 
@@ -298,26 +407,22 @@ pub struct World {
     pub last_tick_ms: i64,
     pub chunk_count: u32,
     pub clock: TimeAnchor,
-    pub _reserved: [u8; 42],
+    pub _reserved: [u8; 22],
 }
 
 // `create_world` creates the World in one CPI (≤ 10 240 bytes).
 const _: () = assert!(8 + World::INIT_SPACE <= 10_240);
 
 impl World {
-    /// Current chain ms; re-anchors `self.clock` in place when needed (the caller must
-    /// hold the World mutably for the write to persist).
-    pub fn chain_ms(&mut self, clock: &Clock) -> i64 {
-        let (ms, anchor) = self.clock.chain_ms(clock.slot, clock.unix_timestamp);
-        if let Some(a) = anchor {
-            self.clock = a;
-        }
-        ms
+    /// Writer path (`tick_day`, which holds the World mutably): monotonic re-anchor,
+    /// returns chain ms.
+    pub fn tick_clock(&mut self, clock: &Clock) -> i64 {
+        self.clock.reanchor(clock.slot, clock.unix_timestamp)
     }
 
-    /// Read-only chain ms (no re-anchor written).
-    pub fn chain_ms_ro(&self, clock: &Clock) -> i64 {
-        self.clock.chain_ms(clock.slot, clock.unix_timestamp).0
+    /// Read-only chain time for gameplay ixs (never writes the World).
+    pub fn chain_ms_ro(&self, clock: &Clock) -> ChainTime {
+        self.clock.read(clock.slot, clock.unix_timestamp)
     }
 
     pub fn core_params(&self) -> phys::WorldParams {
@@ -348,7 +453,6 @@ pub struct PlayerState {
     /// `core::inventory::Inventory` bytes.
     pub inventory: [u8; 216],
     pub held_slot: u8,
-    pub dead: bool,
     /// Current chunk.
     pub cx: i32,
     pub cz: i32,
@@ -356,12 +460,17 @@ pub struct PlayerState {
     pub attack_until_ms: i64,
     /// Last hunger / regeneration step, chain ms.
     pub food_tick_ms: i64,
-    pub _reserved: [u8; 33],
+    pub _reserved: [u8; 34],
 }
 
 const _: () = assert!(MoveState::SIZE == 72 && Inventory::SIZE == 216);
 
 impl PlayerState {
+    /// Death has a single source of truth: `health == 0` (there is no separate flag).
+    pub fn is_dead(&self) -> bool {
+        self.health == 0
+    }
+
     pub fn move_state(&self) -> Result<MoveState> {
         MoveState::from_bytes(&self.move_state)
             .map_err(|_| error!(MagicraftError::InvalidMoveState))
@@ -653,6 +762,43 @@ pub fn ready_chunk_mut<'a>(
     Ok((h, b))
 }
 
+/// Pure identity check of a chunk header against the expected world / coordinates and
+/// its address (PDA from the stored bump).
+pub fn check_chunk_identity(
+    h: &ChunkHeader,
+    key: &Pubkey,
+    world: &Pubkey,
+    cx: i32,
+    cz: i32,
+) -> Result<()> {
+    require!(
+        h.world == *world && h.cx.get() == cx && h.cz.get() == cz,
+        MagicraftError::InvalidChunk
+    );
+    let (cxb, czb, bump) = (cx.to_le_bytes(), cz.to_le_bytes(), [h.bump]);
+    let pda = Pubkey::create_program_address(
+        &crate::auth::chunk_seeds(world, &cxb, &czb, &bump),
+        &crate::ID,
+    )
+    .map_err(|_| error!(MagicraftError::InvalidChunk))?;
+    require_keys_eq!(pda, *key, MagicraftError::InvalidChunk);
+    Ok(())
+}
+
+/// The chunk `(cx, cz)` of `world`: owner, discriminator, stored world/cx/cz and the PDA
+/// (stored bump) are checked, else `InvalidChunk`. Any length (not-yet-grown OK); use
+/// [`ready_chunk_mut`] / [`chunk_parts_mut`] afterwards for blocks.
+pub fn chunk_for<'a>(
+    ai: &'a AccountInfo,
+    world: &Pubkey,
+    cx: i32,
+    cz: i32,
+) -> Result<RefMut<'a, ChunkHeader>> {
+    let h = chunk_header_mut(ai)?;
+    check_chunk_identity(&h, ai.key, world, cx, cz)?;
+    Ok(h)
+}
+
 // ---------------------------------------------------------------------------
 // ChunkPresence
 // ---------------------------------------------------------------------------
@@ -751,6 +897,28 @@ pub fn presence_mut<'a>(
     }))
 }
 
+/// Pure identity check of a presence header against its chunk and address.
+pub fn check_presence_identity(h: &PresenceHeader, key: &Pubkey, chunk: &Pubkey) -> Result<()> {
+    require_keys_eq!(h.chunk, *chunk, MagicraftError::InvalidPresence);
+    let bump = [h.bump];
+    let pda =
+        Pubkey::create_program_address(&crate::auth::presence_seeds(chunk, &bump), &crate::ID)
+            .map_err(|_| error!(MagicraftError::InvalidPresence))?;
+    require_keys_eq!(pda, *key, MagicraftError::InvalidPresence);
+    Ok(())
+}
+
+/// The presence list of `chunk`: owner, discriminator, length/count, stored chunk and the
+/// PDA (stored bump) are checked, else `InvalidPresence`.
+pub fn presence_for<'a>(
+    ai: &'a AccountInfo,
+    chunk: &Pubkey,
+) -> Result<(RefMut<'a, PresenceHeader>, RefMut<'a, [PresenceEntry]>)> {
+    let (h, e) = presence_mut(ai)?;
+    check_presence_identity(&h, ai.key, chunk)?;
+    Ok((h, e))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -824,8 +992,11 @@ mod tests {
                 anchor_slot: 10,
                 anchor_ms: 11,
                 ms_per_slot: 12,
+                base_ms_per_slot: 13,
+                sync_slot: 14,
+                sync_ms: 15,
             },
-            _reserved: [0; 42],
+            _reserved: [0; 22],
         };
         let mut b = World::DISCRIMINATOR.to_vec();
         b.extend(borsh(&w));
@@ -843,6 +1014,9 @@ mod tests {
         assert_eq!(&b[203..211], &10u64.to_le_bytes());
         assert_eq!(&b[211..219], &11i64.to_le_bytes());
         assert_eq!(&b[219..223], &12u32.to_le_bytes());
+        assert_eq!(&b[223..227], &13u32.to_le_bytes());
+        assert_eq!(&b[227..235], &14u64.to_le_bytes());
+        assert_eq!(&b[235..243], &15i64.to_le_bytes());
     }
 
     #[test]
@@ -860,13 +1034,12 @@ mod tests {
             exhaustion: 0xABCD,
             inventory: [0; 216],
             held_slot: 4,
-            dead: false,
             cx: -2,
             cz: 5,
             break_until_ms: 100,
             attack_until_ms: 200,
             food_tick_ms: 300,
-            _reserved: [0; 33],
+            _reserved: [0; 34],
         };
         s.set_move_state(&ms);
         s.set_inventory(&inv);
@@ -880,12 +1053,15 @@ mod tests {
         assert_eq!((b[145], b[146]), (20, 19));
         assert_eq!(&b[147..149], &0xABCDu16.to_le_bytes());
         assert_eq!(&b[149..365], &inv.to_bytes());
-        assert_eq!((b[365], b[366]), (4, 0));
-        assert_eq!(&b[367..371], &(-2i32).to_le_bytes());
-        assert_eq!(&b[371..375], &5i32.to_le_bytes());
-        assert_eq!(&b[375..383], &100i64.to_le_bytes());
-        assert_eq!(&b[383..391], &200i64.to_le_bytes());
-        assert_eq!(&b[391..399], &300i64.to_le_bytes());
+        assert_eq!(b[365], 4);
+        assert_eq!(&b[366..370], &(-2i32).to_le_bytes());
+        assert_eq!(&b[370..374], &5i32.to_le_bytes());
+        assert_eq!(&b[374..382], &100i64.to_le_bytes());
+        assert_eq!(&b[382..390], &200i64.to_le_bytes());
+        assert_eq!(&b[390..398], &300i64.to_le_bytes());
+        assert!(!s.is_dead());
+        s.health = 0;
+        assert!(s.is_dead());
         // Corrupt bool byte in MoveState → error, not panic.
         s.move_state[48] = 2;
         assert!(s.move_state().is_err());
@@ -989,72 +1165,184 @@ mod tests {
     }
 
     #[test]
-    fn time_anchor_first_call_anchors() {
-        let t = TimeAnchor::default();
-        let (ms, a) = t.chain_ms(100, 1_700_000_000);
-        assert_eq!(ms, 1_700_000_000_000);
-        let a = a.unwrap();
-        assert_eq!((a.anchor_slot, a.ms_per_slot), (100, DEFAULT_MS_PER_SLOT));
+    fn chunk_and_presence_identity() {
+        let world = Pubkey::new_unique();
+        let (cx, cz) = (-4i32, 9i32);
+        let (key, bump) = Pubkey::find_program_address(
+            &[
+                CHUNK_SEED,
+                world.as_ref(),
+                &cx.to_le_bytes(),
+                &cz.to_le_bytes(),
+            ],
+            &crate::ID,
+        );
+        let mut data = vec![0u8; CHUNK_INITIAL_LEN];
+        let h = init_chunk_header(&mut data, Pubkey::new_unique(), world, cx, cz, bump).unwrap();
+        assert!(check_chunk_identity(h, &key, &world, cx, cz).is_ok());
+        let bad = error!(MagicraftError::InvalidChunk);
+        assert_eq!(
+            check_chunk_identity(h, &key, &world, cx + 1, cz).err(),
+            Some(bad)
+        );
+        assert!(check_chunk_identity(h, &key, &Pubkey::new_unique(), cx, cz).is_err());
+        assert!(check_chunk_identity(h, &Pubkey::new_unique(), &world, cx, cz).is_err());
+        h.bump = h.bump.wrapping_sub(1);
+        assert!(check_chunk_identity(h, &key, &world, cx, cz).is_err());
+
+        let (pkey, pbump) =
+            Pubkey::find_program_address(&[PRESENCE_SEED, key.as_ref()], &crate::ID);
+        let mut pd = vec![0u8; presence_len(0)];
+        init_presence_header(&mut pd, key, pbump).unwrap();
+        let (ph, _) = presence_parts_from_mut(&mut pd).unwrap();
+        assert!(check_presence_identity(ph, &pkey, &key).is_ok());
+        assert!(check_presence_identity(ph, &pkey, &Pubkey::new_unique()).is_err());
+        assert!(check_presence_identity(ph, &key, &key).is_err());
     }
 
     #[test]
-    fn time_anchor_estimates_between_seconds() {
+    fn sponsor_reserve() {
+        let rent = 1_000_000;
+        let need = rent + SPONSOR_RESERVE_MARGIN;
+        assert!(sponsor_can_pay(need + 500, rent, 500));
+        assert!(!sponsor_can_pay(need + 499, rent, 500));
+        assert!(!sponsor_can_pay(100, rent, 500));
+        assert!(!sponsor_can_pay(u64::MAX, u64::MAX, 0));
+    }
+
+    #[test]
+    fn time_anchor_unset_reads_coarse_and_first_write_anchors() {
+        let mut t = TimeAnchor::default();
+        assert_eq!(
+            t.read(100, 1_700_000_000),
+            ChainTime {
+                ms: 1_700_000_000_000,
+                coarse: true
+            }
+        );
+        assert_eq!(t.reanchor(100, 1_700_000_000), 1_700_000_000_500);
+        assert_eq!((t.anchor_slot, t.ms_per_slot), (100, DEFAULT_MS_PER_SLOT));
+        assert_eq!(t, TimeAnchor::new(100, 1_700_000_000));
+    }
+
+    #[test]
+    fn time_anchor_read_estimates_between_seconds() {
         let t = TimeAnchor {
             anchor_slot: 100,
             anchor_ms: 1_000_000,
             ms_per_slot: 50,
+            ..Default::default()
         };
-        // 7 slots later, unix still in the same second: ms resolution from slots.
-        let (ms, a) = t.chain_ms(107, 1_000);
-        assert_eq!((ms, a), (1_000_350, None));
-        // Within the 2 s tolerance: no write.
-        assert_eq!(t.chain_ms(140, 1_002).1, None);
+        assert_eq!(
+            t.read(107, 1_000),
+            ChainTime {
+                ms: 1_000_350,
+                coarse: false
+            }
+        );
     }
 
     #[test]
-    fn time_anchor_reanchors_on_drift_and_refines_rate() {
-        // Real slots are 40 ms but we assume 50: after 1000 slots (40 s) the estimate is
-        // 10 s ahead → re-anchor to wall time and learn 40 ms/slot.
+    fn time_anchor_stale_falls_back_to_coarse() {
         let t = TimeAnchor {
             anchor_slot: 0,
             anchor_ms: 1_000_000,
             ms_per_slot: 50,
+            ..Default::default()
         };
-        let (ms, a) = t.chain_ms(1_000, 1_040);
-        assert_eq!(ms, 1_040_000);
-        let a = a.unwrap();
+        // 10 s after the anchor: still fine.
+        assert!(!t.read(200, 1_010).coarse);
+        // Writer stopped for > 10 s.
         assert_eq!(
-            a,
-            TimeAnchor {
-                anchor_slot: 1_000,
-                anchor_ms: 1_040_000,
-                ms_per_slot: 40
+            t.read(201, 1_010),
+            ChainTime {
+                ms: 1_010_000,
+                coarse: true
             }
         );
-        // Short span: re-anchor without touching the rate.
-        let t = TimeAnchor {
-            anchor_slot: 0,
-            anchor_ms: 1_000_000,
-            ms_per_slot: 1_000,
-        };
-        let (_, a) = t.chain_ms(10, 1_005);
-        assert_eq!(a.unwrap().ms_per_slot, 1_000);
+        // Estimate far from wall time.
+        assert!(t.read(10, 1_020).coarse);
+    }
+
+    /// Simulates a validator whose real slot length differs from the assumed one, with
+    /// `tick_day` re-anchoring every 20 slots and a reader at every slot.
+    fn simulate(real_ms_per_slot: i64, start_mps: u32) -> (i64, u32) {
+        let t0: i64 = 1_700_000_000_123; // true ms at slot 0
+        let truth = |slot: u64| t0 + slot as i64 * real_ms_per_slot;
+        let unix = |slot: u64| truth(slot).div_euclid(1000);
+        let mut a = TimeAnchor::new(0, unix(0));
+        a.ms_per_slot = start_mps;
+        a.base_ms_per_slot = start_mps;
+        let mut last = i64::MIN;
+        let mut worst_late = 0i64;
+        for slot in 1..=20_000u64 {
+            if slot % 20 == 0 {
+                let ms = a.reanchor(slot, unix(slot));
+                assert!(ms >= last, "reanchor went back at slot {slot}");
+                last = ms;
+            }
+            let r = a.read(slot, unix(slot));
+            assert!(!r.coarse, "coarse at slot {slot}");
+            assert!(
+                r.ms >= last,
+                "read went back at slot {slot}: {} < {last}",
+                r.ms
+            );
+            last = r.ms;
+            if slot > 10_000 {
+                worst_late = worst_late.max((r.ms - truth(slot)).abs());
+            }
+        }
+        (worst_late, a.base_ms_per_slot)
+    }
+
+    #[test]
+    fn time_anchor_monotonic_when_estimate_runs_ahead() {
+        // Real slots 40 ms, assumed 50: the estimate runs ahead and must slew, not jump back.
+        let (err, mps) = simulate(40, 50);
+        assert!(err <= 1_000, "converged error {err}");
+        assert!((39..=41).contains(&mps), "mps {mps}");
+    }
+
+    #[test]
+    fn time_anchor_monotonic_when_estimate_lags() {
+        let (err, mps) = simulate(60, 50);
+        assert!(err <= 1_000, "converged error {err}");
+        assert!((59..=61).contains(&mps), "mps {mps}");
+        let (err, _) = simulate(50, 50);
+        assert!(err <= 1_000, "steady error {err}");
     }
 
     #[test]
     fn time_anchor_is_total() {
-        let t = TimeAnchor {
-            anchor_slot: u64::MAX,
-            anchor_ms: i64::MAX,
-            ms_per_slot: u32::MAX,
-        };
-        let _ = t.chain_ms(0, i64::MIN);
-        let _ = t.chain_ms(u64::MAX, i64::MAX);
-        let t = TimeAnchor {
-            anchor_slot: 0,
-            anchor_ms: i64::MIN,
-            ms_per_slot: u32::MAX,
-        };
-        let _ = t.chain_ms(u64::MAX, i64::MAX);
+        let edge = [
+            TimeAnchor {
+                anchor_slot: u64::MAX,
+                anchor_ms: i64::MAX,
+                ms_per_slot: u32::MAX,
+                ..Default::default()
+            },
+            TimeAnchor {
+                anchor_slot: 0,
+                anchor_ms: i64::MIN,
+                ms_per_slot: u32::MAX,
+                ..Default::default()
+            },
+            TimeAnchor {
+                anchor_slot: 5,
+                anchor_ms: 0,
+                ms_per_slot: 1,
+                ..Default::default()
+            },
+        ];
+        for t in edge {
+            for (slot, unix) in [(0, i64::MIN), (u64::MAX, i64::MAX), (3, 0), (7, -5)] {
+                let _ = t.read(slot, unix);
+                let mut w = t;
+                let before = w.estimate(slot);
+                let ms = w.reanchor(slot, unix);
+                assert!(ms >= before, "reanchor went back");
+            }
+        }
     }
 }

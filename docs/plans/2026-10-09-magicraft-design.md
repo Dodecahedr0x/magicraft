@@ -63,6 +63,19 @@ Exact byte layouts of all accounts: `programs/magicraft/src/state.rs` (module do
 attack_cooldown_ms, day_length_secs, fall_damage: bool, hunger: bool, zombie_cap_per_chunk,
 mob_tick_ms, fluid_tick_ms`. Client physics reads the same values.
 
+### Chain time (`World.clock`, `state::TimeAnchor`)
+
+`Clock::unix_timestamp` has 1 s resolution; movement validation needs ms. The World stores an
+anchor (`anchor_slot`, `anchor_ms`, effective `ms_per_slot`, measured `base_ms_per_slot`, rate
+sync point). **Readers** (all gameplay ixs, World read-only, so no write contention) use
+`chain_ms_ro` = `anchor_ms + (slot − anchor_slot) · ms_per_slot`; if the anchor is unset or
+stale (older than 10 s, or > 10 s from wall time) they get a **coarse** reading (wall seconds,
+`coarse = true`) and widen tolerance (move lead 1000 ms instead of 250). **The only writer** is
+`tick_day` (~1 s; `create_world` sets the first anchor). Re-anchoring is **monotonic**: lagging
+wall time (`unix·1000 + 500`) by > 750 ms jumps forward; lagging/ahead by > 500 ms runs the
+clock 1/8 fast/slow (slew, never backwards); the slot rate is re-measured from wall time over
+≥ 30 s spans.
+
 ### Presence economics
 
 Entering a chunk resizes `ChunkPresence` up one entry, paid by the entering player's `Player` PDA;
