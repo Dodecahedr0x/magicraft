@@ -113,7 +113,7 @@ export function runClient(
   frames: number,
   script: Script,
   every = 8,
-  opts: { onGround?: boolean; fallback?: boolean } = {},
+  opts: { onGround?: boolean; fallback?: boolean; /** Frame length in s (default 1/60). */ frameDt?: (f: number) => number } = {},
 ): RunResult {
   const params = PARAM_BYTES();
   const phys = new PlayerPhysics(start, PARAMS, world.physWorld());
@@ -122,6 +122,7 @@ export function runClient(
   const out: RunResult = { checks: [], rejected: [], fallDamage: 0, fallbacks: 0, phys };
   let hist: Frame[] = [];
   let floor = 0;
+  let clockMs = 0;
   const check = (f: Frame, onGround: boolean): CheckResult => {
     const win = coreMoveWindow(prevPos, f.pos);
     return win ? checkMove(params, prev, f.pos, f.vel, onGround, f.t, f.t + 40, world.quad(win[0], win[1])) : { ok: false, error: "MoveTooFast" };
@@ -130,9 +131,13 @@ export function runClient(
     const inp = script(f, phys);
     if (inp.yaw !== undefined) phys.yaw = inp.yaw;
     phys.input = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, ...inp };
-    phys.update(1 / 60);
+    const dt = opts.frameDt?.(f) ?? 1 / 60;
+    clockMs += dt * 1000;
+    phys.update(dt);
     const s = sampleOf(phys.body);
-    const frame: Frame = { t: Math.floor((f * 1000) / 60), ...s, inWater: phys.body.inWater };
+    // Stamped like the controller: chain time of the simulated state (minus the accumulator).
+    const t = opts.frameDt ? Math.floor(clockMs - phys.acc * 1000) : Math.floor((f * 1000) / 60);
+    const frame: Frame = { t, ...s, inWater: phys.body.inWater };
     hist.push(frame);
     if (f % every) continue;
     let res: CheckResult;

@@ -152,11 +152,28 @@ describe("recipe filtering", () => {
       const near = { table: rnd(2) === 1, furnace: rnd(2) === 1 };
       for (const row of recipeRows(b, decodeInventory(b), near)) {
         const id = row.recipe.id;
-        if (row.max > 0) expect(simulateCraft(b, id, row.max, near.table, near.furnace).ok).toBe(true);
-        if (row.max < 64) expect(simulateCraft(b, id, row.max + 1, near.table, near.furnace).ok).toBe(false);
-        expect(maxCrafts(b, id, near.table, near.furnace)).toBe(row.max);
+        // The largest count the core accepts (brute force: not monotonic in the count).
+        let best = 0;
+        for (let n = 64; n >= 1 && !best; n--) if (simulateCraft(b, id, n, near.table, near.furnace).ok) best = n;
+        expect(row.max).toBe(best);
       }
     }
+  });
+
+  it("max count with a full inventory is not monotonic", () => {
+    const table = idOf(15);
+    const dirt = (n: number): [number, number][] => Array.from({ length: n }, () => [2, 64]);
+    // 35 slots of dirt + 64 planks: only 16 tables (the whole stack) free a slot.
+    const b1 = invBytes([...dirt(35), [PLANKS, 64]]);
+    expect(maxCrafts(b1, table, false, false)).toBe(16);
+    expect(simulateCraft(b1, table, 15, false, false)).toEqual({ ok: false, error: "InventoryFull" });
+    // 34 dirt + 64 + 62 planks: the 62 stack (taken first) empties from 16 crafts on.
+    const b2 = invBytes([...dirt(34), [PLANKS, 64], [PLANKS, 62]]);
+    expect(maxCrafts(b2, table, false, false)).toBe(31);
+    expect(simulateCraft(b2, table, 15, false, false).ok).toBe(false);
+    expect(simulateCraft(b2, table, 16, false, false).ok).toBe(true);
+    // 35 dirt + 62 planks: no count frees the slot.
+    expect(maxCrafts(invBytes([...dirt(35), [PLANKS, 62]]), table, false, false)).toBe(0);
   });
 
   it("craft count clamp", () => {

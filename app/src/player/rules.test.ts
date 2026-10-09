@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { blockFlags } from "../wasm";
 import { placePresenceChunks } from "./presence";
-import { SlotSelect, actionMessage } from "./interact";
+import { SlotSelect, actionMessage, optimisticEdit, type EditStore } from "./interact";
+import type { SendResult } from "../chain";
 import { blockInReach, boxOverlapsBlock, mobInReach, nearestStation, pickMob, placeError, raycast, rayBox, within, type PlaceInput } from "./rules";
 import type { V3 } from "../chain";
 
@@ -271,5 +272,86 @@ describe("held slot sync", () => {
     expect(actionMessage({ kind: "other", name: "NoMob", message: "" }, "Attack")).toBeNull();
     expect(actionMessage({ kind: "timeout", message: "" }, "Placing")).toMatch(/may still land/);
     expect(actionMessage({ kind: "other", name: "Weird", message: "" }, "Placing")).toBe("Placing failed (Weird).");
+  });
+});
+
+describe("optimistic edits (mock sender)", () => {
+  /** A one-voxel store recording the overlay calls. */
+  function fakeStore(initial = 3) {
+    let byte = initial;
+    let seq = 0;
+    const log: string[] = [];
+    const store: EditStore = {
+      setLocal: (_x, _y, _z, b) => {
+        const old = byte;
+        byte = b;
+        log.push(`set ${b}`);
+        return { seq: ++seq, old };
+      },
+      clearLocal: (_x, _y, _z, s) => void log.push(`clear ${s}`),
+      revertLocal: (_x, _y, _z, s, old) => {
+        byte = old;
+        log.push(`revert ${s}`);
+      },
+    };
+    return { store, log, byte: () => byte };
+  }
+  const ok: SendResult = { status: "confirmed", sig: "s", ms: 1 };
+  const fail = (kind: "retry" | "other", name: string): SendResult => ({ status: "failed", error: { kind, name, message: name } });
+  const sender = (...rs: SendResult[]) => {
+    let i = 0;
+    const f = async () => rs[Math.min(i++, rs.length - 1)];
+    return Object.assign(f, { calls: () => i });
+  };
+
+  it("break confirmed: the local air is kept, then dropped from the overlay", async () => {
+    const f = fakeStore();
+    const r = await optimisticEdit({ store: f.store, at: [1, 2, 3], block: 0, send: sender(ok) });
+    expect(r?.status).toBe("confirmed");
+    expect(f.log).toEqual(["set 0", "clear 1"]);
+    expect(f.byte()).toBe(0);
+  });
+
+  it("break rejected (OutOfReach): rolled back", async () => {
+    const f = fakeStore();
+    const r = await optimisticEdit({ store: f.store, at: [1, 2, 3], block: 0, send: sender(fail("other", "OutOfReach")) });
+    expect(r?.status).toBe("failed");
+    expect(f.log).toEqual(["set 0", "revert 1"]);
+    expect(f.byte()).toBe(3);
+  });
+
+  it("cooldown is retried silently, keeping the local edit", async () => {
+    const f = fakeStore();
+    const send = sender(fail("retry", "Cooldown"), fail("retry", "Cooldown"), ok);
+    let retries = 0;
+    const r = await optimisticEdit({ store: f.store, at: [1, 2, 3], block: 0, send, retryMs: 1, onRetry: () => retries++ });
+    expect(r?.status).toBe("confirmed");
+    expect(send.calls()).toBe(3);
+    expect(retries).toBe(2);
+    expect(f.log).toEqual(["set 0", "clear 1"]);
+  });
+
+  it("cooldown retries are bounded, then rolled back", async () => {
+    const f = fakeStore();
+    const send = sender(fail("retry", "Cooldown"));
+    const r = await optimisticEdit({ store: f.store, at: [1, 2, 3], block: 0, send, retryMs: 1, maxRetries: 3 });
+    expect(r?.status).toBe("failed");
+    expect(send.calls()).toBe(4);
+    expect(f.log).toEqual(["set 0", "revert 1"]);
+  });
+
+  it("place rejected (SelfOverlap): the placed block is removed again", async () => {
+    const f = fakeStore(0);
+    const r = await optimisticEdit({ store: f.store, at: [1, 2, 3], block: 11, send: sender(fail("other", "SelfOverlap")), maxRetries: 0 });
+    expect(r?.status).toBe("failed");
+    expect(f.byte()).toBe(0);
+    expect(f.log).toEqual(["set 11", "revert 1"]);
+  });
+
+  it("nothing is sent when the chunk isn't ready locally", async () => {
+    const send = sender(ok);
+    const store: EditStore = { setLocal: () => null, clearLocal: () => {}, revertLocal: () => {} };
+    expect(await optimisticEdit({ store, at: [1, 2, 3], block: 0, send })).toBeNull();
+    expect(send.calls()).toBe(0);
   });
 });

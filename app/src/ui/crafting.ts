@@ -102,7 +102,10 @@ export class CraftingPanel {
       this.list.replaceChildren(h("li", { class: "craft-empty muted" }, "Nothing craftable yet. Punch a tree for logs, or tick “Show all”."));
       return;
     }
+    // Keep keyboard focus on the same control across the rebuild.
+    const focused = (document.activeElement as HTMLElement | null)?.dataset?.focus;
     this.list.replaceChildren(...shown.map((r) => this.row(r)));
+    if (focused) this.list.querySelector<HTMLElement>(`[data-focus="${focused}"]`)?.focus();
   }
 
   private row(r: RecipeRow): HTMLElement {
@@ -116,8 +119,9 @@ export class CraftingPanel {
       count.textContent = String(c);
       go.textContent = `Craft ${c > 1 ? `×${c}` : ""}`.trim();
     };
-    const step = (label: string, d: number, aria: string) => h("button", { class: "btn tiny ghost", type: "button", "aria-label": aria, disabled: r.max <= 1, onclick: () => set((this.counts.get(id) ?? 1) + d) }, label);
-    const go = h("button", { class: "btn tiny", type: "button", disabled: r.max === 0 || this.busy.has(id) }, "Craft");
+    const step = (label: string, d: number, aria: string) =>
+      h("button", { class: "btn tiny ghost", type: "button", "aria-label": aria, "data-focus": `${id}:${label}`, disabled: r.max <= 1, onclick: () => set((this.counts.get(id) ?? 1) + d) }, label);
+    const go = h("button", { class: "btn tiny", type: "button", "data-focus": `${id}:go`, disabled: r.max === 0 || this.busy.has(id) }, "Craft");
     go.addEventListener("click", async () => {
       const c = clampCount(this.counts.get(id) ?? 1, r.max);
       if (!c || this.busy.has(id)) return;
@@ -148,7 +152,7 @@ export class CraftingPanel {
         r.recipe.fuel ? h("span", { class: "craft-station" }, `+${r.recipe.fuel} fuel`) : null,
       ),
       r.max
-        ? h("div", { class: "craft-go" }, step("−", -1, "Fewer"), count, step("+", 1, "More"), h("button", { class: "btn tiny ghost", type: "button", onclick: () => set(r.max) }, "Max"), go)
+        ? h("div", { class: "craft-go" }, step("−", -1, "Fewer"), count, step("+", 1, "More"), h("button", { class: "btn tiny ghost", type: "button", "data-focus": `${id}:max`, onclick: () => set(r.max) }, "Max"), go)
         : h("p", { class: "craft-why" }, r.reason ?? ""),
     );
   }

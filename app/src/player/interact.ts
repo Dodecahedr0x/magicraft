@@ -40,7 +40,8 @@ import {
   type WorldAccount,
 } from "../chain";
 import type { App } from "../state";
-import { breakTimeMs, canHarvest, coreRecipes } from "../wasm";
+import { breakTimeMs, canHarvest, coreRecipes, simulateCraft } from "../wasm";
+import type { ChunkStore } from "../world/store";
 import type { WorldHandle } from "../world/world";
 import { itemInfo, itemName } from "../ui/items";
 import { BLOCK_NAMES } from "../world/blocks";
@@ -187,6 +188,43 @@ export class MobIndex {
     }
     for (const k of this.cache.keys()) if (!seen.has(k)) this.cache.delete(k);
     return out;
+  }
+}
+
+// ---------------------------------------------------------------- optimistic edits
+
+export type EditStore = Pick<ChunkStore, "setLocal" | "clearLocal" | "revertLocal">;
+
+/** Writes `block` at `at` locally, sends the edit, and settles the local write: kept (then
+ *  dropped from the overlay) when confirmed, reverted + re-read on failure. A `retry`
+ *  failure (`Cooldown`: the previous break's `break_until` hasn't passed onchain) is
+ *  re-sent every `retryMs`, at most `maxRetries` times, with the local write kept. Null
+ *  if the chunk isn't ready locally (nothing sent). */
+export async function optimisticEdit(o: {
+  store: EditStore;
+  at: V3;
+  block: number;
+  send: () => Promise<SendResult>;
+  retryMs?: number;
+  maxRetries?: number;
+  onRetry?: () => void;
+}): Promise<SendResult | null> {
+  const [x, y, z] = o.at;
+  const ed = o.store.setLocal(x, y, z, o.block);
+  if (!ed) return null;
+  for (let tries = 0; ; tries++) {
+    const r = await o.send();
+    if (r.status === "confirmed") {
+      o.store.clearLocal(x, y, z, ed.seq);
+      return r;
+    }
+    if (r.status === "failed" && r.error.kind === "retry" && tries < (o.maxRetries ?? MAX_COOLDOWN_RETRIES)) {
+      o.onRetry?.();
+      await new Promise((res) => setTimeout(res, o.retryMs ?? COOLDOWN_RETRY_MS));
+      continue;
+    }
+    o.store.revertLocal(x, y, z, ed.seq, ed.old);
+    return r;
   }
 }
 
@@ -439,44 +477,33 @@ export class Interaction {
 
   private async breakBlock(m: Mining) {
     const { app, world, view } = this.d;
-    const [x, y, z] = m.block;
     const key = m.key;
     this.breaking.add(key);
-    const old = view.store.setLocal(x, y, z, 0);
-    if (old === null) {
-      this.breaking.delete(key);
-      return;
-    }
-    if (!canHarvest(m.id, m.item)) {
-      // The cheapest pickaxe that would harvest it (only pickaxe blocks have a tier rule).
-      const pick = [256, 257, 258, 259].find((t) => canHarvest(m.id, t));
-      this.toast(`No drop: ${BLOCK_NAMES[m.id]} needs ${pick ? `a ${itemName(pick).toLowerCase()}` : "another tool"}.`, "info");
-    }
     try {
-      if (!(await this.select.sync())) {
-        view.store.revertLocal(x, y, z, old);
-        this.toast("Couldn't switch tools; try again.");
-        return;
+      // The onchain tool must be the selected one first (drops, durability, next cooldown).
+      if (!(await this.select.sync())) return this.toast("Couldn't switch tools; try again.");
+      if (!canHarvest(m.id, m.item)) {
+        // The cheapest pickaxe that would harvest it (only pickaxe blocks have a tier rule).
+        const pick = [256, 257, 258, 259].find((t) => canHarvest(m.id, t));
+        this.toast(`No drop: ${BLOCK_NAMES[m.id]} needs ${pick ? `a ${itemName(pick).toLowerCase()}` : "another tool"}.`, "info");
       }
-      for (let tries = 0; ; tries++) {
-        const chain = this.chainNow;
-        const r = await this.send(() => breakBlockIx(app.program, app.auth(), world, m.block, view.store));
-        if (r.status === "confirmed") {
-          this.stats.breaks++;
-          if (chain !== null) this.breakGuard = Math.max(this.breakGuard, chain + m.time);
-          view.store.clearLocal(x, y, z);
-          return;
-        }
-        if (r.status === "failed" && r.error.kind === "retry" && tries < MAX_COOLDOWN_RETRIES) {
-          // Cooldown: the previous break's `break_until` hasn't passed onchain yet.
-          this.stats.cooldownRetries++;
-          await new Promise((res) => setTimeout(res, COOLDOWN_RETRY_MS));
-          continue;
-        }
+      // The next break is gated from the moment this one is sent (`break_until = now +
+      // this block's time` onchain); restored if the break fails for good.
+      const guard = this.breakGuard;
+      const chain = this.chainNow;
+      if (chain !== null) this.breakGuard = Math.max(guard, chain + m.time);
+      const r = await optimisticEdit({
+        store: view.store,
+        at: m.block,
+        block: 0,
+        send: () => this.send(() => breakBlockIx(app.program, app.auth(), world, m.block, view.store)),
+        onRetry: () => this.stats.cooldownRetries++,
+      });
+      if (r?.status === "confirmed") this.stats.breaks++;
+      else if (r) {
         this.stats.breakFailures++;
-        view.store.revertLocal(x, y, z, old);
+        this.breakGuard = guard;
         if (r.status === "failed") this.fail(r.error, "Breaking");
-        return;
       }
     } finally {
       this.breaking.delete(key);
@@ -485,6 +512,11 @@ export class Interaction {
 
   // ------------------------------------------------------------ attack
 
+  /** Attacks mob slot `mob.idx` of chunk `(mob.cx, mob.cz)`. Race (accepted): the ix names
+   *  a slot, not a mob id — if the mob dies or moves to another chunk before the tx lands,
+   *  the program answers `NoMob` (silent here), or hits whichever mob took that slot in the
+   *  meantime if it is in reach too (slots are only reused by spawns / mobs walking in).
+   *  The tool is the onchain held slot, synced first (`SlotSelect.sync`). */
   private async attack(mob: LiveMob) {
     const chain = this.chainNow;
     const st = this.d.state();
@@ -559,18 +591,18 @@ export class Interaction {
       err = placeError({ ...base, others: [...(local ? [local as V3] : []), ...entries.map((e) => e.pos)] });
       if (err) return this.blockedLocally(err);
     }
-    const [x, y, z] = target;
-    const old = view.store.setLocal(x, y, z, block);
-    if (old === null) return;
     this.pendingPlace.set(slot, (this.pendingPlace.get(slot) ?? 0) + 1);
     try {
-      const r = await this.send(() => placeBlockIx(app.program, app.auth(), world, target, slot, view.store));
-      if (r.status === "confirmed") {
-        this.stats.places++;
-        view.store.clearLocal(x, y, z);
-      } else {
+      const r = await optimisticEdit({
+        store: view.store,
+        at: target,
+        block,
+        send: () => this.send(() => placeBlockIx(app.program, app.auth(), world, target, slot, view.store)),
+        maxRetries: 0,
+      });
+      if (r?.status === "confirmed") this.stats.places++;
+      else if (r) {
         this.stats.placeFailures++;
-        view.store.revertLocal(x, y, z, old);
         if (r.status === "failed") this.fail(r.error, "Placing");
       }
     } finally {
@@ -611,6 +643,17 @@ export class Interaction {
     const r = coreRecipes()[recipe];
     const st = this.stations();
     const { app, world } = this.d;
+    // The core's craft on the current inventory first: craftable counts are not contiguous
+    // (a consumed stack frees a slot), so a count below the maximum can still fail.
+    const inv = this.d.state()?.inv;
+    if (inv) {
+      const sim = simulateCraft(inv, recipe, count, !!st.table, !!st.furnace);
+      if (!sim.ok) {
+        const error: TxFailure = { kind: "other", name: sim.error, message: `craft ×${count} would fail (${sim.error})` };
+        this.toast(sim.error === "InventoryFull" ? `No room for ×${count}; try another count.` : actionMessage(error, "Crafting"));
+        return { status: "failed", error };
+      }
+    }
     const res = await this.send(() =>
       craftIx(app.program, app.auth(), world, recipe, count, { table: r?.station === 1 ? st.table : null, furnace: r?.station === 2 ? st.furnace : null }),
     );

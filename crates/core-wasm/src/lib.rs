@@ -335,28 +335,23 @@ pub fn craft(inv: &[u8], recipe_id: u16, count: u8, table: bool, furnace: bool) 
     out
 }
 
-/// The largest `count` (0..=[`MAX_CRAFT_COUNT`]) for which [`craft`] succeeds (a craft that
-/// works for `n` works for every smaller `n`: inputs, fuel and output space all scale).
+/// The largest `count` (0..=[`MAX_CRAFT_COUNT`]) for which [`craft`] succeeds. Not
+/// monotonic in `count` (consuming a whole input stack frees its slot for the output, so
+/// e.g. 16 tables from 64 planks fit a full inventory while 15 don't), hence a linear scan
+/// from the top (≤ 64 core crafts on a 216-byte copy each).
 #[wasm_bindgen]
 pub fn max_crafts(inv: &[u8], recipe_id: u16, table: bool, furnace: bool) -> u8 {
     let Some(inv) = inventory_of(inv) else {
         return 0;
     };
     let near = Stations { table, furnace };
-    let ok = |n: u8| {
-        let mut tmp = inv;
-        recipes::craft(&mut tmp, recipe_id, n, near).is_ok()
-    };
-    let (mut lo, mut hi) = (0u8, MAX_CRAFT_COUNT);
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if ok(mid) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    lo
+    (1..=MAX_CRAFT_COUNT)
+        .rev()
+        .find(|&n| {
+            let mut tmp = inv;
+            recipes::craft(&mut tmp, recipe_id, n, near).is_ok()
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -543,5 +538,15 @@ mod tests {
         assert_eq!(craft(&b, 0, 4, false, false)[0], 3); // MissingInputs
         assert_eq!(craft(&b, 3, 1, false, false)[0], 2); // furnace needs a table
         assert_eq!(craft(&b[1..], 0, 1, false, false), vec![BAD_INPUT]);
+
+        // Not monotonic: a full inventory with 64 planks fits 16 tables (the planks slot is
+        // freed) but not 1..=15.
+        let mut full = Inventory::new();
+        full.add(Item::Dirt, 35 * 64);
+        full.add(Item::Planks, 64);
+        let fb = full.to_bytes();
+        assert_eq!(craft(&fb, 2, 15, false, false)[0], 5); // NoSpace
+        assert_eq!(craft(&fb, 2, 16, false, false)[0], 0);
+        assert_eq!(max_crafts(&fb, 2, false, false), 16);
     }
 }

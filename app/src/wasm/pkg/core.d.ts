@@ -81,8 +81,10 @@ export function item_ids(): Uint16Array;
 export function item_info(id: number): Int32Array;
 
 /**
- * The largest `count` (0..=[`MAX_CRAFT_COUNT`]) for which [`craft`] succeeds (a craft that
- * works for `n` works for every smaller `n`: inputs, fuel and output space all scale).
+ * The largest `count` (0..=[`MAX_CRAFT_COUNT`]) for which [`craft`] succeeds. Not
+ * monotonic in `count` (consuming a whole input stack frees its slot for the output, so
+ * e.g. 16 tables from 64 planks fit a full inventory while 15 don't), hence a linear scan
+ * from the top (≤ 64 core crafts on a 216-byte copy each).
  */
 export function max_crafts(inv: Uint8Array, recipe_id: number, table: boolean, furnace: boolean): number;
 

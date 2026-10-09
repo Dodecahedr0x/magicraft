@@ -5,6 +5,9 @@
 import type { AccountInfo, Connection, PublicKey } from "@solana/web3.js";
 import { accountKind, chunkKey, chunkPda, decodePresence, PRESENCE_STALE_MS, presencePda, type PresenceEntry } from "../chain";
 
+/** Extra age an entry may have and still count as fresh for the overlap check, ms. */
+export const FRESH_MARGIN_MS = 250;
+
 type Slot = { key: string; sub: number | null; entries: PresenceEntry[] | null };
 
 export type PresenceConn = Pick<Connection, "onAccountChange" | "removeAccountChangeListener" | "getMultipleAccountsInfo">;
@@ -75,7 +78,9 @@ export class PresenceWatch {
   }
 
   /** Entries of the given chunks (cached, or fetched now), fresh at chain time `nowMs`
-   *  (null = unknown: every entry counts, the stricter choice). */
+   *  within `PRESENCE_STALE_MS + FRESH_MARGIN_MS` (the clock estimate and the tx's landing
+   *  time are a little off: err on counting an entry), or all of them when `nowMs` is null
+   *  (unknown: the stricter choice). */
   async fresh(chunks: [number, number][], nowMs: number | null): Promise<PresenceEntry[]> {
     const out: PresenceEntry[] = [];
     const missing: [number, number][] = [];
@@ -85,7 +90,7 @@ export class PresenceWatch {
       else missing.push([x, z]);
     }
     if (missing.length) for (const e of (await this.fetch(missing)).values()) out.push(...e);
-    return nowMs === null ? out : out.filter((e) => nowMs - e.lastSeenMs <= PRESENCE_STALE_MS);
+    return nowMs === null ? out : out.filter((e) => nowMs - e.lastSeenMs <= PRESENCE_STALE_MS + FRESH_MARGIN_MS);
   }
 
   dispose() {

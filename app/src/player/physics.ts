@@ -9,8 +9,9 @@
 // - Box 0.6 × 1.8 × 0.6 (half-width 76.8 FP, height 460.8 FP), larger than the program's
 //   (74 / 4..456 FP), so resting against a face never overlaps onchain after rounding.
 // - Fixed step 1/60 s (≤ 50 ms per integration step); a frame catches up at most
-//   `MAX_CATCHUP_S` (longer stalls are dropped: the player stands still, which is always
-//   accepted). Gravity is integrated exactly per step (trapezoid with the max-fall clamp),
+//   `MAX_CATCHUP_S` (1.5 s; dropping time inside a jump makes the body rise later in chain
+//   time than the program's jump ceiling allows, so slow frames must be simulated in full;
+//   the controller snaps to the confirmed state after longer stalls). Gravity is integrated exactly per step (trapezoid with the max-fall clamp),
 //   so the jump apex is ≤ `v²/2g` (1.25 blocks with default params).
 // - Horizontal: no inertia, full air control; walk / sprint (Shift) speed, swim speed
 //   whenever the feet or head voxel is water (puddles / flowing water count, like the
@@ -35,8 +36,12 @@ export const HEIGHT = 460.8;
 export const EYE = 1.62;
 /** Fixed integration step, s. */
 export const STEP_S = 1 / 60;
-/** Most simulated time per frame, s (longer frames drop time). */
-export const MAX_CATCHUP_S = 0.25;
+/** Most simulated time per frame, s. Frames up to this are simulated in full (dropping
+ *  time mid-jump fails the program's jump ceiling); longer stalls are dropped and the
+ *  controller snaps the player back to the confirmed state (`PlayerController`). */
+export const MAX_CATCHUP_S = 1.5;
+/** Integration steps per `update` call (bounds the work of one frame). */
+export const MAX_STEPS_PER_UPDATE = Math.ceil(MAX_CATCHUP_S / (1 / 60)) + 1;
 /** `physics::FEET_EPS` / `BODY_H`: the program's water probes (feet / head voxel). */
 export const FEET_EPS = 4;
 export const BODY_H = 456;
@@ -264,7 +269,7 @@ export class PlayerPhysics {
   update(dt: number): number {
     this.acc += Math.min(Math.max(dt, 0), MAX_CATCHUP_S);
     let n = 0;
-    while (this.acc >= STEP_S) {
+    while (this.acc >= STEP_S && n < MAX_STEPS_PER_UPDATE) {
       this.prevPos = [...this.body.pos];
       step(this.body, this.input, this.yaw, this.params, this.world);
       this.acc -= STEP_S;

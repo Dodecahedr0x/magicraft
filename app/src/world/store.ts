@@ -17,6 +17,7 @@
 //   `clearLocal` (confirmed) or `revertLocal` (failed: restore + re-read the chunk).
 import type { AccountInfo, Connection, PublicKey } from "@solana/web3.js";
 import { accountKind, CHUNK_GEN_STAGE_OFFSET, CHUNK_HEADER_SIZE, chunkBlocks, chunkPda, chunkReady, chunkKey, GEN_DONE, type ChunkView } from "../chain";
+import { isFluid as isFluidByte } from "./blocks";
 import { borderOf, DIRS } from "./mesher";
 
 export type StoreConn = Pick<
@@ -72,8 +73,11 @@ export class ChunkStore implements ChunkView {
   private dirty = new Set<string>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
-  /** Optimistic edits per chunk key: local block index → byte. */
-  private overlay = new Map<string, Map<number, number>>();
+  /** Optimistic edits per chunk key: local block index → edit. */
+  private overlay = new Map<string, Map<number, { b: number; old: number; seq: number }>>();
+  private editSeq = 0;
+  /** `moveBlocks` copies (per chunk key, by entry version). */
+  private moveCache = new Map<string, { version: number; blocks: Uint8Array }>();
   center: [number, number] | null = null;
 
   constructor(readonly opts: StoreOptions) {
@@ -144,39 +148,47 @@ export class ChunkStore implements ChunkView {
   }
 
   /** Writes block `b` at `(x, y, z)` locally and keeps it over account updates until
-   *  `clearLocal` / `revertLocal`. Returns the previous byte, or null if the chunk is not
-   *  ready (nothing written). */
-  setLocal(x: number, y: number, z: number, b: number): number | null {
+   *  `clearLocal` / `revertLocal` with the returned edit `seq` (a later edit of the same
+   *  voxel supersedes it). Null if the chunk is not ready (nothing written). */
+  setLocal(x: number, y: number, z: number, b: number): { seq: number; old: number } | null {
     const l = this.locate(x, y, z);
     if (!l) return null;
     const old = l.e.blocks![l.i];
     let m = this.overlay.get(l.e.key);
     if (!m) this.overlay.set(l.e.key, (m = new Map()));
-    m.set(l.i, b);
+    const prev = m.get(l.i);
+    const seq = ++this.editSeq;
+    // The chain value under stacked edits is the first edit's `old`.
+    m.set(l.i, { b, old: prev ? prev.old : old, seq });
     l.e.blocks![l.i] = b;
+    this.moveCache.delete(l.e.key);
     this.markEdit(l.e, l.lx, l.lz);
-    return old;
+    return { seq, old };
   }
 
-  /** The edit at `(x, y, z)` was confirmed: stop re-applying it (the chain has it now). */
-  clearLocal(x: number, y: number, z: number) {
+  private takeEdit(x: number, y: number, z: number, seq: number) {
     const l = this.locate(x, y, z);
     const m = l && this.overlay.get(l.e.key);
-    if (!m) return;
+    const ed = m?.get(l!.i);
+    if (!l || !m || !ed || ed.seq !== seq) return null;
     m.delete(l.i);
     if (!m.size) this.overlay.delete(l.e.key);
+    this.moveCache.delete(l.e.key);
+    return { l, ed };
   }
 
-  /** The edit at `(x, y, z)` failed: drop it, put `old` back (if the byte is still ours)
-   *  and re-read the chunk from the chain. */
-  revertLocal(x: number, y: number, z: number, old: number) {
-    const l = this.locate(x, y, z);
-    if (!l) return;
-    const m = this.overlay.get(l.e.key);
-    const mine = m?.get(l.i);
-    m?.delete(l.i);
-    if (m && !m.size) this.overlay.delete(l.e.key);
-    if (mine !== undefined && l.e.blocks![l.i] === mine) {
+  /** Edit `seq` at `(x, y, z)` was confirmed: stop re-applying it (the chain has it now). */
+  clearLocal(x: number, y: number, z: number, seq: number) {
+    this.takeEdit(x, y, z, seq);
+  }
+
+  /** Edit `seq` at `(x, y, z)` failed: drop it, put `old` back (if the byte is still the
+   *  edit's) and re-read the chunk from the chain. */
+  revertLocal(x: number, y: number, z: number, seq: number, old: number) {
+    const t = this.takeEdit(x, y, z, seq);
+    if (!t) return;
+    const { l, ed } = t;
+    if (l.e.blocks![l.i] === ed.b) {
       l.e.blocks![l.i] = old;
       this.markEdit(l.e, l.lx, l.lz);
     }
@@ -188,6 +200,23 @@ export class ChunkStore implements ChunkView {
     let n = 0;
     for (const m of this.overlay.values()) n += m.size;
     return n;
+  }
+
+  /** Block bytes for move pre-validation: `readyBlocks` with every pending edit taken
+   *  conservatively — a pending break keeps the chain's (solid) block, a pending place
+   *  shows the placed one — so no move is pre-validated through a block the chain may
+   *  still hold. Cached per chunk version. */
+  moveBlocks(cx: number, cz: number): Uint8Array | null {
+    const blocks = this.readyBlocks(cx, cz);
+    const e = this.get(cx, cz);
+    const m = e && this.overlay.get(e.key);
+    if (!blocks || !e || !m) return blocks;
+    const hit = this.moveCache.get(e.key);
+    if (hit && hit.version === e.version && hit.blocks.length) return hit.blocks;
+    const copy = blocks.slice();
+    for (const [i, ed] of m) if (ed.b === 0 || isFluidByte(ed.b)) copy[i] = ed.old;
+    this.moveCache.set(e.key, { version: e.version, blocks: copy });
+    return copy;
   }
 
   private markEdit(e: ChunkEntry, lx: number, lz: number) {
@@ -249,6 +278,7 @@ export class ChunkStore implements ChunkView {
   private unload(e: ChunkEntry) {
     this.map.delete(e.key);
     this.overlay.delete(e.key);
+    this.moveCache.delete(e.key);
     if (e.sub !== null) void Promise.resolve(this.opts.conn.removeAccountChangeListener(e.sub)).catch(() => {});
     e.sub = null;
     // Removal of its mesh (meshInput is null now).
@@ -305,8 +335,9 @@ export class ChunkStore implements ChunkView {
     e.blocks = data ? chunkBlocks(data) : null;
     const next = e.blocks;
     const ov = this.overlay.get(e.key);
-    if (ov && next) for (const [i, b] of ov) next[i] = b;
+    if (ov && next) for (const [i, ed] of ov) next[i] = ed.b;
     else if (ov && !data) this.overlay.delete(e.key);
+    this.moveCache.delete(e.key);
     if (!prev !== !next) {
       this.markDirty(e.key);
       for (const [dx, dz] of DIRS) this.markNeighbor(e.cx + dx, e.cz + dz);
@@ -371,6 +402,7 @@ export class ChunkStore implements ChunkView {
       if (e.sub !== null) void Promise.resolve(this.opts.conn.removeAccountChangeListener(e.sub)).catch(() => {});
     this.map.clear();
     this.overlay.clear();
+    this.moveCache.clear();
     this.dirty.clear();
   }
 }

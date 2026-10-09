@@ -171,7 +171,8 @@ describe("ChunkStore", () => {
     store.flush();
     dirty.length = 0;
     // Break (15, 10, 3) locally: the border neighbor (1, 0) re-meshes too.
-    expect(store.setLocal(15, 10, 3, 0)).toBe(3);
+    const brk = store.setLocal(15, 10, 3, 0)!;
+    expect(brk.old).toBe(3);
     expect(store.getBlock(15, 10, 3)).toBe(0);
     expect(store.localEdits).toBe(1);
     store.flush();
@@ -179,15 +180,26 @@ describe("ChunkStore", () => {
     // An unrelated update (crank tick) still carries the old block: the overlay wins.
     f.push(0, 0, chunkData((b) => (b[bi(15, 10, 3)] = 3)));
     expect(store.getBlock(15, 10, 3)).toBe(0);
+    // Move pre-validation still sees the pending break as the chain's stone.
+    expect(store.moveBlocks(0, 0)![bi(15, 10, 3)]).toBe(3);
+    expect(store.readyBlocks(0, 0)![bi(15, 10, 3)]).toBe(0);
+    // A stale settle (older seq) doesn't touch a newer edit of the same voxel.
+    const again = store.setLocal(15, 10, 3, 0)!;
+    store.clearLocal(15, 10, 3, brk.seq);
+    expect(store.localEdits).toBe(1);
+    expect(again.old).toBe(0);
     // Confirmed: overlay dropped; the chain's state arrives with the next update.
-    store.clearLocal(15, 10, 3);
+    store.clearLocal(15, 10, 3, again.seq);
+    expect(store.moveBlocks(0, 0)![bi(15, 10, 3)]).toBe(0);
     expect(store.localEdits).toBe(0);
     f.push(0, 0, chunkData());
     expect(store.getBlock(15, 10, 3)).toBe(0);
     // A failed place is reverted (and the chunk re-read).
-    expect(store.setLocal(4, 11, 4, 2)).toBe(0);
+    const plc = store.setLocal(4, 11, 4, 2)!;
+    expect(plc.old).toBe(0);
     expect(store.getBlock(4, 11, 4)).toBe(2);
-    store.revertLocal(4, 11, 4, 0);
+    expect(store.moveBlocks(0, 0)![bi(4, 11, 4)]).toBe(2); // pending place counts as solid
+    store.revertLocal(4, 11, 4, plc.seq, plc.old);
     expect(store.getBlock(4, 11, 4)).toBe(0);
     expect(store.localEdits).toBe(0);
     await Promise.resolve();

@@ -199,7 +199,8 @@ export class WorldRenderer {
     this.last = performance.now();
     const loop = (t: number) => {
       this.raf = requestAnimationFrame(loop);
-      const dtMs = Math.min(250, t - this.last);
+      // Real frame time (≤ 2 s): physics catches up in full; longer stalls snap back.
+      const dtMs = Math.min(2000, t - this.last);
       this.last = t;
       this.avgFrame += (dtMs - this.avgFrame) * 0.05;
       this.frameCb?.(dtMs / 1000);

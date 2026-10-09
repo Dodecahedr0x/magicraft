@@ -83,6 +83,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
     show(s);
     player?.onPlayerState(data);
     act?.select.onPlayerState(s.heldSlot);
+    if (s.health === 0) setPanel(false, false);
     death.show(s.health === 0);
     if (s.health > 0 && player) player.controller.frozen = false;
     paintHud();
@@ -98,7 +99,8 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
 
   // ------------------------------------------------------------ inventory panel (E)
 
-  const setPanel = (open: boolean) => {
+  /** Opens / closes the panel; `relock` recaptures the mouse on a user close. */
+  function setPanel(open: boolean, relock = true) {
     if (!act || !player || open === !invPanel.hidden) return;
     if (open && death.shown) return;
     invPanel.hidden = !open;
@@ -107,15 +109,18 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
     if (open) {
       if (document.pointerLockElement) document.exitPointerLock();
       paintHud();
+      // Focus into the dialog (first craft button, else Close).
+      (invPanel.querySelector<HTMLElement>(".craft-go .btn:not(.ghost):not(:disabled)") ?? invPanel.querySelector<HTMLElement>(".inv-head .btn"))?.focus();
     } else {
-      (canvas.requestPointerLock?.() as Promise<void> | undefined)?.catch?.(() => {});
+      if (invPanel.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();
+      if (relock) (canvas.requestPointerLock?.() as Promise<void> | undefined)?.catch?.(() => {});
     }
-  };
+  }
   const typing = (e: Event) => e.target instanceof HTMLElement && (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable);
   const onKey = (e: KeyboardEvent) => {
     if (typing(e) || e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
     if (e.code === "KeyE") setPanel(invPanel.hidden);
-    else if (e.code === "Escape" && !invPanel.hidden) setPanel(false);
+    else if (e.code === "Escape" && !invPanel.hidden) setPanel(false, false);
   };
   window.addEventListener("keydown", onKey);
   // Stations come and go as the player moves: refresh the open panel.
@@ -128,7 +133,10 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
     () => {
       if (stopped) return;
       player = startPlayer(app, view, world, account, canvas, {
-        onDead: () => death.show(true),
+        onDead: () => {
+          setPanel(false, false);
+          death.show(true);
+        },
         onIssue: (f) => view.toast(sendResultMessage({ status: "failed", error: f }, "Move") ?? f.message, "warn"),
       });
       const session = player;
@@ -147,7 +155,10 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
             if (f !== null) (mineBar.firstElementChild as HTMLElement).style.width = `${Math.round(f * 100)}%`;
           },
           target: (label) => (aim.textContent = label ?? ""),
-          onDead: () => death.show(true),
+          onDead: () => {
+            setPanel(false, false);
+            death.show(true);
+          },
         },
       });
       const a = act;

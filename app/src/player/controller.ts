@@ -15,7 +15,7 @@ import type { TxFailure } from "../chain/sender";
 import type { App } from "../state";
 import { blockFlags } from "../wasm";
 import type { WorldHandle } from "../world/world";
-import { EYE, FP, NO_INPUT, PlayerPhysics, sampleOf, type Input, type PhysParams, type World } from "./physics";
+import { EYE, FP, MAX_CATCHUP_S, NO_INPUT, PlayerPhysics, sampleOf, type Input, type PhysParams, type World } from "./physics";
 import { ChainClock, encodeParams, MoveSync, type ChainReading } from "./sync";
 
 const SENS = 0.0025;
@@ -91,7 +91,8 @@ export class PlayerController {
     });
     on(document, "visibilitychange", () => this.keys.clear());
     on(canvas, "pointerdown", (e) => {
-      if (e.button !== 0 || o.isFlying?.()) return;
+      // No capture while a panel (inventory) has the mouse.
+      if (e.button !== 0 || o.isFlying?.() || this.blocked) return;
       if (!this.locked) {
         // Pointer lock may be refused (automation, iframes): drag to look instead.
         const p = canvas.requestPointerLock?.() as Promise<void> | undefined;
@@ -208,7 +209,7 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
     sender: () => (app.state.sessionStale ? null : app.state.sender),
     moveIx: (m) => moveIx(app.program, app.auth(), worldPk, { ...m, view: store }),
     dayCrankIx: () => scheduleDayCrankIx(app.program, worldPk),
-    blocks: (cx, cz) => store.readyBlocks(cx, cz),
+    blocks: (cx, cz) => store.moveBlocks(cx, cz),
     fetchState: async () => (await er.getAccountInfo(pstate, "confirmed"))?.data ?? null,
     clock,
     snap: (pos: V3) => controller.snap(pos),
@@ -260,8 +261,21 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
   sync.onWorld(world);
   const tickTimer = setInterval(() => void sync.tick(), sync.intervalMs);
 
+  // A stall longer than physics catches up (or the tab coming back into view): the local
+  // body would lag chain time, so restart from the confirmed state instead.
+  let resume = false;
+  const onVisible = () => {
+    if (document.visibilityState === "visible") resume = true;
+  };
+  document.addEventListener("visibilitychange", onVisible);
   const offFrame = view.onFrame((dt) => {
     if (stopped) return;
+    if ((resume || dt > MAX_CATCHUP_S) && sync.prevState) {
+      controller.snap(sync.prevState.pos);
+      sync.resetFrames();
+      dt = 0;
+    }
+    resume = false;
     const p = controller.update(dt);
     if (!p) return;
     const b = p.body;
@@ -299,6 +313,7 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
       clearInterval(calTimer);
       clearInterval(tickTimer);
       offFrame();
+      document.removeEventListener("visibilitychange", onVisible);
       controller.dispose();
       void er.removeAccountChangeListener(worldSub).catch(() => {});
       if (g.__magicraft) delete g.__magicraft.player;

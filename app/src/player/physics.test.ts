@@ -189,6 +189,22 @@ describe("60 fps client vs check_move at 8 Hz", () => {
       expect(r.checks.length).toBe(Math.floor(frames / 8));
     });
 
+  // Throttled rendering (hidden tab, slow device): 0.2–0.4 s frames used to drop physics
+  // time mid-jump, so the body rose later in chain time than the jump ceiling allows
+  // (Flying) and the sync snapped back.
+  const slow: [string, (f: number) => number][] = [
+    ["0.2–0.4 s", (f) => 0.2 + ((f * 7) % 5) * 0.05],
+    ["0.35 s", () => 0.35],
+    ["0.4 s", () => 0.4],
+  ];
+  for (const [name, frameDt] of slow)
+    for (const fallback of [false, true])
+      it(`slow frames (${name}${fallback ? ", frame choice" : ""}) bunny-hopping up the stairs: no snaps`, () => {
+        const r = runClient(world(), [bf(46), bf(10), bf(5)], 60, () => ({ forward: true, sprint: true, jump: true, yaw: YAW_PX }), 1, { fallback, frameDt });
+        expect(r.rejected).toEqual([]);
+        expect(r.phys.body.pos[0]).toBeGreaterThan(bf(70)); // climbed: no time dropped
+      });
+
   it("walking off ledges and stairs down", () => {
     const r = runClient(world(), [bf(69, 128), bf(20), bf(5)], 120, () => ({ forward: true, sprint: true, yaw: YAW_NX }));
     expect(r.rejected).toEqual([]);
