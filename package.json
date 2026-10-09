@@ -3,6 +3,7 @@
   "private": true,
   "license": "ISC",
   "scripts": {
+    "test": "anchor build && scripts/local-er.sh up && (anchor test --skip-local-validator --skip-build --skip-deploy; s=$?; scripts/local-er.sh down; exit $s)",
     "lint": "prettier \"tests/**/*.ts\" --check",
     "lint:fix": "prettier \"tests/**/*.ts\" -w"
   },

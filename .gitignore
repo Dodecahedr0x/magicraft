@@ -5,3 +5,4 @@ test-ledger/
 app/dist/
 .DS_Store
 **/*.rs.bk
+.localnet/
