@@ -95,6 +95,15 @@
 //!   (no credit when the cooldown was already 0 before this tick), so the long-run rate is
 //!   exactly 1 hit/s for any tick period ≤ 1 s
 //!   (e.g. 333 ms ticks → hits at ticks 0, 4, 7, 10, …: 10 hits in 30 ticks).
+//! - **Despawn** (Minecraft-style, deterministic): every step with no fresh target within
+//!   [`DESPAWN_RANGE`] (32 blocks, 3D) adds `dt` to `alone_ms` (any target in range
+//!   resets it); at [`DESPAWN_AFTER_MS`] (15 s of stepped time) the slot is cleared
+//!   (`died` + `despawned`). Mobs only step while their chunk ticks: a chunk with mobs and
+//!   no fresh presence keeps ticking for the rest of its crank iterations (≥ ~20 s after
+//!   the last renewal at the default 250 ms interval), so the threshold sits below that;
+//!   zombies frozen in a dormant chunk are dropped by `close_chunk` (empty presence) or
+//!   despawn once their chunk ticks again with nobody near. Cave zombies spawned by day
+//!   next to a passing player therefore don't pile up and hold the cap.
 //! - Burning: by day, with feet not in water and **sky-exposed** (no opaque block from the
 //!   block above the head up to the world top): `burn_ms += dt`, −1 hp per full 1000 ms;
 //!   0 hp → cleared, `died`. Night, shade or water → `burn_ms` resets. Sunlight passes
@@ -208,6 +217,10 @@ pub const ZOMBIE_DAMAGE: u8 = 3;
 pub const ATTACK_COOLDOWN_MS: i64 = 1000;
 /// Burning: −1 hp per this much sunlit time.
 pub const BURN_INTERVAL_MS: i64 = 1000;
+/// A zombie with no fresh target within this 3D distance (FP, 32 blocks) is "alone".
+pub const DESPAWN_RANGE: i64 = 32 * FP as i64;
+/// A zombie alone for this much stepped time despawns (module docs, "Despawn").
+pub const DESPAWN_AFTER_MS: u16 = 15_000;
 /// Targets considered per call (cost bound).
 pub const MAX_TARGETS: usize = 32;
 /// Blocks a mob falls per tick at most (cost bound of settle).
@@ -258,7 +271,9 @@ const MAX_BLOCK: i64 = XZ_LIMIT as i64 / FPL;
 /// | 20 | `cooldown_ms` | u16 | zombie: ms until the next hit is allowed |
 /// | 22 | `burn_ms` | u16 | zombie: sunlit ms not yet turned into damage |
 /// | 24 | `last_tick` | u8 | stamp of the last [`step_mob`] (`tick % 255 + 1`; 0 = never) |
-/// | 25 | `_reserved` | [u8; 7] | 0 |
+/// | 25 | `_pad` | u8 | 0 (alignment of `alone_ms`) |
+/// | 26 | `alone_ms` | u16 | zombie: ms stepped with no target within [`DESPAWN_RANGE`] |
+/// | 28 | `_reserved` | [u8; 4] | 0 |
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Mob {
@@ -274,7 +289,11 @@ pub struct Mob {
     /// that crossed into a chunk is not stepped again by that chunk's tick in the same
     /// period. Requires `MobCtx::tick` to be a global clock.
     pub last_tick: u8,
-    pub _reserved: [u8; 7],
+    pub _pad: u8,
+    /// Zombie: time stepped with no fresh target within [`DESPAWN_RANGE`] (saturating);
+    /// reaching [`DESPAWN_AFTER_MS`] despawns it.
+    pub alone_ms: u16,
+    pub _reserved: [u8; 4],
 }
 
 const _: () = assert!(core::mem::size_of::<Mob>() == Mob::SIZE);
@@ -294,7 +313,9 @@ impl Mob {
         cooldown_ms: 0,
         burn_ms: 0,
         last_tick: 0,
-        _reserved: [0; 7],
+        _pad: 0,
+        alone_ms: 0,
+        _reserved: [0; 4],
     };
 
     /// An animal from populate (chunk-local block coordinates), centered on its block.
@@ -336,15 +357,17 @@ impl Mob {
         b[20..22].copy_from_slice(&self.cooldown_ms.to_le_bytes());
         b[22..24].copy_from_slice(&self.burn_ms.to_le_bytes());
         b[24] = self.last_tick;
-        b[25..32].copy_from_slice(&self._reserved);
+        b[25] = self._pad;
+        b[26..28].copy_from_slice(&self.alone_ms.to_le_bytes());
+        b[28..32].copy_from_slice(&self._reserved);
         b
     }
 
     /// Parses per the layout table (any bytes are accepted).
     pub fn from_bytes(b: &[u8; 32]) -> Mob {
         let i32_at = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-        let mut reserved = [0u8; 7];
-        reserved.copy_from_slice(&b[25..32]);
+        let mut reserved = [0u8; 4];
+        reserved.copy_from_slice(&b[28..32]);
         Mob {
             kind: b[0],
             hp: b[1],
@@ -355,6 +378,8 @@ impl Mob {
             cooldown_ms: u16::from_le_bytes([b[20], b[21]]),
             burn_ms: u16::from_le_bytes([b[22], b[23]]),
             last_tick: b[24],
+            _pad: b[25],
+            alone_ms: u16::from_le_bytes([b[26], b[27]]),
             _reserved: reserved,
         }
     }
@@ -405,8 +430,10 @@ pub struct Hit {
 pub struct MobEvent {
     /// Position changed.
     pub moved: bool,
-    /// The slot was cleared (burnt to death, hp 0, or invalid state).
+    /// The slot was cleared (burnt to death, despawned, hp 0, or invalid state).
     pub died: bool,
+    /// The slot was cleared because the zombie was alone too long (also sets `died`).
+    pub despawned: bool,
     /// Zombie contact damage dealt this tick.
     pub hit: Option<Hit>,
     /// `(Δcx, Δcz)` of the chunk now holding the mob (one of them 0, each in −1..=1);
@@ -660,6 +687,16 @@ pub fn sky_exposed<W: BlockAccess + ?Sized>(w: &W, bx: i32, fy: i32, bz: i32) ->
     sky_exposed_i(w, bx as i64, fy as i64, bz as i64)
 }
 
+/// Some target within 3D distance `r` (FP) of `p` (first [`MAX_TARGETS`]).
+fn near_any(targets: &[Target], p: &[i64; 3], r: i64) -> bool {
+    targets.iter().take(MAX_TARGETS).any(|t| {
+        let dx = t.pos[0] as i64 - p[0];
+        let dy = t.pos[1] as i64 - p[1];
+        let dz = t.pos[2] as i64 - p[2];
+        dx.abs() <= r && dy.abs() <= r && dz.abs() <= r && dx * dx + dy * dy + dz * dz <= r * r
+    })
+}
+
 /// Nearest chaseable target (module docs, "Zombie").
 fn nearest<'t>(targets: &'t [Target], p: &[i64; 3]) -> Option<&'t Target> {
     let mut best: Option<(&Target, i64)> = None;
@@ -774,6 +811,17 @@ pub fn step_mob<W: BlockAccess + ?Sized>(ctx: &MobCtx, mob: &mut Mob, world: &W)
     let zombie = mob.kind == KIND_ZOMBIE;
 
     if zombie {
+        if near_any(ctx.targets, &p, DESPAWN_RANGE) {
+            mob.alone_ms = 0;
+        } else {
+            mob.alone_ms = (mob.alone_ms as i64 + dt).min(u16::MAX as i64) as u16;
+            if mob.alone_ms >= DESPAWN_AFTER_MS {
+                mob.clear();
+                ev.died = true;
+                ev.despawned = true;
+                return ev;
+            }
+        }
         if ctx.is_day && !in_water && sky_exposed_i(world, bx, fy, bz) {
             let acc = mob.burn_ms as i64 + dt;
             let n = (acc / BURN_INTERVAL_MS).min(255) as u8;
@@ -1234,7 +1282,9 @@ mod tests {
             cooldown_ms: 999,
             burn_ms: 0x1234,
             last_tick: 77,
-            _reserved: [9; 7],
+            _pad: 3,
+            alone_ms: 0x0A0B,
+            _reserved: [9; 4],
         };
         let b = m.to_bytes();
         assert_eq!(&b[0..4], &[4, 17, 0x81, 5]);
@@ -1245,7 +1295,9 @@ mod tests {
         assert_eq!(&b[20..22], &999u16.to_le_bytes());
         assert_eq!(&b[22..24], &0x1234u16.to_le_bytes());
         assert_eq!(b[24], 77);
-        assert_eq!(&b[25..32], &[9; 7]);
+        assert_eq!(b[25], 3);
+        assert_eq!(&b[26..28], &0x0A0Bu16.to_le_bytes());
+        assert_eq!(&b[28..32], &[9; 4]);
         assert_eq!(Mob::from_bytes(&b), m);
         assert_eq!(Mob::EMPTY.to_bytes(), [0; 32]);
     }
@@ -1505,13 +1557,25 @@ mod tests {
             }
             m
         };
-        assert_eq!(run(vec![target(0, 11, 17)]), run(vec![]));
+        // (The 17-block target is within the despawn range: only `alone_ms` differs.)
+        let near = run(vec![target(0, 11, 17)]);
+        let none = run(vec![]);
+        assert_eq!(near.alone_ms, 0);
+        assert_eq!(
+            near,
+            Mob {
+                alone_ms: 0,
+                ..none
+            }
+        );
     }
 
     #[test]
     fn idle_zombie_wanders_at_half_speed() {
         let w = W::flat(10);
         let mut sm = sim(&w);
+        // A target beyond the chase range but within the despawn range keeps it around.
+        sm.targets = vec![target(8, 11, 8 + 24)];
         let mut m = mob(KIND_ZOMBIE, 8, 11, 8);
         let start = m.pos;
         let max = (ZOMBIE_SPEED * 333 / 1000 / 2) as i32;
@@ -1613,9 +1677,66 @@ mod tests {
     }
 
     #[test]
+    fn zombie_despawns_when_alone() {
+        let w = W::flat(10);
+        // Alone (no targets): 15 s of stepped time, then cleared; dt sums exactly.
+        for dt in [250u32, 333, 1000] {
+            let mut sm = sim(&w);
+            sm.dt = dt;
+            let mut m = mob(KIND_ZOMBIE, 2, 11, 2);
+            let mut t = 0u32;
+            loop {
+                let ev = sm.step(&mut m);
+                t += dt;
+                if ev.died {
+                    assert!(ev.despawned && m.is_empty());
+                    break;
+                }
+                assert!(!ev.despawned);
+                assert_eq!(m.alone_ms as u32, t);
+            }
+            assert!(t >= DESPAWN_AFTER_MS as u32 && t < DESPAWN_AFTER_MS as u32 + dt);
+        }
+        // A target within 32 blocks (beyond the 16-block chase range) resets the timer.
+        let mut sm = sim(&w);
+        sm.dt = 1000;
+        let mut m = mob(KIND_ZOMBIE, 2, 11, 2);
+        for i in 0..40 {
+            // 25 blocks from wherever the wandering zombie is.
+            let far = Target {
+                pos: [m.pos[0], m.pos[1], m.pos[2] + 25 * FP],
+                idx: 0,
+                chunk: 0,
+            };
+            sm.targets = if i % 10 == 9 { vec![far] } else { vec![] };
+            let ev = sm.step(&mut m);
+            assert!(!ev.died, "despawned at step {i}");
+            if i % 10 == 9 {
+                assert_eq!(m.alone_ms, 0, "step {i} at {:?}", m.pos);
+            }
+        }
+        // ...one 39 blocks away (3D) does not.
+        let mut sm = sim(&w);
+        sm.dt = 1000;
+        sm.targets = vec![target(2 + 30, 11 + 25, 2)];
+        let mut m = mob(KIND_ZOMBIE, 2, 11, 2);
+        let n = (0..30).take_while(|_| !sm.step(&mut m).died).count();
+        assert_eq!(n, 14);
+        // Passive mobs never despawn.
+        let mut sm = sim(&w);
+        sm.dt = 1000;
+        let mut m = mob(KIND_PIG, 2, 11, 2);
+        for _ in 0..60 {
+            assert!(!sm.step(&mut m).died);
+        }
+        assert_eq!(m.alone_ms, 0);
+    }
+
+    #[test]
     fn zombie_burns_by_day_on_surface_only() {
         let w = W::flat(10);
         let mut sm = sim(&w);
+        sm.targets = vec![target(2, 11, 2 + 24)]; // not alone (no despawn)
         sm.is_day = true;
         sm.dt = 1000;
         let mut m = mob(KIND_ZOMBIE, 2, 11, 2);
@@ -1630,6 +1751,7 @@ mod tests {
 
         // Sub-second ticks accumulate: 3 × 333 ms < 1 s, the 4th tick burns.
         let mut sm = sim(&w);
+        sm.targets = vec![target(2, 11, 2 + 24)]; // not alone (no despawn)
         sm.is_day = true;
         let mut m = mob(KIND_ZOMBIE, 2, 11, 2);
         for _ in 0..3 {
@@ -1641,6 +1763,7 @@ mod tests {
 
         // Night: no burn.
         let mut sm = sim(&w);
+        sm.targets = vec![target(2, 11, 2 + 24)]; // not alone (no despawn)
         sm.dt = 1000;
         let mut m = mob(KIND_ZOMBIE, 2, 11, 2);
         for _ in 0..30 {
@@ -1656,6 +1779,7 @@ mod tests {
             }
         }
         let mut sm = sim(&w);
+        sm.targets = vec![target(2, 11, 2 + 24)]; // not alone (no despawn)
         sm.is_day = true;
         sm.dt = 1000;
         let mut m = mob(KIND_ZOMBIE, 2, 11, 2);
@@ -1672,6 +1796,7 @@ mod tests {
                 }
             }
             let mut sm = sim(&w);
+            sm.targets = vec![target(2, 11, 2 + 24)]; // not alone (no despawn)
             sm.is_day = true;
             sm.dt = 1000;
             let mut m = mob(KIND_ZOMBIE, 2, 11, 2);
@@ -1683,6 +1808,7 @@ mod tests {
         // Passive mobs never burn.
         let w = W::flat(10);
         let mut sm = sim(&w);
+        sm.targets = vec![target(2, 11, 2 + 24)]; // not alone (no despawn)
         sm.is_day = true;
         sm.dt = 1000;
         let mut m = mob(KIND_PIG, 2, 11, 2);

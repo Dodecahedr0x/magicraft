@@ -192,6 +192,14 @@ pub mod magicraft {
     pub fn debug_cancel_tick(ctx: Context<DebugCancelTick>) -> Result<()> {
         instructions::crank::debug_cancel_tick(ctx)
     }
+
+    /// Test hook (`localnet` builds only): puts a mob of `kind` (full hp) at the FP feet
+    /// position `pos` into a free slot of the chunk holding it, and arms its crank;
+    /// `kind == 0` clears the chunk's mob slots.
+    #[cfg(feature = "localnet")]
+    pub fn debug_spawn_mob(ctx: Context<DebugSpawnMob>, kind: u8, pos: [i32; 3]) -> Result<()> {
+        instructions::crank::debug_spawn_mob(ctx, kind, pos)
+    }
 }
 
 #[derive(Accounts)]

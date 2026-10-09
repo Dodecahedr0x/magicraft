@@ -500,11 +500,12 @@ pub struct CloseChunk<'info> {
 
 /// Closes an unedited chunk and its presence list, refunding all rent to the payer Player
 /// (on the ER; the next commit carries it to base). Payer only (wallet or session key).
-/// Requires `!edited` (`ChunkEdited`), no zombies or other non-passive mobs (`ChunkHasMobs`)
-/// and an empty presence list (`ChunkOccupied`); any `gen_stage` (a half-generated chunk
-/// can be reclaimed). **Passive animals do not block**: they are dropped with the chunk
-/// (whatever happened to them is lost) and the populate of a regenerated chunk spawns the
-/// original animals again. Clears this chunk's bit in every existing neighbor's `nbr_mask`
+/// Requires `!edited` (`ChunkEdited`) and an empty presence list (`ChunkOccupied`); any
+/// `gen_stage` (a half-generated chunk can be reclaimed). **Mobs do not block** (Task 21b):
+/// animals and zombies are dropped with the chunk — with nobody present, its zombies would
+/// despawn anyway (`core::mobs`, "Despawn"), and the populate of a regenerated chunk spawns
+/// the original animals again. (`ChunkHasMobs` is no longer returned.)
+/// Clears this chunk's bit in every existing neighbor's `nbr_mask`
 /// (the 4 neighbor slots, as in `create_chunk`) and re-arms their armed cranks with the new
 /// account lists, then cancels this chunk's tick crank (unknown ids are a no-op).
 /// `open_chunks −= 1`, `world.chunk_count −= 1` (saturating).
@@ -521,7 +522,6 @@ pub fn close_chunk(mut ctx: Context<CloseChunk>, cx: i32, cz: i32) -> Result<()>
         let h = chunk_for(&chunk_ai, &world_key, cx, cz)?;
         require_keys_eq!(h.payer, a.player.key(), MagicraftError::Unauthorized);
         require!(h.edited == 0, MagicraftError::ChunkEdited);
-        require!(!h.has_blocking_mobs(), MagicraftError::ChunkHasMobs);
         (h.task_id.get(), h.bump, CrankKeys::of(&h))
     };
     {

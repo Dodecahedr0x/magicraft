@@ -432,6 +432,61 @@ pub fn debug_cancel_tick(ctx: Context<DebugCancelTick>) -> Result<()> {
     cancel_tick(&chunk_ai, &k, k.task_id)
 }
 
+// ---------- debug_spawn_mob (localnet builds only) ----------
+
+#[cfg(feature = "localnet")]
+#[derive(Accounts)]
+pub struct DebugSpawnMob<'info> {
+    pub world: Account<'info, World>,
+    /// CHECK: a ready chunk of `world` (checked by `ready_chunk_mut`); receives the mob.
+    #[account(mut)]
+    pub chunk: UncheckedAccount<'info>,
+    pub magic_program: Program<'info, MagicProgram>,
+}
+
+/// **Test hook, compiled into `localnet` builds only**: places a mob of `kind`
+/// (`max_hp`, id from the position) at the FP feet position `pos`, which must lie in this
+/// chunk (`InvalidTarget`), in its first free slot (`InvalidTarget` if full), then arms
+/// the chunk's crank if stale (as `populate_chunk` does for animals). Lets tests meet a
+/// zombie deterministically instead of waiting for a natural spawn. `kind == 0` instead
+/// clears every mob slot of the chunk (`pos` ignored; e.g. an animal that wandered in).
+#[cfg(feature = "localnet")]
+pub fn debug_spawn_mob(ctx: Context<DebugSpawnMob>, kind: u8, pos: [i32; 3]) -> Result<()> {
+    use magicraft_core::hash::mix;
+    use magicraft_core::mobs::max_hp;
+    let world = &ctx.accounts.world;
+    let chunk_ai = ctx.accounts.chunk.to_account_info();
+    {
+        let (mut h, _) = crate::state::ready_chunk_mut(&chunk_ai)?;
+        require_keys_eq!(h.world, world.key(), MagicraftError::InvalidChunk);
+        if kind == magicraft_core::mobs::KIND_NONE {
+            for i in 0..MOB_SLOTS {
+                h.set_mob(i, &Mob::EMPTY);
+            }
+            return Ok(());
+        }
+        let cw = magicraft_core::consts::CHUNK_W as i64 * magicraft_core::consts::FP as i64;
+        let inside = (pos[0] as i64).div_euclid(cw) == h.cx.get() as i64
+            && (pos[2] as i64).div_euclid(cw) == h.cz.get() as i64;
+        require!(inside && max_hp(kind) > 0, MagicraftError::InvalidTarget);
+        let slot = h.free_mob_slot().ok_or(MagicraftError::InvalidTarget)?;
+        let id = mix(((pos[0] as u32 as u64) << 32 | pos[2] as u32 as u64) ^ pos[1] as u64);
+        h.set_mob(
+            slot,
+            &Mob {
+                kind,
+                hp: max_hp(kind),
+                pos,
+                id: id as u32,
+                ..Mob::EMPTY
+            },
+        );
+    }
+    let now = world.chain_ms_ro(&Clock::get()?).ms;
+    maybe_arm_chunk(&chunk_ai, world, now)?;
+    Ok(())
+}
+
 // ---------- tick_chunk (crank target, permissionless) ----------
 
 #[derive(Accounts)]
@@ -783,6 +838,9 @@ fn run_tick(
                 enter_mask,
             };
             let ev = step_mob(&ctx, &mut m, &hood);
+            if ev.despawned {
+                msg!("tick: zombie despawned");
+            }
             if let Some(hit) = ev.hit {
                 if let Some(Some(list)) = lists.get_mut(hit.chunk as usize) {
                     if let Some(e) = list.get_mut(hit.idx as usize) {

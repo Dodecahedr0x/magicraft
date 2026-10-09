@@ -868,7 +868,7 @@ player's chunk may get no surface zombie at night (first full-suite run: a zombi
 underground, no hit in 70 s). The spec therefore idles until night (no heartbeat: the presence
 goes stale, cranks idle) and spends the night in a freshly created chunk. Design follow-up:
 despawn far / unreachable zombies, or let `close_chunk` drop zombies with no fresh presence
-nearby.
+nearby. **Resolved in Task 21b** (below).
 
 **Session-key CU** (whole ix; three runs; one run's numbers sit ~3-5k above another's for the
 same ix, from bump searches over the random keys, so compare within a run):
@@ -890,3 +890,42 @@ same ix, from bump searches over the random keys, so compare within a run):
 Harness: `scripts/local-er.sh` now waits for base slot ≥ 20 before starting the ER; starting it
 in the first slots failed the ER's fee-vault setup tx deterministically on a loaded machine
 ("Magic fee vault setup failed": `Unsupported program id`).
+
+## 2026-10-09: Zombie despawn, mobs don't block close, deterministic zombie tests (Task 21b)
+
+- **Despawn** (`core::mobs`, "Despawn"): a zombie stepped with no fresh target within 32 blocks
+  (3D) accumulates `Mob.alone_ms` (u16 at offset 26; offset 25 is padding, reserved now 4
+  bytes); at 15 s it is cleared (`MobEvent::despawned`, tick logs `tick: zombie despawned`).
+  15 s rather than 30 s: a chunk with only mobs keeps ticking just for its remaining crank
+  iterations (≥ ~20 s after the last renewal at 250 ms), so a 30 s threshold would rarely fire.
+  Measured: despawned ~20 s after a debug spawn (5 s until the entry went stale + 15 s);
+  despawn tick 13.7k CU. Golden terrain digest unchanged (mobs stepping isn't in it).
+- **`close_chunk`** no longer checks mobs (empty presence suffices): zombies and animals are
+  dropped. `ChunkHasMobs` (6113) stays in the enum unused so codes don't shift. Close with a
+  zombie: 27.6k CU, exact refund. e2e: 5-7 of 9 chunks closed (was 0-2), the rest edited or
+  occupied.
+- **`debug_spawn_mob(kind, pos)`** (`localnet` builds only, like `debug_cancel_tick`): mob at a
+  FP position inside the chunk, first free slot, then arms the crank; kind 0 clears all slots. The e2e and one 15-crank
+  test place a zombie 3 blocks from the player at night; one 15-crank test keeps natural spawns
+  (bounded to two nights, rotating through fallback chunks). Damage attribution:
+  `helpers/zombie.ts` `chaseUntilHurt` waits next to the zombie until the hit shows in the
+  presence entry's `pending_damage`, then moves (reading it and moving blindly raced the tick).
+- 15-crank idle test: the self-cancel is not always the last execution. Seen in 2 of ~10 runs:
+  after `tick: idle, crank cancelled` (`Successfully added cancel request for task <id>`), (0,0)
+  kept executing for > 15 s — accepted ticks were further idle cancels of the same id,
+  interleaved with executions rejected as too early (< half an interval after the previous one),
+  i.e. a second execution stream of that task id that the cancel didn't remove. Likely a
+  replace race in the ER scheduler (the chunk is armed read-only by moves, so `crank_armed`
+  stays 0 until the first tick and several same-id replaces can land close together); not
+  reproduced in 4 dedicated runs. Harmless (no-op ticks) and bounded by the task's iterations
+  (≤ 240 × interval). The test now waits for quiescence (the chunk's own `last_tick_ms`
+  unchanged for 2 s, ≤ 75 s; its signature history also holds neighbours' ticks, which list it),
+  checks the trailing ticks are ok no-ops with `tick_count` frozen, then that no tick is accepted
+  for 2 s. An animal from the neighbouring animal chunk can also wander into (0,0) and keep
+  it busy; the test clears it first (`debug_spawn_mob` with kind 0). Re-check with Hydra (Task 28).
+- e2e: `DAY_SECS` 120, night wait bounded by one day; worlds can't be pre-screened by seed
+  (the seed is VRF output, known only after paying for `create_world` + `request_seed`).
+- Water scouting (15-crank `findWater`, e2e via `fedByWater`): the water feeding the broken block
+  may sit across a chunk border; both specs now create Q's horizontal neighbour chunks (a run
+  failed with the feeder in a chunk that existed only in the reference terrain).
+- Full suite: 108 passing, two consecutive runs.

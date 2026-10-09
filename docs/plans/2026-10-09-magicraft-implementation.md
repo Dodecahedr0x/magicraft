@@ -339,6 +339,16 @@ New helpers: `createSession`/`sessionAccounts` (session), `topUp` (player), `cre
 `scoutWork(..., {fed})` (scout), `mobsIn` (actions), `TxStats` (stats). Numbers:
 `docs/notes/spikes.md`.
 
+### Task 21b: Zombie despawn, reclaimable chunks, deterministic zombie tests
+
+**Done:** `core::mobs` despawn (15 s of stepped time with no fresh target within 32 blocks,
+`Mob.alone_ms`); `close_chunk` drops mobs (empty presence suffices); localnet hook
+`debug_spawn_mob(kind, pos)` (kind 0 clears); shared `helpers/zombie.ts` (`columnNear`,
+`chaseUntilHurt` with `pending_damage` attribution); 15-crank: one natural-spawn test (bounded,
+fallback chunks), one hook-placed zombie test, a despawn + close-with-zombie test, quiescent idle
+test; e2e: hook-placed zombie at night (`DAY_SECS` 120, bounded wait), a fresh chunk created
+and closed after respawn (≥ 1 exact-refund close). Notes: `docs/notes/spikes.md`.
+
 ---
 
 ## Phase 3 — Browser client (`app/`)

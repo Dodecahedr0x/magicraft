@@ -42,6 +42,7 @@ pub enum MagicraftError {
     WrongGenStage, // 6111
     #[msg("Chunk was edited and cannot be closed")]
     ChunkEdited, // 6112
+    /// Unused since Task 21b (`close_chunk` drops mobs); kept so later codes do not shift.
     #[msg("Chunk still has mobs")]
     ChunkHasMobs, // 6113
     #[msg("Chunk still has players present")]

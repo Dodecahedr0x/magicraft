@@ -723,17 +723,6 @@ impl ChunkHeader {
         self.fluid[131] != 0 || self.fluid[132] != 0
     }
 
-    /// A mob that blocks `close_chunk`: any occupied slot that is not a passive animal
-    /// (pig/cow/sheep), i.e. zombies (and any unknown kind). Passive animals are dropped with
-    /// the chunk and come back from `populate_chunk` when it is regenerated.
-    pub fn has_blocking_mobs(&self) -> bool {
-        (0..MOB_SLOTS).any(|i| {
-            let k = self.mob(i).kind;
-            k != magicraft_core::mobs::KIND_NONE
-                && !(magicraft_core::mobs::KIND_PIG..=magicraft_core::mobs::KIND_SHEEP).contains(&k)
-        })
-    }
-
     /// The fluid queue (copied out; LE `repr(C)` layout: `buf` u16 × 64 @0,
     /// `rescan_cursor` u16 @128, `head` @130, `len` @131, `overflow` @132, `high_water` @133).
     pub fn fluid_queue(&self) -> FluidQueue {
@@ -1658,44 +1647,5 @@ mod tests {
                 assert!(ms >= before, "reanchor went back");
             }
         }
-    }
-
-    #[test]
-    fn passive_mobs_do_not_block_close() {
-        use magicraft_core::mobs::{KIND_COW, KIND_SHEEP, KIND_ZOMBIE};
-        let mut h: ChunkHeader = bytemuck::Zeroable::zeroed();
-        assert!(!h.has_blocking_mobs());
-        for (i, k) in [magicraft_core::mobs::KIND_PIG, KIND_COW, KIND_SHEEP]
-            .into_iter()
-            .enumerate()
-        {
-            h.set_mob(
-                i,
-                &Mob {
-                    kind: k,
-                    hp: 5,
-                    ..Mob::EMPTY
-                },
-            );
-        }
-        assert!(h.has_mobs() && !h.has_blocking_mobs());
-        h.set_mob(
-            7,
-            &Mob {
-                kind: KIND_ZOMBIE,
-                hp: 20,
-                ..Mob::EMPTY
-            },
-        );
-        assert!(h.has_blocking_mobs());
-        h.set_mob(
-            7,
-            &Mob {
-                kind: 9,
-                hp: 1,
-                ..Mob::EMPTY
-            },
-        );
-        assert!(h.has_blocking_mobs());
     }
 }

@@ -148,8 +148,9 @@ Creation allowed only adjacent to an existing **fully generated** chunk or the p
 chunk (or (0,0) in an empty world). Payer =
 creator's `Player` PDA.
 
-`close_chunk`: payer only, if `!edited`, no zombies (passive animals are dropped and come back
-when the chunk is regenerated), presence empty. Cancels the chunk's tick crank,
+`close_chunk`: payer only, if `!edited` and presence empty. Mobs never block: animals are
+dropped and come back when the chunk is regenerated; zombies are dropped (with nobody present
+they would despawn anyway). Cancels the chunk's tick crank,
 closes `Chunk` + `ChunkPresence`, refunds rent, `open_chunks -= 1`. Regeneration later yields
 identical terrain. The payer's `Player` must be delegated (the refund goes to it on the ER).
 
@@ -233,7 +234,9 @@ recedes. Each change enqueues neighbors; cross-border writes go to neighbor chun
 - Pig, cow, sheep: wander, 1-block step-up, avoid drops > 3.
 - Zombie: spawns at night (or underground anytime) near fresh presence, ≥8 blocks away, no torch
   within 4, cap `zombie_cap_per_chunk`; chases nearest fresh player within 16 (own + neighbor
-  presence); contact damage 3/s into `pending_damage`; burns on surface by day.
+  presence); contact damage 3/s into `pending_damage`; burns on surface by day; **despawns** after
+  15 s of stepped time with no fresh player within 32 blocks (3D; `Mob.alone_ms`), so cave
+  zombies spawned by day near a passing player don't pile up and hold the cap.
 - Mobs may move into a free slot of a neighbor chunk.
 - Randomness: `hash(world.seed, chunk, tick)`. VRF only for world seed.
 
