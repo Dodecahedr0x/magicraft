@@ -33,7 +33,7 @@
 //!    Neighbor replay: candidates of the 8 neighbor chunks are first filtered by position
 //!    (canopy must reach this chunk: local column in `-2..=17` on both axes), then by biome
 //!    ([`biome_at`]) and roll; only then is the base height read from [`HeightWindow`]
-//!    (2-column strips / 2×2 corners via [`heights_cols`]). The slow
+//!    (2-column strips / 2×2 corners via [`window_heights`]). The slow
 //!    [`height_at`](crate::terrain::height_at) is never called.
 //! 4. **Cacti** ([`place_cacti`]) — chunk-local: [`CACTUS_CANDIDATES`] hashed columns, half
 //!    accepted, in Desert columns whose live surface block is Sand at `h > SEA_LEVEL`
@@ -45,30 +45,31 @@
 //!
 //! (Snowy sea ice is placed by stage 1; stage 2 has no ice step.)
 //!
-//! # Cost: hard bound (modeled SBF ops ≈ CU)
-//! A chunk whose `populate_chunk` exceeded the budget would be stuck at `gen_stage 1`
-//! forever, so every term is bounded by construction; [`STAGE2_OPS_BOUND`] sums them and
-//! is const-asserted ≤ 800k **modeled** ops: ix overhead 30k (assumed) + Stage1Info rebuild
-//! 73k + worm replay 57k + column ceilings 15k + neighbor heights 158k (4 strips × 25k + 4
-//! corners × 14.5k) + trees 69k + misc 4k + caves ≤ [`CAVE_OPS_CAP`] 380k = **786k**. The op
-//! constants are hand counts of the inner loops; the cave cap is a true hard limit on modeled
-//! ops, the other terms are worst-case loop counts.
+//! # Cost: hard bound (SBF-calibrated CU)
+//! A chunk whose `populate_chunk` exceeded the 1.4M budget would be stuck at `gen_stage 1`
+//! forever, so every term is bounded by construction (loop counts) and priced with
+//! SBF-measured unit costs ([`STAGE2_CU_BOUND`], const-asserted ≤ 950k; currently
+//! **≈ 889k**): ix overhead 15k + Stage1Info rebuild 40k + height window 118k (shared lattice
+//! sums 42k, 4 strips, 4 corners, column ceilings) + worm replay 127k (432 spheres) +
+//! carving ≤ 432 × 290 + 0.9 × [`CAVE_OPS_CAP`] = 467k + trees 116k + misc 6k. The cave cap
+//! itself is unchanged (380k **modeled** ops, see [`crate::caves`]); the calibration maps
+//! modeled ops to CU (≤ 0.9 CU per op + 290 per sphere, over 26 712 measured geometries).
 //!
-//! **SBF-measured (Task 17, `docs/notes/spikes.md`):** the model is far off for the height
-//! terms: one side strip ([`heights_cols`]) costs ≈ 125k CU (modeled 25k), a corner ≈ 100k;
-//! carving costs ≈ 0.88 CU per modeled cave op; Stage1Info rebuild 17-58k; trees without a
-//! corner 8-35k. Whole `populate_chunk`: 587k-802k over 50 chunks. Real worst case ≈ 100k +
-//! 4 × 125k + 4 × 110k + 0.9 × 380k + 34k ≈ **1.42M CU** (cap and 4 corners at once; never
-//! observed — over 10^6 chunks the same model gives p99.999 1.09M, max 1.13M).
+//! **SBF-measured (Task 17b, `bench/cu`, `docs/notes/spikes.md`):** `generate_stage2` median
+//! 175k, max 294k over 768 chunks (Task 17: 587k-802k for the whole ix); the whole
+//! `populate_chunk` ix ≈ 196-262k on the local ER. Window: [`WindowSums`] 38k, side strip
+//! 9.6k, corner 3k (Task 17: 125k / 100k per part); carving ≈ 0.75 CU per modeled op on
+//! real chunks.
 //!
 //! Measured: `scan_cave_tail` (10^6 chunks) — cave demand mean 55k, p99 163k, p99.999
 //! 288k, max 340k (cap never hit); side strips loaded avg 3.93 (max 4), corners avg 0.07
 //! (p99.999 3, max 4).
 //!
 //! # SBF stack (4 KB per frame)
-//! [`generate_stage2`] frame ≈ 0.5 KB ([`HeightWindow`] is 420 B); [`carve_caves`] ≈ 1.2 KB;
-//! the window loader ≈ 0.2 KB + [`heights_cols`] ≈ 0.4 KB + its lattice-sum frame ≈ 1.9 KB;
-//! [`place_trees`], [`place_ores`], [`place_cacti`], [`spawn_animals`] are
+//! [`generate_stage2`] frame ≈ 1.1 KB ([`HeightWindow`] ≈ 1 KB incl. its [`WindowSums`]);
+//! [`carve_caves`] ≈ 1.2 KB; the window loader ≈ 0.3 KB + [`window_heights`] < 0.5 KB +
+//! `lattice_sums` ≤ 2.6 KB (in [`WindowSums::new`]) or [`fbm_rect`](crate::noise::fbm_rect)
+//! ≈ 1.5 KB; [`place_trees`], [`place_ores`], [`place_cacti`], [`spawn_animals`] are
 //! `#[inline(never)]` with < 0.3 KB each. The caller provides the 16 KB block buffer, the
 //! [`Stage1Info`] (1.25 KB) and the mob output array.
 
@@ -77,7 +78,7 @@ use crate::caves::{carve_caves, CaveStats, CAVE_OPS_CAP, MAX_WORMS, SEGS};
 use crate::consts::{CHUNK_H, CHUNK_VOL, SEA_LEVEL};
 use crate::coords::block_index;
 use crate::hash::{rand_range, splitmix_next, Seed};
-use crate::terrain::{biome_at, heights_cols, Biome, Stage1Info, MAX_HEIGHT};
+use crate::terrain::{biome_at, window_heights, Biome, Stage1Info, WindowSums};
 
 pub const SALT_ORE: u32 = 0x04E5_0011;
 pub const SALT_TREE: u32 = 0x76EE_0012;
@@ -111,39 +112,55 @@ pub const MOB_SHEEP: u8 = 3;
 /// Spawn attempts per chunk are `0..=MAX_SPAWNS`.
 pub const MAX_SPAWNS: usize = 3;
 
-/// # Worst-case op bound (modeled SBF ops; see module docs, "Cost")
-/// Ix overhead (Anchor, account checks) — an assumption.
-pub const OPS_IX_OVERHEAD: u32 = 30_000;
-/// [`stage1_info_from_blocks`](crate::terrain::stage1_info_from_blocks): ≤ 57 probes × 5 ops
-/// per column.
-pub const OPS_STAGE1_INFO: u32 = 256 * MAX_HEIGHT as u32 * 5;
-/// Worm replay: 9 chunks × (≤ 2 worms × ≤ 24 segments × 125 ops (3 draws, step, walls,
-/// bbox clip + bound) + 300 ops of worm setup).
-pub const OPS_WORM_REPLAY: u32 = 9 * (MAX_WORMS as u32 * SEGS.1 as u32 * 125 + 300);
-/// Per-column carve ceilings: 256 × (4 window reads + mins).
-pub const OPS_COL_LIMITS: u32 = 256 * 60;
-/// [`heights_cols`] fixed part (3 `fbm_grid9` 2-octave ≈ 9.7k + 81 classifications ≈ 2k +
-/// box sums ≈ 1.4k) and per column (3-octave `fbm_2d` ≈ 315 + blend ≈ 60).
-pub const OPS_LATTICE: u32 = 13_000;
-pub const OPS_COLUMN: u32 = 375;
-/// 4 side strips (2×16) + 4 corners (2×2).
-pub const OPS_NEIGHBOR_HEIGHTS: u32 =
-    4 * (OPS_LATTICE + 32 * OPS_COLUMN) + 4 * (OPS_LATTICE + 4 * OPS_COLUMN);
-/// Trees: 54 candidate hashes × 40 + ≤ 48 neighbor `biome_at` × 650 + writes × 20 ops
-/// (6 own trees × ≤ 53 voxels; a neighbor tree reaches ≤ 2 columns in: ≤ 30 voxels).
-pub const OPS_TREES: u32 = 54 * 40 + 48 * 650 + (6 * 53 + 48 * 30) * 20;
-/// Ores, cacti, animals.
-pub const OPS_MISC: u32 = 4_000;
-/// Total modeled worst case of `populate_chunk` (caves capped at [`CAVE_OPS_CAP`]).
-pub const STAGE2_OPS_BOUND: u32 = OPS_IX_OVERHEAD
-    + OPS_STAGE1_INFO
-    + OPS_WORM_REPLAY
-    + OPS_COL_LIMITS
-    + OPS_NEIGHBOR_HEIGHTS
-    + OPS_TREES
-    + OPS_MISC
-    + CAVE_OPS_CAP;
-const _: () = assert!(STAGE2_OPS_BOUND <= 800_000);
+/// # Worst-case CU bound of `populate_chunk` (SBF-calibrated; see module docs, "Cost")
+///
+/// Every constant is an SBF-measured cost (`bench/cu`: litesvm, platform-tools v1.54, the
+/// workspace release profile; Task 17b, 2026-10-09) rounded up by ≥ 10%, times a loop count
+/// that is a hard limit by construction. Re-run `bench/cu/run.sh calibrate` after changing
+/// terrain, caves or populate code. [`STAGE2_CU_BOUND`] is const-asserted ≤ 950k (limit
+/// 1.4M).
+///
+/// Program part of `populate_chunk` outside core (Anchor dispatch, account checks, header
+/// and mob writes): measured ≈ 4.4k on the local ER.
+pub const CU_IX_OVERHEAD: u32 = 15_000;
+/// [`stage1_info_from_blocks`](crate::terrain::stage1_info_from_blocks): 256 binary
+/// searches of ≤ 6 probes; measured max 33.5k over 1 200 chunks.
+pub const CU_STAGE1_INFO: u32 = 40_000;
+/// Height window: [`HeightWindow::new`] (≈ 0.65k), `col_limits` (≈ 9.7k, data-independent),
+/// [`WindowSums::new`] (max 38.0k), 4 side strips (max 9.6k + ≈ 0.45k load glue each) and
+/// 4 corners (max 3.0k + glue each).
+pub const CU_WINDOW: u32 = 1_000 + 12_000 + 42_000 + 4 * (11_000 + 600) + 4 * (3_500 + 600);
+/// Worm replay of the 3×3 neighborhood: every sphere of every worm is generated, clipped and
+/// (if it touches the chunk) costed, carved or not. At most [`MAX_SPHERES`] spheres; fit over
+/// 1 728 chunks: CU ≤ 1.2k + 260 × spheres.
+pub const MAX_SPHERES: u32 = 9 * MAX_WORMS as u32 * SEGS.1 as u32;
+pub const CU_REPLAY_PER_SPHERE: u32 = 290;
+pub const CU_REPLAY_FIXED: u32 = 2_000;
+/// Carving one sphere costs ≤ `CU_CARVE_PER_SPHERE` + `CU_CARVE_PER_OP_PERMILLE`/1000 ×
+/// its modeled ops ([`BBox::ops_bound`](crate::caves::BBox::ops_bound)); measured over
+/// 26 712 sphere geometries (r 1-3, all chunk-edge clips, deep and above-sea ceilings, worst
+/// write path): with 0.9 CU/op the largest remainder is 255 CU (a 1-column-wide r = 3 slice).
+/// Carved spheres total ≤ [`CAVE_OPS_CAP`] modeled ops, so carving ≤ 432 × 290 + 0.9 × 380k.
+pub const CU_CARVE_PER_SPHERE: u32 = 290;
+pub const CU_CARVE_PER_OP_PERMILLE: u32 = 900;
+/// Trees: 54 candidates (hash + filters), ≤ 48 neighbor [`biome_at`] (measured 0.68k each)
+/// and the tree writes: 6 own trees (max 2.37k each), 24 side-neighbor trees (≤ 2 canopy
+/// columns inside, max 1.44k), 24 corner-neighbor trees (max 0.64k).
+pub const CU_TREES: u32 = 54 * 150 + 48 * 750 + 6 * 2_600 + 24 * 1_600 + 24 * 750;
+/// Ores (fixed loops, ≈ 3.4k), cacti, animals, glue.
+pub const CU_MISC: u32 = 6_000;
+/// Worst case of `populate_chunk` in SBF CU: cave cap fully used by [`MAX_SPHERES`] spheres
+/// **and** all 8 neighbor parts loaded **and** 54 trees.
+pub const STAGE2_CU_BOUND: u32 = CU_IX_OVERHEAD
+    + CU_STAGE1_INFO
+    + CU_WINDOW
+    + MAX_SPHERES * CU_REPLAY_PER_SPHERE
+    + CU_REPLAY_FIXED
+    + MAX_SPHERES * CU_CARVE_PER_SPHERE
+    + (CAVE_OPS_CAP as u64 * CU_CARVE_PER_OP_PERMILLE as u64 / 1000) as u32
+    + CU_TREES
+    + CU_MISC;
+const _: () = assert!(STAGE2_CU_BOUND <= 950_000);
 
 /// An animal spawned by populate. Chunk-local block coordinates: `x, z ∈ 0..16` is the
 /// column, `y` the block the feet occupy (first air above the grass).
@@ -161,8 +178,9 @@ const MARGIN: i32 = 2;
 
 /// Stage-1 surface heights of the chunk's columns plus a 2-column margin
 /// (local `-2..18` on both axes). Own columns come from [`Stage1Info`]; each of the 8
-/// neighbor parts (2×16 side strip or 2×2 corner) is computed on first access with one
-/// [`heights_cols`] (exact stage-1 heights, bit-equal to the neighbor's own stage 1).
+/// neighbor parts (2×16 side strip or 2×2 corner) is computed on first access with
+/// [`window_heights`] (exact stage-1 heights, bit-equal to the neighbor's own stage 1). The
+/// lattice box sums all parts share ([`WindowSums`]) are computed once, on the first load.
 pub struct HeightWindow {
     seed: Seed,
     cx: i32,
@@ -170,6 +188,7 @@ pub struct HeightWindow {
     h: [u8; WIN * WIN],
     /// Bit `(dz + 1) * 3 + (dx + 1)` set once neighbor `(dx, dz)` is loaded.
     loaded: u16,
+    sums: Option<WindowSums>,
 }
 
 impl HeightWindow {
@@ -180,10 +199,14 @@ impl HeightWindow {
             cz,
             h: [0; WIN * WIN],
             loaded: 1 << 4,
+            sums: None,
         };
-        for lz in 0..16 {
-            for lx in 0..16 {
-                w.h[Self::idx(lx, lz)] = own[lz as usize * 16 + lx as usize] as u8;
+        for (src, dst) in own
+            .chunks_exact(16)
+            .zip(w.h[MARGIN as usize * WIN..].chunks_exact_mut(WIN))
+        {
+            for (d, &s) in dst[MARGIN as usize..].iter_mut().zip(src) {
+                *d = s as u8;
             }
         }
         w
@@ -205,12 +228,33 @@ impl HeightWindow {
     pub fn get(&mut self, lx: i32, lz: i32) -> i32 {
         debug_assert!((-MARGIN..16 + MARGIN).contains(&lx) && (-MARGIN..16 + MARGIN).contains(&lz));
         let (dx, dz) = (lx.div_euclid(16), lz.div_euclid(16));
+        self.ensure(dx, dz);
+        self.h[Self::idx(lx, lz)] as i32
+    }
+
+    /// Loads neighbor `(dx, dz)` (`-1..=1` each) unless already loaded.
+    #[inline(always)]
+    fn ensure(&mut self, dx: i32, dz: i32) {
         let bit = 1u16 << ((dz + 1) * 3 + dx + 1);
         if self.loaded & bit == 0 {
             self.load(dx, dz);
             self.loaded |= bit;
         }
-        self.h[Self::idx(lx, lz)] as i32
+    }
+
+    /// Loads the 4 side strips (no-op for those already loaded).
+    pub fn load_sides(&mut self) {
+        for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            self.ensure(dx, dz);
+        }
+    }
+
+    /// Row `lz` (`-2..18`) of the window as columns `-2..18`. Only meaningful for loaded
+    /// parts (use [`Self::load_sides`] / [`Self::get`] first).
+    #[inline(always)]
+    pub fn row(&self, lz: i32) -> &[u8; WIN] {
+        let i = (lz + MARGIN) as usize * WIN;
+        self.h[i..i + WIN].try_into().unwrap()
     }
 
     /// Number of neighbor chunks whose heights were computed (bench / cost accounting).
@@ -219,25 +263,28 @@ impl HeightWindow {
     }
 
     /// Loads the window cells of neighbor `(dx, dz)`: a 2×16 / 16×2 strip for a side, a 2×2
-    /// block for a corner, via [`heights_cols`] (bit-exact with that chunk's stage 1).
+    /// block for a corner, via [`window_heights`] (bit-exact with that chunk's stage 1).
     #[inline(never)]
     fn load(&mut self, dx: i32, dz: i32) {
-        // Neighbor-local start and length per axis.
-        let span = |d: i32| -> (usize, usize) {
+        // Own-local start and length per axis.
+        let span = |d: i32| -> (i32, usize) {
             match d {
-                -1 => (16 - MARGIN as usize, MARGIN as usize),
+                -1 => (-MARGIN, MARGIN as usize),
                 0 => (0, 16),
-                _ => (0, MARGIN as usize),
+                _ => (16, MARGIN as usize),
             }
         };
         let ((x0, w), (z0, d)) = (span(dx), span(dz));
+        let (seed, cx, cz) = (self.seed, self.cx, self.cz);
+        let sums = self
+            .sums
+            .get_or_insert_with(|| WindowSums::new(&seed, cx, cz));
         let mut t = [0i32; 16 * MARGIN as usize];
-        let (ncx, ncz) = (self.cx.wrapping_add(dx), self.cz.wrapping_add(dz));
-        heights_cols(&self.seed, ncx, ncz, x0, z0, w, d, &mut t);
-        for j in 0..d {
-            for i in 0..w {
-                let (lx, lz) = ((x0 + i) as i32 + dx * 16, (z0 + j) as i32 + dz * 16);
-                self.h[Self::idx(lx, lz)] = t[j * w + i] as u8;
+        window_heights(&seed, sums, cx, cz, (x0, w), (z0, d), &mut t);
+        for (j, src) in t.chunks_exact(w).take(d).enumerate() {
+            let i = Self::idx(x0, z0 + j as i32);
+            for (dst, &v) in self.h[i..i + w].iter_mut().zip(src) {
+                *dst = v as u8;
             }
         }
     }
@@ -386,37 +433,63 @@ pub fn place_trees(
     }
 }
 
+/// SBF CU calibration hook (`bench/cu`; not part of the API): one [`place_trees`] tree write.
+#[doc(hidden)]
+#[inline(never)]
+pub fn bench_write_tree(
+    blocks: &mut [u8; CHUNK_VOL],
+    win: &HeightWindow,
+    lx: i32,
+    h: i32,
+    lz: i32,
+    t: i32,
+) {
+    write_tree(blocks, win, lx, h, lz, t);
+}
+
 /// Writes the local voxels of a tree based at local column `(lx, lz)` with surface `h`.
 #[inline(always)]
 fn write_tree(blocks: &mut [u8; CHUNK_VOL], win: &HeightWindow, lx: i32, h: i32, lz: i32, t: i32) {
     let top = h + t;
+    // Only canopy cells inside the chunk and below the world top are visited (`put` would
+    // skip the others; the result does not depend on write order, see module docs). Row
+    // `dz` of a layer with radius `r` spans `|dx| ≤ min(r, reach − |dz|)` (corners cut).
     for y in top - 1..=top + 1 {
+        if y >= CHUNK_H as i32 {
+            break;
+        }
         let r = if y == top + 1 { 1 } else { CANOPY_R };
-        for dz in -r..=r {
-            for dx in -r..=r {
-                if dx.abs() + dz.abs() > if r == 1 { 1 } else { 3 } {
-                    continue; // corners
-                }
-                if dx == 0 && dz == 0 && y <= top {
+        let reach = if r == 1 { 1 } else { 3 };
+        for z in (lz - r).max(0)..=(lz + r).min(15) {
+            let dz = (z - lz).abs();
+            let hw = (reach - dz).min(r);
+            let trunk = dz == 0 && y <= top;
+            for x in (lx - hw).max(0)..=(lx + hw).min(15) {
+                if trunk && x == lx {
                     continue; // trunk
                 }
-                put(blocks, win, lx + dx, y, lz + dz, Block::Leaves);
+                put_local(blocks, win, x as usize, y, z as usize, Block::Leaves);
             }
         }
     }
-    for y in h + 1..=top {
-        put(blocks, win, lx, y, lz, Block::Log);
+    if (0..16).contains(&lx) && (0..16).contains(&lz) {
+        for y in h + 1..=top.min(CHUNK_H as i32 - 1) {
+            put_local(blocks, win, lx as usize, y, lz as usize, Block::Log);
+        }
     }
 }
 
-/// Writes a tree/cactus voxel if it is local, below the world top, above its column's
-/// stage-1 surface, and the target allows it (Log over Air/Leaves; others over Air only).
+/// Writes a tree voxel (`x, z ∈ 0..16`, `y < CHUNK_H`) if it is above its column's stage-1
+/// surface and the target allows it (Log over Air/Leaves; Leaves over Air only).
 #[inline(always)]
-fn put(blocks: &mut [u8; CHUNK_VOL], win: &HeightWindow, x: i32, y: i32, z: i32, b: Block) {
-    if !(0..16).contains(&x) || !(0..16).contains(&z) || y >= CHUNK_H as i32 {
-        return;
-    }
-    let (x, z) = (x as usize, z as usize);
+fn put_local(
+    blocks: &mut [u8; CHUNK_VOL],
+    win: &HeightWindow,
+    x: usize,
+    y: i32,
+    z: usize,
+    b: Block,
+) {
     if y <= win.own(x, z) {
         return;
     }
@@ -839,7 +912,7 @@ mod tests {
             total += st.demand;
         }
         assert!(skipped > 0 && total > 0);
-        println!("bound {STAGE2_OPS_BOUND} (caves cap {CAVE_OPS_CAP})");
+        println!("bound {STAGE2_CU_BOUND} CU (caves cap {CAVE_OPS_CAP} modeled ops)");
     }
 
     #[test]
@@ -1093,7 +1166,7 @@ mod tests {
         let t = std::time::Instant::now();
         let mut h = [0i32; 32];
         for rep in 0..REPS {
-            heights_cols(&s, rep, 3, 14, 0, 2, 16, &mut h);
+            crate::terrain::heights_cols(&s, rep, 3, 14, 0, 2, 16, &mut h);
             acc += h[5] as u64;
         }
         let strip = t.elapsed() / REPS as u32;

@@ -39,7 +39,7 @@
 //! heights), loaded once the first sphere touches the chunk. So the rule is exact on both
 //! sides of every border.
 //!
-//! # Cost (modeled SBF ops ≈ CU) and the hard cap
+//! # Cost (modeled ops) and the hard cap
 //! Each sphere's work is bounded before carving by [`BBox::ops_bound`]: bbox rows ×
 //! [`OPS_ROW`] + bbox voxels × [`OPS_TEST`] + min(voxels, [`MAX_HITS`]`[r]`) × [`OPS_HIT`]
 //! (`MAX_HITS` = 8/40/136 is exact, asserted exhaustively). Spheres are replayed in a fixed
@@ -49,6 +49,11 @@
 //! Unconstrained, the worst case would be 9 chunks × 2 worms × 24 spheres of r=3 all inside
 //! one chunk ≈ 3M ops. Measured over 10^6 chunks (4 seeds × 500², `scan_cave_tail`):
 //! demand mean 55k, p99 163k, p99.999 288k, max 340k — the cap never triggered.
+//!
+//! The modeled weights define the cap (and so the output) and stay fixed; real SBF CU are
+//! calibrated against them (`bench/cu`, Task 17b): carving a sphere costs ≤ 290 CU + 0.9 CU
+//! per modeled op over 26 712 measured geometries (≈ 0.75 CU/op on real chunks), replaying
+//! one sphere ≤ 290 CU. See [`crate::populate::STAGE2_CU_BOUND`].
 //!
 //! # SBF stack
 //! [`carve_caves`] frame ≈ 1.2 KB (the two 512 B ceiling tables in an `Option`, a [`Worms`]
@@ -102,17 +107,26 @@ const SIN_Q: [i16; 65] = [
     255, 256, 256, 256,
 ];
 
+/// sin(k·2π/256)·256 for k in 0..256, unfolded from [`SIN_Q`] at compile time.
+const SIN_FULL: [i16; 256] = {
+    let mut t = [0i16; 256];
+    let mut a = 0;
+    while a < 256 {
+        t[a] = match a {
+            0..=64 => SIN_Q[a],
+            65..=128 => SIN_Q[128 - a],
+            129..=192 => -SIN_Q[a - 128],
+            _ => -SIN_Q[256 - a],
+        };
+        a += 1;
+    }
+    t
+};
+
 /// sin of a 256-step angle, ×256.
 #[inline(always)]
 fn sin256(a: i32) -> i64 {
-    let a = (a & 255) as usize;
-    let v = match a {
-        0..=64 => SIN_Q[a],
-        65..=128 => SIN_Q[128 - a],
-        129..=192 => -SIN_Q[a - 128],
-        _ => -SIN_Q[256 - a],
-    };
-    v as i64
+    SIN_FULL[(a & 255) as usize] as i64
 }
 
 #[inline(always)]
@@ -248,26 +262,35 @@ pub struct CaveStats {
 
 /// Per-column carve ceilings: `y` is carvable iff `y ≤ lo[c] || (SEA_LEVEL < y ≤ top[c])`
 /// (`1 ≤ y` is guaranteed by the bbox clip).
-struct Lim {
-    lo: [u8; 256],
-    top: [u8; 256],
+#[doc(hidden)]
+pub struct Lim {
+    pub lo: [u8; 256],
+    pub top: [u8; 256],
 }
 
-/// Ceilings for normal and entrance spheres (see module docs). Loads the 4 side strips.
+/// Ceilings for normal and entrance spheres (see module docs). Loads the 4 side strips,
+/// then reads the window rows directly (≈ 9.7k CU, data-independent).
 #[inline(never)]
 fn col_limits(win: &mut HeightWindow, biomes: &[Biome; 256], out: &mut [Lim; 2]) {
-    for (c, biome) in biomes.iter().enumerate() {
-        let (x, z) = ((c % 16) as i32, (c / 16) as i32);
-        let h = win.own(x as usize, z as usize);
-        let mut nmin = h;
-        for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
-            nmin = nmin.min(win.get(nx, nz));
-        }
-        let grassy = matches!(biome, Biome::Plains | Biome::Forest);
-        let top_e = if !grassy && h >= SEA_LEVEL { h } else { h - 1 };
-        for (l, top) in out.iter_mut().zip([h - 1, top_e]) {
-            l.top[c] = top as u8;
-            l.lo[c] = top.min(nmin) as u8;
+    win.load_sides();
+    for z in 0..16i32 {
+        // Window rows z-1, z, z+1 (columns -2..18; own column x is at index x + 2).
+        let (up, mid, down) = (win.row(z - 1), win.row(z), win.row(z + 1));
+        for x in 0..16usize {
+            let c = z as usize * 16 + x;
+            let h = mid[x + 2];
+            let nmin = h
+                .min(mid[x + 1])
+                .min(mid[x + 3])
+                .min(up[x + 2])
+                .min(down[x + 2]) as i32;
+            let h = h as i32;
+            let grassy = matches!(biomes[c], Biome::Plains | Biome::Forest);
+            let top_e = if !grassy && h >= SEA_LEVEL { h } else { h - 1 };
+            for (l, top) in out.iter_mut().zip([h - 1, top_e]) {
+                l.top[c] = top as u8;
+                l.lo[c] = top.min(nmin) as u8;
+            }
         }
     }
 }
@@ -336,6 +359,26 @@ pub fn carve_caves_capped(
     st
 }
 
+/// SBF CU calibration hook (`bench/cu`; not part of the API): the per-sphere work of
+/// [`carve_caves`] for one radius-`r` sphere with chunk-local fixed-point centre — clip,
+/// [`BBox::ops_bound`] and the carve under ceilings `lim` — returning the modeled ops (0 if
+/// the sphere misses the chunk).
+#[doc(hidden)]
+#[inline(never)]
+pub fn bench_carve_one(blocks: &mut [u8; CHUNK_VOL], lim: &Lim, c: (i64, i64, i64), r: i32) -> u32 {
+    let Some(bb) = clip_bbox(c.0, c.1, c.2, r) else {
+        return 0;
+    };
+    let ctx = Carve {
+        lx: c.0,
+        ly: c.1,
+        lz: c.2,
+        r2: (r as i64 * FPL).pow(2),
+    };
+    carve_sphere(blocks, lim, &ctx, &bb);
+    bb.ops_bound(r)
+}
+
 const EMPTY_LIM: Lim = Lim {
     lo: [0; 256],
     top: [0; 256],
@@ -400,28 +443,35 @@ struct Carve {
 
 #[inline(always)]
 fn carve_sphere(blocks: &mut [u8; CHUNK_VOL], lim: &Lim, k: &Carve, bb: &BBox) {
-    for y in bb.y0..=bb.y1 {
+    // Exclusive bounds; the clip guarantees `0 ≤ x, z ≤ 15` and `1 ≤ y ≤ 62`.
+    let (x0, x1) = (bb.x0, bb.x1 + 1);
+    let ddx0 = x0 * FPL + FPL / 2 - k.lx;
+    for y in bb.y0..bb.y1 + 1 {
         let ddy = y * FPL + FPL / 2 - k.ly;
         let ry = k.r2 - ddy * ddy;
         if ry < 0 {
             continue;
         }
-        for z in bb.z0..=bb.z1 {
+        let (yy, above_sea) = (y as u8, y > SEA_LEVEL as i64);
+        let layer = &mut blocks[(y as usize & 63) * 256..][..256];
+        for z in bb.z0..bb.z1 + 1 {
             let ddz = z * FPL + FPL / 2 - k.lz;
             let rz = ry - ddz * ddz;
             if rz < 0 {
                 continue;
             }
-            for x in bb.x0..=bb.x1 {
-                let ddx = x * FPL + FPL / 2 - k.lx;
-                if ddx * ddx > rz {
-                    continue;
+            let r0 = (z as usize & 15) * 16;
+            let (lo, top) = (&lim.lo[r0..r0 + 16], &lim.top[r0..r0 + 16]);
+            let cells = &mut layer[r0..r0 + 16];
+            let mut ddx = ddx0;
+            for x in x0..x1 {
+                if ddx * ddx <= rz {
+                    let c = x as usize & 15;
+                    if yy <= lo[c] || (above_sea && yy <= top[c]) {
+                        cells[c] = Block::Air as u8;
+                    }
                 }
-                let c = (z * 16 + x) as usize & 255;
-                let yy = y as u8;
-                if yy <= lim.lo[c] || (y > SEA_LEVEL as i64 && yy <= lim.top[c]) {
-                    blocks[(y as usize * 256 + c) & (CHUNK_VOL - 1)] = Block::Air as u8;
-                }
+                ddx += FPL;
             }
         }
     }

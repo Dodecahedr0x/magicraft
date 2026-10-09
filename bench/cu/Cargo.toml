@@ -1,0 +1,24 @@
+# SBF compute-unit bench for magicraft-core terrain generation (not part of the workspace,
+# no dependencies besides core). Build + run: `bench/cu/run.sh` (usage in that script).
+[package]
+name = "magicraft-cu-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+magicraft-core = { path = "../../crates/core" }
+
+# Same release settings as the workspace (root Cargo.toml).
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[profile.release.package.magicraft-core]
+overflow-checks = false
+
+[workspace]

@@ -112,11 +112,13 @@ Deterministic integer math on `hash(world.seed, …)`; independent of chunk crea
   canopies write only above stage-1 surfaces (logs over air/leaves, leaves over air → order-free).
 - **Stage 2 cost bound:** a chunk over budget would be stuck at `gen_stage 1`, so populate is
   bounded by construction: cave carving stops taking spheres at a modeled 380k ops (measured over
-  10^6 chunks: p99.999 288k, max 340k — never hit), and the const `STAGE2_OPS_BOUND` (≈ 786k
-  modeled ops incl. 30k ix overhead) is asserted ≤ 800k. Native timing: stage 2 ≈ 1.6× stage 1
-  on average. **SBF-measured (Task 17):** create + grow tx 604k-632k CU, populate 587k-802k
-  (dominated by the 4 neighbor height strips, ≈ 125k each); modeled max over 10^6 chunks 1.13M,
-  construction bound ≈ 1.42M (see `docs/notes/spikes.md`).
+  10^6 chunks: p99.999 288k, max 340k — never hit), and the const `STAGE2_CU_BOUND` (SBF-calibrated
+  CU: hard loop counts × measured unit costs + ≥ 10%, ≈ 889k incl. ix overhead) is asserted
+  ≤ 950k. **SBF-measured (Task 17b, `bench/cu`):** create + grow tx ≈ 186k-200k CU (stage 1
+  150k-175k), populate ≈ 196k-262k (stage 2 median 175k, max 294k over 768 chunks). Task 17's
+  numbers (grow 584k-604k, populate 587k-802k, construction bound ≈ 1.42M) were dominated by
+  signed `i64` divisions (a ~200 CU routine on SBF) and per-neighbor lattice grids (see
+  `docs/notes/spikes.md`).
 
 Generation is compute-heavy: anything computed per block costs ≥ ~7 CU per byte (measured:
 16 384 computed bytes ≈ 115k CU above baseline; bulk fills/copies are nearly free), so generation

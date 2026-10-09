@@ -1,0 +1,18 @@
+# Host runner for the SBF CU bench (litesvm). Not part of the workspace; see ../run.sh.
+[package]
+name = "magicraft-cu-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+litesvm = { version = "0.17", features = ["register-tracing"] }
+solana-compute-budget = "4"
+solana-keypair = "3"
+solana-signer = "3"
+solana-instruction = "3"
+solana-transaction = "4"
+solana-message = "4"
+solana-pubkey = "4"
+
+[workspace]

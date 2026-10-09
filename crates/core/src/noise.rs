@@ -8,14 +8,23 @@
 //! Wrap seam: world coordinates are plain `i32`; noise is discontinuous where `x` or `z`
 //! wraps from `i32::MAX` to `i32::MIN` (never panics; unreachable for a bounded world).
 //!
-//! For terrain, prefer [`fbm_chunk`]: it hashes each lattice corner once per chunk and
-//! precomputes per-axis smoothstep weights, then does only three lerps per column per octave.
+//! For terrain, prefer [`fbm_rect`] / [`fbm_chunk`]: each lattice corner is hashed once per
+//! grid, each corner row is interpolated along x once per column, and each sample then
+//! does a single z lerp per octave.
 //!
 //! Output range is `0..=NOISE_MAX` (lattice values are `0..=1023`, a subset).
 //!
-//! Cost per `value_noise_2d`: 4 × `Seed::h2d` (~15 ops), 2 smoothsteps (~6), 3 lerps (~4)
-//! and index/fraction (~8) ≈ 90 SBF ops. `fbm_2d` with `o` octaves ≈ `o × 90 + 10` (one
-//! division by the amplitude sum at the end; a single `div` is 1 CU on SBF).
+//! # Cost (SBF-measured, `bench/cu`)
+//! `value_noise_2d` ≈ 110 CU, `fbm_2d` with 2 octaves ≈ 225 CU. [`fbm_rect`]: ≈ 14 CU per
+//! sample per octave in the inner loop, ≈ 6.2k CU per 16×16 octave pass including the
+//! per-octave setup (axis weights, corner hashes, row lerps).
+//!
+//! **SBF pitfalls** (all measured): signed `i64` division (`/`, `div_euclid`) by anything,
+//! even a constant, is a ~200 CU software routine (`__divdi3`), while unsigned division is
+//! one instruction — every division here is unsigned on provably non-negative values.
+//! Checked `i64` multiplication is also a software routine, hence the crate's release
+//! `overflow-checks = false`. Mixing `i32` and `i64` costs a shift pair per sign extension;
+//! the grid loops work in `i64` on non-negative values loaded zero-extended.
 
 use crate::hash::Seed;
 
@@ -108,101 +117,118 @@ pub fn fbm_2d(seed: &Seed, x: i32, z: i32, octaves: u32, base_cell_log2: u32, sa
         let s = salt.wrapping_add(i.wrapping_mul(0x9E37_79B9));
         sum += (value_noise_2d(seed, x, z, k, s) as i64) << (octaves - 1 - i);
     }
-    (sum / ((1i64 << octaves) - 1)) as i32
+    // `sum ≥ 0`: unsigned division is a single SBF instruction (signed `i64` division is a
+    // ~200 CU software routine).
+    (sum as u64 / ((1u64 << octaves) - 1)) as i32
 }
 
+/// Largest side of an [`fbm_rect`] grid.
+pub const MAX_SIDE: usize = 16;
 /// Number of lattice corners a 16-wide axis can touch (16 cells + the `+1` corner).
-const MAX_CORNERS: usize = 17;
+const MAX_CORNERS: usize = MAX_SIDE + 1;
 
-/// Per-axis precompute for one octave: lattice-row offset of each sample and its weight.
+/// Per-axis precompute for one octave over `n ≤ 16` samples starting at `o`: the first
+/// lattice index, each sample's lattice offset and smoothstep weight, and the number of
+/// lattice corners spanned.
 #[inline(always)]
-fn axis<const N: usize>(o: i32, k: u32) -> (i32, [u8; N], [i64; N], usize) {
+fn axis(o: i32, n: usize, k: u32) -> (i32, [u8; MAX_SIDE], [i64; MAX_SIDE], usize) {
     let mask = (1u32 << k) - 1;
     let i0 = o >> k;
-    let mut idx = [0u8; N];
-    let mut w = [0i64; N];
-    for l in 0..N {
+    let mut idx = [0u8; MAX_SIDE];
+    let mut w = [0i64; MAX_SIDE];
+    for (l, (i, w)) in idx.iter_mut().zip(w.iter_mut()).take(n).enumerate() {
         let x = o + l as i32;
-        idx[l] = ((x >> k) - i0) as u8;
-        w[l] = smooth(frac(x as u32 & mask, k));
+        *i = ((x >> k) - i0) as u8;
+        *w = smooth(frac(x as u32 & mask, k));
     }
     // Corners spanned: last cell offset + 1 (for the `+1` corner) + 1.
-    (i0, idx, w, idx[N - 1] as usize + 2)
+    (i0, idx, w, idx[n - 1] as usize + 2)
 }
 
-/// Shared body of [`fbm_chunk`] / [`fbm_grid9`]: `out[lz * N + lx] = fbm_2d(ox + lx, oz + lz)`.
+/// [`fbm_2d`] over a `w × d` grid (`1 ≤ w, d ≤ 16`): `out[lz * w + lx] = fbm_2d(seed,
+/// ox + lx, oz + lz, ...)` **exactly** (bit for bit). `out.len() ≥ w · d` (panics otherwise).
 ///
-/// Stack: corner table 17×17×4 = 1156 B + two axis tables 2×(N + 8N) B ≈ 1.5 KB at N = 16.
-#[inline(always)]
-fn fbm_grid<const N: usize>(
+/// Per octave: each lattice corner touched is hashed once, then each corner row is
+/// interpolated along `x` once per sample column (`rows[cz][lx]` = the inner `x` lerp of
+/// [`value_noise_2d`], which does not depend on `lz`), and each sample does a single `z` lerp
+/// and accumulate. All lerps run in `i64` on non-negative values (no SBF sign-extension
+/// pairs), and the final division by the weight total is unsigned (one SBF instruction;
+/// signed `i64` division is a ~200 CU software routine).
+///
+/// SBF-measured (`bench/cu`): ≈ 4.6k CU per 256-sample octave pass (was ≈ 15k + 51k of
+/// signed divisions per call). Frame ≈ 1.5 KB (row table 17 × 16 × 4 B + axis tables).
+///
+/// If the grid would wrap past `i32::MAX` (not a chunk origin) it falls back to per-sample
+/// [`fbm_2d`].
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn fbm_rect(
     seed: &Seed,
     ox: i32,
     oz: i32,
+    w: usize,
+    d: usize,
     octaves: u32,
     base_cell_log2: u32,
     salt: u32,
     out: &mut [i32],
 ) {
-    const { assert!(N >= 1 && N < MAX_CORNERS) };
-    let out = &mut out[..N * N];
-    let last = N as i32 - 1;
-    if ox > i32::MAX - last || oz > i32::MAX - last {
-        for lz in 0..N {
-            for lx in 0..N {
-                out[lz * N + lx] = fbm_2d(
-                    seed,
-                    ox.wrapping_add(lx as i32),
-                    oz.wrapping_add(lz as i32),
-                    octaves,
-                    base_cell_log2,
-                    salt,
-                );
+    assert!((1..=MAX_SIDE).contains(&w) && (1..=MAX_SIDE).contains(&d));
+    let out = &mut out[..w * d];
+    if ox > i32::MAX - (w as i32 - 1) || oz > i32::MAX - (d as i32 - 1) {
+        for (lz, row) in out.chunks_exact_mut(w).enumerate() {
+            for (lx, o) in row.iter_mut().enumerate() {
+                let (x, z) = (ox.wrapping_add(lx as i32), oz.wrapping_add(lz as i32));
+                *o = fbm_2d(seed, x, z, octaves, base_cell_log2, salt);
             }
         }
         return;
     }
     let octaves = octaves.clamp(1, 16);
     out.fill(0);
-    let mut corners = [[0i32; MAX_CORNERS]; MAX_CORNERS]; // [z][x]
+    // rows[cz][lx]: corner row `cz` interpolated along x at sample column `lx` (0..=1023).
+    let mut rows = [[0u32; MAX_SIDE]; MAX_CORNERS];
     for i in 0..octaves {
         let k = base_cell_log2.saturating_sub(i).min(MAX_CELL_LOG2);
         let s = salt.wrapping_add(i.wrapping_mul(0x9E37_79B9));
-        let (ix0, xi, xw, nx) = axis::<N>(ox, k);
-        let (iz0, zi, zw, nz) = axis::<N>(oz, k);
-        for (cz, row) in corners.iter_mut().enumerate().take(nz) {
+        let (ix0, xi, xw, nx) = axis(ox, w, k);
+        let (iz0, zi, zw, nz) = axis(oz, d, k);
+        let mut corner = [0i64; MAX_CORNERS];
+        for (cz, row) in rows.iter_mut().enumerate().take(nz) {
             let iz = iz0.wrapping_add(cz as i32);
-            for (cx, c) in row.iter_mut().enumerate().take(nx) {
-                *c = lattice(seed, ix0.wrapping_add(cx as i32), iz, s);
+            for (cx, c) in corner.iter_mut().enumerate().take(nx) {
+                *c = lattice(seed, ix0.wrapping_add(cx as i32), iz, s) as i64;
+            }
+            for ((r, &a), &sx) in row.iter_mut().zip(&xi).zip(&xw).take(w) {
+                let a = a as usize;
+                *r = lerp64(corner[a], corner[a + 1], sx) as u32;
             }
         }
         let shift = octaves - 1 - i;
-        for lz in 0..N {
-            let (r0, r1) = (&corners[zi[lz] as usize], &corners[zi[lz] as usize + 1]);
-            let sz = zw[lz];
-            for lx in 0..N {
-                let (a, sx) = (xi[lx] as usize, xw[lx]);
-                let v = lerp(lerp(r0[a], r0[a + 1], sx), lerp(r1[a], r1[a + 1], sx), sz);
-                out[lz * N + lx] += v << shift;
+        for ((orow, &zr), &sz) in out.chunks_exact_mut(w).zip(&zi).zip(&zw) {
+            let zr = zr as usize;
+            let (r0, r1) = (&rows[zr][..w], &rows[zr + 1][..w]);
+            for ((o, &a), &b) in orow.iter_mut().zip(r0).zip(r1) {
+                let v = lerp64(a as i64, b as i64, sz);
+                *o = o.wrapping_add((v << shift) as i32);
             }
         }
     }
-    let total = (1i32 << octaves) - 1;
+    let total = (1u32 << octaves) - 1;
     for v in out.iter_mut() {
-        *v /= total;
+        *v = (*v as u32 / total) as i32;
     }
 }
 
+/// [`lerp`] in `i64`: `a + (b − a)·s >> FRAC_BITS` (equal to `lerp` for `i32` inputs).
+#[inline(always)]
+fn lerp64(a: i64, b: i64, s: i64) -> i64 {
+    a + (((b - a) * s) >> FRAC_BITS)
+}
+
 /// [`fbm_2d`] for a whole 16×16 chunk column grid: `out[lz * 16 + lx] =
-/// fbm_2d(seed, ox + lx, oz + lz, ...)` exactly.
-///
-/// `(ox, oz)` is the chunk's world origin. Per octave it hashes each lattice corner touched
-/// once (≤ 9 for cells ≥ 16, ≤ 289 for cell 1) and precomputes the 16 smoothstep weights
-/// per axis, so each column costs only 3 lerps + accumulate (~20 ops) per octave instead of
-/// ~90. No heap; SBF frame ≈ 1.5 KB (corner table 1156 B + axis tables).
-///
-/// If `ox` or `oz` exceeds `i32::MAX - 15` (not a chunk origin; the column range would
-/// wrap) it falls back to per-column [`fbm_2d`].
-#[inline(never)]
+/// fbm_2d(seed, ox + lx, oz + lz, ...)` exactly. See [`fbm_rect`].
+#[inline(always)]
 pub fn fbm_chunk(
     seed: &Seed,
     ox: i32,
@@ -212,12 +238,12 @@ pub fn fbm_chunk(
     salt: u32,
     out: &mut [i32; 256],
 ) {
-    fbm_grid::<16>(seed, ox, oz, octaves, base_cell_log2, salt, out);
+    fbm_rect(seed, ox, oz, 16, 16, octaves, base_cell_log2, salt, out);
 }
 
 /// [`fbm_chunk`] for a 9×9 grid: `out[j * 9 + i] = fbm_2d(seed, ox + i, oz + j, ...)` exactly.
-/// Used for the terrain biome lattice. SBF frame ≈ 1.3 KB.
-#[inline(never)]
+/// Used for the terrain biome lattice. See [`fbm_rect`].
+#[inline(always)]
 pub fn fbm_grid9(
     seed: &Seed,
     ox: i32,
@@ -227,7 +253,7 @@ pub fn fbm_grid9(
     salt: u32,
     out: &mut [i32; 81],
 ) {
-    fbm_grid::<9>(seed, ox, oz, octaves, base_cell_log2, salt, out);
+    fbm_rect(seed, ox, oz, 9, 9, octaves, base_cell_log2, salt, out);
 }
 
 #[cfg(test)]
@@ -407,6 +433,38 @@ mod tests {
                     for i in 0..9 {
                         let (x, z) = (ox.wrapping_add(i), oz.wrapping_add(j));
                         assert_eq!(out[(j * 9 + i) as usize], fbm_2d(&s, x, z, oct, k, 9));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fbm_rect_matches_fbm_2d() {
+        let s = seed(15);
+        let mut out = [0i32; 256];
+        for &(ox, oz) in &[(0, 0), (-3, 7), (-402, 158), (1000, -77), (i32::MAX - 5, 3)] {
+            for &(w, d) in &[
+                (1, 1),
+                (2, 16),
+                (16, 2),
+                (2, 2),
+                (6, 9),
+                (11, 11),
+                (16, 16),
+                (5, 13),
+            ] {
+                for (oct, k) in [(2u32, 4u32), (3, 5), (2, 6), (3, 2), (1, 0), (4, 31)] {
+                    fbm_rect(&s, ox, oz, w, d, oct, k, 3, &mut out);
+                    for j in 0..d {
+                        for i in 0..w {
+                            let (x, z) = (ox.wrapping_add(i as i32), oz.wrapping_add(j as i32));
+                            assert_eq!(
+                                out[j * w + i],
+                                fbm_2d(&s, x, z, oct, k, 3),
+                                "{ox},{oz} {w}x{d} oct {oct} k {k} at {i},{j}"
+                            );
+                        }
                     }
                 }
             }
