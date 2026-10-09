@@ -32,6 +32,12 @@ rpc() { # url method [params-json]
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":${3:-[]}}" "$1"
 }
 
+slot_at_least() { # url slot
+  local s
+  s="$(rpc "$1" getSlot | grep -o '"result":[0-9]*' | cut -d: -f2)"
+  [[ -n "$s" && "$s" -ge "$2" ]]
+}
+
 account_exists() { # url pubkey
   rpc "$1" getAccountInfo "[\"$2\",{\"encoding\":\"base64\"}]" | grep -q '"owner"'
 }
@@ -80,6 +86,10 @@ up() {
     --upgradeable-program "$PROGRAM_ID" "$PROGRAM_SO" "$(solana-keygen pubkey "$WALLET")"
   # getHealth can answer before genesis programs are queryable; wait for ours too.
   wait_ready base "$BASE_RPC" account_exists "$BASE_RPC" "$PROGRAM_ID"
+  # Starting the ER in the first base slots fails its fee-vault setup tx with
+  # "Unsupported program id" ("Magic fee vault setup failed"; deterministic on a loaded
+  # machine), so give the base a few slots first.
+  wait_ready base "$BASE_RPC (slot >= 20)" slot_at_least "$BASE_RPC" 20
 
   RUST_LOG="${RUST_LOG:-info}" start er ephemeral-validator --no-tui --lifecycle ephemeral --reset \
     --storage "$DIR/er-storage" --listen "127.0.0.1:$ER_PORT" \
