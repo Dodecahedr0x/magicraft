@@ -90,25 +90,65 @@ impl TryFrom<u8> for Block {
     }
 }
 
-/// Water source or flowing water.
+/// Water source or flowing water (`WaterSource..=Water7`).
 #[inline]
-pub fn is_fluid(b: Block) -> bool {
-    (b as u8) >= Block::WaterSource as u8
+pub const fn is_fluid(b: Block) -> bool {
+    matches!(b as u8, x if x >= Block::WaterSource as u8 && x <= Block::Water7 as u8)
 }
 
 /// Blocks entities collide with. Air, water and torches are passable.
 #[inline]
-pub fn is_solid(b: Block) -> bool {
-    !(b == Block::Air || b == Block::Torch || is_fluid(b))
+pub const fn is_solid(b: Block) -> bool {
+    !(matches!(b, Block::Air | Block::Torch) || is_fluid(b))
 }
 
 /// Blocks that don't fully occlude neighbours (rendering / light).
 #[inline]
-pub fn is_transparent(b: Block) -> bool {
+pub const fn is_transparent(b: Block) -> bool {
     matches!(
         b,
         Block::Air | Block::Leaves | Block::Glass | Block::Torch | Block::Ice
     ) || is_fluid(b)
+}
+
+/// Property bit: entities collide with the block.
+pub const SOLID: u8 = 1;
+/// Property bit: block does not occlude neighbours.
+pub const TRANSPARENT: u8 = 2;
+/// Property bit: block is water.
+pub const FLUID: u8 = 4;
+
+/// Property flags for every byte value, for hot loops over raw chunk bytes.
+/// Bytes outside the palette are treated as solid, opaque and not fluid (fail closed).
+pub const BLOCK_FLAGS: [u8; 256] = {
+    let mut t = [SOLID; 256];
+    let mut i = 0;
+    while i < Block::ALL.len() {
+        let b = Block::ALL[i];
+        t[i] = (if is_solid(b) { SOLID } else { 0 })
+            | (if is_transparent(b) { TRANSPARENT } else { 0 })
+            | (if is_fluid(b) { FLUID } else { 0 });
+        i += 1;
+    }
+    t
+};
+
+/// [`is_solid`] on a raw byte; out-of-palette bytes are solid.
+#[inline]
+pub fn is_solid_u8(b: u8) -> bool {
+    BLOCK_FLAGS[b as usize] & SOLID != 0
+}
+
+/// [`is_transparent`] on a raw byte; out-of-palette bytes are opaque.
+#[inline]
+pub fn is_transparent_u8(b: u8) -> bool {
+    BLOCK_FLAGS[b as usize] & TRANSPARENT != 0
+}
+
+/// [`is_fluid`] on a raw byte; out-of-palette bytes are not fluid.
+#[inline]
+pub fn is_fluid_u8(b: u8) -> bool {
+    BLOCK_FLAGS[b as usize] & FLUID != 0
 }
 
 /// Water level: source = 0, flowing level n = n (1..=7); `None` for non-water.
@@ -121,11 +161,12 @@ pub fn water_level(b: Block) -> Option<u8> {
     }
 }
 
-/// Water block for a level (0 = source, 1..=7 flowing). Panics if `level > 7`.
+/// Water block for a level (0 = source, 1..=7 flowing). Callers must pass `level <= 7`
+/// (debug-asserted); in release the level is masked with `& 7`, so it never panics.
 #[inline]
 pub fn water_block(level: u8) -> Block {
-    assert!(level <= 7, "water level out of range");
-    Block::ALL[(Block::WaterSource as u8 + level) as usize]
+    debug_assert!(level <= 7, "water level out of range");
+    Block::ALL[(Block::WaterSource as u8 + (level & 7)) as usize]
 }
 
 /// Bare-hand break time in milliseconds.
@@ -205,7 +246,7 @@ pub fn preferred_tool(b: Block) -> Option<ToolKind> {
 
 /// Item dropped when `b` is broken (assuming [`can_harvest`] holds; the caller checks it).
 /// Leaves, glass, ice, bedrock, air and water drop nothing.
-pub fn drop(b: Block) -> Option<(Item, u8)> {
+pub fn drop_item(b: Block) -> Option<(Item, u8)> {
     match b {
         Block::Stone => Some((Item::Cobblestone, 1)),
         Block::Grass => Some((Item::Dirt, 1)),
@@ -372,13 +413,31 @@ mod tests {
     }
 
     #[test]
+    fn flag_table_matches_enum_for_all_bytes() {
+        for v in 0..=255u8 {
+            match Block::from_u8(v) {
+                Some(b) => {
+                    assert_eq!(is_solid_u8(v), is_solid(b), "{b:?}");
+                    assert_eq!(is_transparent_u8(v), is_transparent(b), "{b:?}");
+                    assert_eq!(is_fluid_u8(v), is_fluid(b), "{b:?}");
+                }
+                None => {
+                    assert!(is_solid_u8(v));
+                    assert!(!is_transparent_u8(v));
+                    assert!(!is_fluid_u8(v));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn drops() {
-        assert_eq!(drop(Block::Stone), Some((Item::Cobblestone, 1)));
-        assert_eq!(drop(Block::Grass), Some((Item::Dirt, 1)));
-        assert_eq!(drop(Block::CoalOre), Some((Item::Coal, 1)));
-        assert_eq!(drop(Block::DiamondOre), Some((Item::Diamond, 1)));
-        assert_eq!(drop(Block::IronOre), Some((Item::IronOre, 1)));
-        assert_eq!(drop(Block::Log), Some((Item::Log, 1)));
+        assert_eq!(drop_item(Block::Stone), Some((Item::Cobblestone, 1)));
+        assert_eq!(drop_item(Block::Grass), Some((Item::Dirt, 1)));
+        assert_eq!(drop_item(Block::CoalOre), Some((Item::Coal, 1)));
+        assert_eq!(drop_item(Block::DiamondOre), Some((Item::Diamond, 1)));
+        assert_eq!(drop_item(Block::IronOre), Some((Item::IronOre, 1)));
+        assert_eq!(drop_item(Block::Log), Some((Item::Log, 1)));
         for b in [
             Block::Leaves,
             Block::Glass,
@@ -387,7 +446,7 @@ mod tests {
             Block::WaterSource,
             Block::Bedrock,
         ] {
-            assert_eq!(drop(b), None, "{b:?}");
+            assert_eq!(drop_item(b), None, "{b:?}");
         }
     }
 

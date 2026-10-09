@@ -21,6 +21,7 @@ pub fn world_to_chunk(x: i32) -> (i32, usize) {
 }
 
 /// World block coordinate of local coordinate 0 in chunk `cx`.
+/// Valid for `|cx| <= i32::MAX / 16` (overflows otherwise; overflow checks are on in release).
 #[inline]
 pub fn chunk_origin(cx: i32) -> i32 {
     cx * CHUNK_W as i32

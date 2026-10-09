@@ -38,13 +38,6 @@ macro_rules! items {
             /// Every item.
             pub const ALL: &'static [Item] = &[$(Item::$name,)*];
 
-            /// Decodes a stored id; `None` for unknown ids.
-            pub fn from_u16(v: u16) -> Option<Item> {
-                match v {
-                    $(x if x == $v => Some(Item::$name),)*
-                    _ => None,
-                }
-            }
         }
     };
 }
@@ -107,7 +100,78 @@ items! {
     RottenFlesh = 1026,
 }
 
+/// Block items by id 1..=22 (`None` for bedrock, id 8).
+const BLOCK_ITEMS: [Option<Item>; 22] = [
+    Some(Item::Grass),
+    Some(Item::Dirt),
+    Some(Item::Stone),
+    Some(Item::Cobblestone),
+    Some(Item::Sand),
+    Some(Item::Sandstone),
+    Some(Item::Gravel),
+    None,
+    Some(Item::Log),
+    Some(Item::Leaves),
+    Some(Item::Planks),
+    Some(Item::CoalOre),
+    Some(Item::IronOre),
+    Some(Item::DiamondOre),
+    Some(Item::CraftingTable),
+    Some(Item::Furnace),
+    Some(Item::Torch),
+    Some(Item::Glass),
+    Some(Item::IronBlock),
+    Some(Item::Snow),
+    Some(Item::Ice),
+    Some(Item::Cactus),
+];
+/// Tools, ids 256..=271.
+const TOOL_ITEMS: [Item; 16] = [
+    Item::WoodPickaxe,
+    Item::StonePickaxe,
+    Item::IronPickaxe,
+    Item::DiamondPickaxe,
+    Item::WoodAxe,
+    Item::StoneAxe,
+    Item::IronAxe,
+    Item::DiamondAxe,
+    Item::WoodShovel,
+    Item::StoneShovel,
+    Item::IronShovel,
+    Item::DiamondShovel,
+    Item::WoodSword,
+    Item::StoneSword,
+    Item::IronSword,
+    Item::DiamondSword,
+];
+/// Materials, ids 512..=515.
+const MATERIAL_ITEMS: [Item; 4] = [Item::Stick, Item::Coal, Item::IronIngot, Item::Diamond];
+/// Foods, ids 768..=773.
+const FOOD_ITEMS: [Item; 6] = [
+    Item::RawPork,
+    Item::CookedPork,
+    Item::RawBeef,
+    Item::CookedBeef,
+    Item::RawMutton,
+    Item::CookedMutton,
+];
+/// Mob drops, ids 1024..=1026.
+const DROP_ITEMS: [Item; 3] = [Item::Leather, Item::Wool, Item::RottenFlesh];
+
 impl Item {
+    /// Decodes a stored id; `None` for unknown ids. One range check plus a table lookup.
+    pub fn from_u16(v: u16) -> Option<Item> {
+        let v = v as usize;
+        match v {
+            1..=22 => BLOCK_ITEMS[v - 1],
+            256..=271 => Some(TOOL_ITEMS[v - 256]),
+            512..=515 => Some(MATERIAL_ITEMS[v - 512]),
+            768..=773 => Some(FOOD_ITEMS[v - 768]),
+            1024..=1026 => Some(DROP_ITEMS[v - 1024]),
+            _ => None,
+        }
+    }
+
     /// Item for a placeable block; `None` for air, water and bedrock.
     pub fn from_block(b: Block) -> Option<Item> {
         Item::from_u16(b as u8 as u16)
