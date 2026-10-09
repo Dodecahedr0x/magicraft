@@ -6,11 +6,13 @@ pub mod consts;
 pub mod coords;
 pub mod fluid;
 pub mod hash;
+pub mod inventory;
 pub mod items;
 pub mod mobs;
 pub mod noise;
 pub mod physics;
 pub mod populate;
+pub mod recipes;
 pub mod terrain;
 
 /// Version of the core game rules.
