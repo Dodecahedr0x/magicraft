@@ -884,6 +884,136 @@ fieldset.plain {
   color: var(--text);
 }
 
+.game-overlay[hidden],
+.chunk-halt[hidden] {
+  display: none;
+}
+
+/* ------------------------------------------------------------ world view */
+
+.game-bar {
+  position: absolute;
+  top: 0.75rem;
+  left: 0.75rem;
+  right: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  pointer-events: none;
+}
+.game-bar > * {
+  pointer-events: auto;
+}
+.game-name {
+  font-family: var(--display);
+  font-size: 1.1rem;
+  color: #fff;
+  text-shadow: 0 1px 2px rgb(0 0 0 / 0.6);
+}
+.game-pos {
+  font-variant-numeric: tabular-nums;
+  color: rgb(255 255 255 / 0.85);
+  text-shadow: 0 1px 2px rgb(0 0 0 / 0.6);
+  margin-right: auto;
+}
+.world-ui {
+  position: absolute;
+  inset: auto 0.75rem 0.75rem 0.75rem;
+  display: grid;
+  grid-template-columns: minmax(0, 20rem) 1fr minmax(0, 22rem);
+  align-items: end;
+  gap: 0.75rem;
+  pointer-events: none;
+}
+.world-ui > * {
+  pointer-events: auto;
+}
+.chunk-panel {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.75rem 0.85rem;
+  border-radius: var(--radius-lg);
+  background: rgb(19 17 15 / 0.82);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(6px);
+  font-size: 0.875rem;
+}
+.chunk-panel p {
+  margin: 0;
+}
+.chunk-panel .check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.chunk-panel .check input {
+  inline-size: 1rem;
+  block-size: 1rem;
+  accent-color: var(--grass);
+}
+.chunk-status {
+  color: var(--text);
+}
+.chunk-totals {
+  color: var(--gold);
+  font-variant-numeric: tabular-nums;
+}
+.chunk-totals:empty {
+  display: none;
+}
+.chunk-halt {
+  display: grid;
+  gap: 0.4rem;
+}
+.fly-help {
+  justify-self: center;
+  margin: 0;
+  padding: 0.3rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  color: rgb(255 255 255 / 0.9);
+  background: rgb(0 0 0 / 0.35);
+}
+.toasts {
+  display: grid;
+  gap: 0.4rem;
+  justify-items: end;
+}
+.toast {
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius);
+  background: rgb(19 17 15 / 0.88);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--grass);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  animation: toast-in 180ms var(--ease-out);
+  transition: opacity 300ms, transform 300ms;
+}
+.toast.warn {
+  border-left-color: var(--gold);
+}
+.toast.out {
+  opacity: 0;
+  transform: translateY(4px);
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+@media (max-width: 860px) {
+  .world-ui {
+    grid-template-columns: 1fr;
+  }
+  .fly-help {
+    display: none;
+  }
+}
+
 /* ------------------------------------------------------------ responsive / motion */
 
 @media (max-width: 860px) {

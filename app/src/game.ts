@@ -1,10 +1,12 @@
-// Game entry (placeholder until Tasks 24–27: chunk store + renderer, player controller,
-// gameplay UI). Receives the joined world, keeps the PlayerState subscription in app state
-// and shows an "entering world" overlay on a canvas.
+// Game entry: receives the joined world, keeps the PlayerState subscription in app state,
+// and runs the world view (chunk store + renderer + auto-create, world/world.ts) on the
+// game canvas. The "entering world" overlay stays until the first chunk mesh is on screen.
+// (Player controller and gameplay UI: Tasks 25–27.)
 import type { PublicKey } from "@solana/web3.js";
 import { decodePlayerState, FP, pstatePda, type PlayerStateAccount, type WorldAccount } from "./chain";
 import type { App } from "./state";
 import { clear, focusHeading, h } from "./ui/dom";
+import { startWorld } from "./world/world";
 
 export type GameHandle = { stop(): void };
 
@@ -20,10 +22,13 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
   overlay.querySelector("h1")!.id = "game-title";
   focusHeading(root);
 
+  const bar = h("div", { class: "game-bar" }, h("strong", { class: "game-name" }, account.name), h("span", { class: "game-pos muted" }));
   const show = (s: PlayerStateAccount) => {
     app.set({ playerState: s });
+    view.onPlayerState(s);
     const [x, y, z] = s.move.pos.map((v) => (v / FP).toFixed(1));
     info.textContent = `Health ${s.health}/20 · Food ${s.food}/20 · at ${x}, ${y}, ${z}`;
+    bar.querySelector(".game-pos")!.textContent = `Player at ${x}, ${y}, ${z}`;
   };
   const apply = (data: Uint8Array) => {
     try {
@@ -32,30 +37,17 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
       /* not created yet */
     }
   };
+  const view = startWorld(app, canvas, world, account, () => {
+    overlay.hidden = true;
+    bar.append(leave);
+  });
+  root.querySelector(".screen.game")!.append(bar, view.ui);
   void app.conns.er.getAccountInfo(pstate, "confirmed").then((i) => i && apply(i.data), () => {});
   const sub = app.conns.er.onAccountChange(pstate, (i) => apply(i.data), { commitment: "confirmed" });
 
-  // A tiny sky/ground gradient so the canvas is not blank (the renderer replaces this).
-  const ctx = canvas.getContext("2d");
-  const paint = () => {
-    const r = canvas.getBoundingClientRect();
-    canvas.width = Math.max(1, Math.round(r.width * devicePixelRatio));
-    canvas.height = Math.max(1, Math.round(r.height * devicePixelRatio));
-    if (!ctx) return;
-    const g = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    g.addColorStop(0, "#7fb2e6");
-    g.addColorStop(0.62, "#cfe3f2");
-    g.addColorStop(0.62, "#5f8f3a");
-    g.addColorStop(1, "#3c5a26");
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-  };
-  paint();
-  window.addEventListener("resize", paint);
-
   const handle: GameHandle = {
     stop() {
-      window.removeEventListener("resize", paint);
+      view.stop();
       void app.conns.er.removeAccountChangeListener(sub).catch(() => {});
       app.set({ world: null, playerState: null });
     },

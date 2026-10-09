@@ -1,0 +1,288 @@
+// Chunk store: the client's live copy of the chunks around the player.
+//
+// - Loads every chunk within `radius` of the center (circle `dx² + dz² ≤ r² + r`): one
+//   `onAccountChange` subscription per chunk (also for chunks that don't exist yet, so a
+//   creation by anyone shows up) + one batched `getMultipleAccountsInfo` for the initial
+//   state. Chunks beyond `keep` (default radius + 1) are unsubscribed and dropped.
+// - On every account change the header is re-read and the block bytes are diffed against
+//   the previous copy: header-only writes (crank ticks, mobs) don't re-mesh; changed blocks
+//   mark the chunk dirty, and changes on a border column also mark that neighbor dirty
+//   (its culled faces depend on our border). A chunk gaining or losing blocks (created,
+//   grown, closed) marks itself and its 4 neighbors. Dirty keys are flushed to `onDirty`
+//   after a short debounce (nearest first).
+// - Implements `ChunkView` (`exists` / `ready`) for the chain builders and `getBlock` for
+//   physics (Task 25).
+import type { AccountInfo, Connection, PublicKey } from "@solana/web3.js";
+import { accountKind, CHUNK_HEADER_SIZE, chunkBlocks, chunkPda, chunkReady, chunkKey, GEN_DONE, type ChunkView } from "../chain";
+import { borderOf, DIRS } from "./mesher";
+
+export type StoreConn = Pick<
+  Connection,
+  "getMultipleAccountsInfo" | "getAccountInfo" | "onAccountChange" | "removeAccountChangeListener"
+>;
+
+export type ChunkStatus = "loading" | "missing" | "present";
+
+export type ChunkEntry = {
+  cx: number;
+  cz: number;
+  key: string;
+  pda: PublicKey;
+  status: ChunkStatus;
+  /** Raw account data while present. */
+  data: Uint8Array | null;
+  /** The 16 384 block bytes (view into `data`) once the chunk is full size. */
+  blocks: Uint8Array | null;
+  /** `gen_stage` while present (0 created, 1 grown, 2 done), else −1. */
+  genStage: number;
+  /** Subscription id. */
+  sub: number | null;
+  /** Bumped on every applied update (guards fetch results racing subscription updates). */
+  version: number;
+};
+
+export type StoreOptions = {
+  conn: StoreConn;
+  programId: PublicKey;
+  world: PublicKey;
+  /** Load radius in chunks (default 4). */
+  radius?: number;
+  /** Unload beyond this radius (default radius + 1). */
+  keep?: number;
+  /** Debounce of dirty flushes, ms (default 30). */
+  debounceMs?: number;
+  /** Chunks to (re)mesh — or to remove, when `meshInput(key)` is null. */
+  onDirty?: (keys: string[]) => void;
+  /** Any status / header / block change of a loaded chunk (after it is applied). */
+  onChange?: (e: ChunkEntry) => void;
+};
+
+/** In the load circle of radius `r` (chunk units). */
+export const inRadius = (dx: number, dz: number, r: number) => dx * dx + dz * dz <= r * r + r;
+/** Opposite of a `DIRS` index (N↔S, E↔W). */
+const OPP = [1, 0, 3, 2];
+
+export class ChunkStore implements ChunkView {
+  readonly radius: number;
+  readonly keep: number;
+  private map = new Map<string, ChunkEntry>();
+  private dirty = new Set<string>();
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private disposed = false;
+  center: [number, number] | null = null;
+
+  constructor(readonly opts: StoreOptions) {
+    this.radius = opts.radius ?? 4;
+    this.keep = opts.keep ?? this.radius + 1;
+  }
+
+  // ------------------------------------------------------------ queries
+
+  get(cx: number, cz: number): ChunkEntry | undefined {
+    return this.map.get(chunkKey(cx, cz));
+  }
+  entry(key: string): ChunkEntry | undefined {
+    return this.map.get(key);
+  }
+  entries(): IterableIterator<ChunkEntry> {
+    return this.map.values();
+  }
+  get size() {
+    return this.map.size;
+  }
+
+  exists(cx: number, cz: number): boolean {
+    return this.get(cx, cz)?.status === "present";
+  }
+  ready(cx: number, cz: number): boolean {
+    const e = this.get(cx, cz);
+    return e?.status === "present" && e.genStage === GEN_DONE && !!e.data && chunkReady(e.data);
+  }
+  /** Loaded (initial state known) and known not to exist. */
+  missing(cx: number, cz: number): boolean {
+    return this.get(cx, cz)?.status === "missing";
+  }
+
+  /** Block id at world block coords; null when that chunk isn't loaded / has no blocks.
+   *  Above the world: air (0); below: null. */
+  getBlock(x: number, y: number, z: number): number | null {
+    if (y >= 64) return 0;
+    if (y < 0) return null;
+    const cx = Math.floor(x / 16);
+    const cz = Math.floor(z / 16);
+    const b = this.get(cx, cz)?.blocks;
+    if (!b) return null;
+    return b[(y * 16 + (z - cz * 16)) * 16 + (x - cx * 16)];
+  }
+
+  /** Mesher input for `key` (copies), or null when it has no blocks. */
+  meshInput(key: string): { blocks: Uint8Array; borders: (Uint8Array | null)[] } | null {
+    const e = this.map.get(key);
+    if (!e?.blocks) return null;
+    const borders = DIRS.map(([dx, dz], d) => {
+      const nb = this.get(e.cx + dx, e.cz + dz)?.blocks;
+      return nb ? borderOf(nb, OPP[d]) : null;
+    });
+    return { blocks: e.blocks.slice(), borders };
+  }
+
+  // ------------------------------------------------------------ loading
+
+  /** Moves the load circle to `(cx, cz)`: subscribes + fetches new chunks, drops far ones.
+   *  Resolves when the new chunks' initial state is applied. */
+  async setCenter(cx: number, cz: number): Promise<void> {
+    if (this.disposed) return;
+    if (this.center && this.center[0] === cx && this.center[1] === cz) return;
+    this.center = [cx, cz];
+    for (const e of [...this.map.values()]) if (!inRadius(e.cx - cx, e.cz - cz, this.keep)) this.unload(e);
+    const added: ChunkEntry[] = [];
+    const r = this.radius;
+    for (let dz = -r; dz <= r; dz++)
+      for (let dx = -r; dx <= r; dx++) {
+        if (!inRadius(dx, dz, r)) continue;
+        const key = chunkKey(cx + dx, cz + dz);
+        if (this.map.has(key)) continue;
+        added.push(this.load(cx + dx, cz + dz));
+      }
+    added.sort((a, b) => this.dist(a) - this.dist(b));
+    for (let i = 0; i < added.length; i += 100) await this.fetch(added.slice(i, i + 100));
+  }
+
+  private dist(e: { cx: number; cz: number }) {
+    const c = this.center ?? [0, 0];
+    return (e.cx - c[0]) ** 2 + (e.cz - c[1]) ** 2;
+  }
+
+  private load(cx: number, cz: number): ChunkEntry {
+    const { conn, programId, world } = this.opts;
+    const key = chunkKey(cx, cz);
+    const pda = chunkPda(programId, world, cx, cz);
+    const e: ChunkEntry = { cx, cz, key, pda, status: "loading", data: null, blocks: null, genStage: -1, sub: null, version: 0 };
+    this.map.set(key, e);
+    e.sub = conn.onAccountChange(pda, (info) => this.map.get(key) === e && this.apply(e, info), { commitment: "confirmed" });
+    return e;
+  }
+
+  private unload(e: ChunkEntry) {
+    this.map.delete(e.key);
+    if (e.sub !== null) void Promise.resolve(this.opts.conn.removeAccountChangeListener(e.sub)).catch(() => {});
+    e.sub = null;
+    // Removal of its mesh (meshInput is null now).
+    if (e.blocks) this.markDirty(e.key);
+  }
+
+  private async fetch(es: ChunkEntry[]): Promise<void> {
+    if (!es.length) return;
+    const versions = es.map((e) => e.version);
+    let infos: (AccountInfo<Uint8Array> | null)[];
+    try {
+      infos = await this.opts.conn.getMultipleAccountsInfo(
+        es.map((e) => e.pda),
+        "confirmed",
+      );
+    } catch (err) {
+      console.warn("chunk fetch failed; retrying", err);
+      await new Promise((r) => setTimeout(r, 1000));
+      const left = es.filter((e) => this.map.get(e.key) === e && e.status === "loading");
+      return this.fetch(left);
+    }
+    es.forEach((e, i) => {
+      // Skip if unloaded meanwhile or a subscription update already arrived (newer).
+      if (this.map.get(e.key) !== e || e.version !== versions[i]) return;
+      this.apply(e, infos[i]);
+    });
+  }
+
+  /** Re-reads one chunk now (after a tx that changed it, before its notification). */
+  async refresh(key: string): Promise<void> {
+    const e = this.map.get(key);
+    if (!e) return;
+    const v = e.version;
+    try {
+      const info = await this.opts.conn.getAccountInfo(e.pda, "confirmed");
+      if (this.map.get(key) === e && e.version === v) this.apply(e, info);
+    } catch {
+      /* the subscription will catch up */
+    }
+  }
+
+  // ------------------------------------------------------------ updates
+
+  private apply(e: ChunkEntry, info: AccountInfo<Uint8Array> | null) {
+    if (this.disposed) return;
+    const ok =
+      !!info && info.owner.equals(this.opts.programId) && info.data.length >= CHUNK_HEADER_SIZE && accountKind(info.data) === "chunk";
+    const data = ok ? Uint8Array.from(info.data) : null;
+    const prev = e.blocks;
+    e.version++;
+    e.status = data ? "present" : "missing";
+    e.data = data;
+    e.genStage = data ? data[82] : -1;
+    e.blocks = data ? chunkBlocks(data) : null;
+    const next = e.blocks;
+    if (!prev !== !next) {
+      this.markDirty(e.key);
+      for (const [dx, dz] of DIRS) this.markNeighbor(e.cx + dx, e.cz + dz);
+    } else if (prev && next) {
+      let changed = false;
+      let n = false, s = false, east = false, w = false;
+      for (let i = 0; i < next.length; i++) {
+        if (prev[i] === next[i]) continue;
+        changed = true;
+        const lx = i & 15;
+        const lz = (i >> 4) & 15;
+        if (lz === 0) n = true;
+        else if (lz === 15) s = true;
+        if (lx === 0) w = true;
+        else if (lx === 15) east = true;
+      }
+      if (changed) this.markDirty(e.key);
+      if (n) this.markNeighbor(e.cx, e.cz - 1);
+      if (s) this.markNeighbor(e.cx, e.cz + 1);
+      if (east) this.markNeighbor(e.cx + 1, e.cz);
+      if (w) this.markNeighbor(e.cx - 1, e.cz);
+    }
+    try {
+      this.opts.onChange?.(e);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  private markNeighbor(cx: number, cz: number) {
+    const nb = this.get(cx, cz);
+    if (nb?.blocks) this.markDirty(nb.key);
+  }
+
+  private markDirty(key: string) {
+    this.dirty.add(key);
+    if (this.timer !== null || this.disposed) return;
+    this.timer = setTimeout(() => this.flush(), this.opts.debounceMs ?? 30);
+  }
+
+  /** Emits the pending dirty keys now (nearest first). */
+  flush() {
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+    if (!this.dirty.size || this.disposed) return;
+    const keys = [...this.dirty];
+    this.dirty.clear();
+    const c = this.center ?? [0, 0];
+    const d = (k: string) => {
+      const [x, z] = k.split(",").map(Number);
+      return (x - c[0]) ** 2 + (z - c[1]) ** 2;
+    };
+    keys.sort((a, b) => d(a) - d(b));
+    this.opts.onDirty?.(keys);
+  }
+
+  dispose() {
+    this.disposed = true;
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+    for (const e of this.map.values())
+      if (e.sub !== null) void Promise.resolve(this.opts.conn.removeAccountChangeListener(e.sub)).catch(() => {});
+    this.map.clear();
+    this.dirty.clear();
+  }
+}
