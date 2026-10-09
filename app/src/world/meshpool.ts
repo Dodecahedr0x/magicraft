@@ -22,7 +22,7 @@ export class MeshPool {
       const w = new Worker(new URL("./mesher.worker.ts", import.meta.url), { type: "module" });
       const slot = { w, busy: false };
       w.onmessage = (e: MessageEvent<MeshReply>) => this.reply(e.data);
-      w.onerror = (e) => console.error("mesher worker error", e.message);
+      w.onerror = (e) => this.crashed(slot, e.message);
       this.workers.push(slot);
     }
   }
@@ -43,6 +43,7 @@ export class MeshPool {
   /** Drops queued (not dispatched) work for keys not in `keep`. */
   prune(keep: (key: string) => boolean) {
     this.queue = this.queue.filter((j) => keep(j.key) || (this.queued.delete(j.key), false));
+    for (const k of this.latest.keys()) if (!keep(k)) this.latest.delete(k);
   }
 
   get backlog() {
@@ -71,17 +72,32 @@ export class MeshPool {
     }
   }
 
+  /** A worker error outside a reply: free its slot and fail its job (the chunk keeps its
+   *  previous mesh; the next change re-requests it). */
+  private crashed(slot: { w: Worker; busy: boolean }, msg: string) {
+    console.error("mesher worker error", msg);
+    for (const [id, p] of this.pending)
+      if (p.w === slot) {
+        this.pending.delete(id);
+        if (this.latest.get(p.job.key) === p.seq) this.latest.delete(p.job.key);
+        console.error("meshing failed", p.job.key);
+      }
+    slot.busy = false;
+    this.pump();
+  }
+
   private reply(r: MeshReply) {
     const p = this.pending.get(r.id);
     if (!p) return;
     this.pending.delete(r.id);
     p.w.busy = false;
-    if ("error" in r) console.error("meshing failed", p.job.key, r.error);
+    if ("error" in r) console.error("meshing failed", p.job.key, r.error); // previous mesh stays
     else {
       this.times.push(r.ms);
       if (this.times.length > 200) this.times.shift();
       if (this.latest.get(p.job.key) === p.seq) p.job.done(r.mesh, r.ms);
     }
+    if (this.latest.get(p.job.key) === p.seq) this.latest.delete(p.job.key);
     this.pump();
   }
 
@@ -91,5 +107,6 @@ export class MeshPool {
     this.queue = [];
     this.queued.clear();
     this.pending.clear();
+    this.latest.clear();
   }
 }

@@ -1,6 +1,6 @@
-// Free-fly debug camera until the player controller (Task 25): drag with the mouse to look,
-// WASD to move, Space / Shift (or E / Q) up / down, Ctrl for speed. Keys are ignored while
-// typing in a form field.
+// Free-fly debug camera (until the player controller, Task 25; afterwards debug mode
+// only): drag with the mouse to look, WASD to move, Space up, C or Q down, Shift faster.
+// Keys are ignored while typing in a form field.
 import type { PerspectiveCamera } from "three";
 
 export class FlyCam {
@@ -55,8 +55,8 @@ export class FlyCam {
     const k = this.keys;
     const f = (k.has("KeyW") ? 1 : 0) - (k.has("KeyS") ? 1 : 0);
     const s = (k.has("KeyD") ? 1 : 0) - (k.has("KeyA") ? 1 : 0);
-    const u = (k.has("Space") || k.has("KeyE") ? 1 : 0) - (k.has("ShiftLeft") || k.has("ShiftRight") || k.has("KeyQ") ? 1 : 0);
-    const v = this.speed * (k.has("ControlLeft") || k.has("ControlRight") ? 3 : 1) * dt;
+    const u = (k.has("Space") ? 1 : 0) - (k.has("KeyC") || k.has("KeyQ") ? 1 : 0);
+    const v = this.speed * (k.has("ShiftLeft") || k.has("ShiftRight") ? 3 : 1) * dt;
     if (f || s || u) {
       const sin = Math.sin(this.yaw);
       const cos = Math.cos(this.yaw);

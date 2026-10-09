@@ -19,6 +19,10 @@ export const GROUND_HALF_W = 78;
 
 export const CHUNK_HEADER_SIZE = 768;
 export const CHUNK_BLOCKS_OFFSET = CHUNK_HEADER_SIZE;
+/** Offset of `ChunkHeader.gen_stage` (u8). */
+export const CHUNK_GEN_STAGE_OFFSET = 82;
+/** Offset of `ChunkHeader.payer` (Player PDA, 32 B). */
+export const CHUNK_PAYER_OFFSET = 8;
 export const CHUNK_INITIAL_LEN = 10_240;
 export const CHUNK_FULL_LEN = CHUNK_BLOCKS_OFFSET + CHUNK_VOL; // 17 152
 export const PRESENCE_HEADER_SIZE = 48;
@@ -504,7 +508,7 @@ export function decodeChunkHeader(d: Uint8Array): ChunkHeader {
     cz: r.i32(76),
     bump: r.u8(80),
     edited: r.bool(81),
-    genStage: r.u8(82),
+    genStage: r.u8(CHUNK_GEN_STAGE_OFFSET),
     crankArmed: r.bool(83),
     taskId: r.i64(84),
     lastTickMs: r.n64(92),
@@ -523,7 +527,7 @@ export function decodeChunkHeader(d: Uint8Array): ChunkHeader {
 
 /** A chunk is playable: full size and `gen_stage == DONE` (else ixs reject it). */
 export const chunkReady = (d: Uint8Array) =>
-  d.length === CHUNK_FULL_LEN && d[82] === GEN_DONE && accountKind(d) === "chunk";
+  d.length === CHUNK_FULL_LEN && d[CHUNK_GEN_STAGE_OFFSET] === GEN_DONE && accountKind(d) === "chunk";
 
 /** The 16 384 block bytes of a full chunk (a view into `d`, no copy); index
  *  `y * 256 + lz * 16 + lx` ([`blockIndex`]). Null while the chunk is not full size. */

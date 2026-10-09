@@ -26,7 +26,7 @@ const ixs = { createAndGrow: vi.fn(async () => []), grow: vi.fn(async () => []),
 describe("AutoCreator", () => {
   it("creates outward from ready chunks, nearest first, never two adjacent at once", () => {
     const s = stub(["0,0"]);
-    const a = new AutoCreator({ store: s.store, view: s.view, send: async () => ok, ixs, radius: 3 });
+    const a = new AutoCreator({ consented: true, capLamports: 1e9, store: s.store, view: s.view, send: async () => ok, ixs, radius: 3 });
     a.focus = [0, 0];
     const first = a.next()!;
     expect(first.step).toBe("create");
@@ -39,7 +39,7 @@ describe("AutoCreator", () => {
 
   it("does not create chunks detached from anything ready, except the player's own", () => {
     const s = stub(["0,0"]);
-    const a = new AutoCreator({ store: s.store, view: s.view, send: async () => ok, ixs, radius: 1 });
+    const a = new AutoCreator({ consented: true, capLamports: 1e9, store: s.store, view: s.view, send: async () => ok, ixs, radius: 1 });
     a.focus = [3, 3];
     // Radius-1 circle around (3,3) is not adjacent to (0,0).
     expect(a.next()).toBeNull();
@@ -49,7 +49,7 @@ describe("AutoCreator", () => {
 
   it("resumes stage 0 / 1 chunks with grow / populate", () => {
     const s = stub(["0,0"], { "1,0": 1, "0,1": 0 });
-    const a = new AutoCreator({ store: s.store, view: s.view, send: async () => ok, ixs, radius: 1 });
+    const a = new AutoCreator({ consented: true, capLamports: 1e9, store: s.store, view: s.view, send: async () => ok, ixs, radius: 1 });
     a.focus = [0, 0];
     const steps = new Set<string>();
     for (let i = 0; i < 2; i++) {
@@ -64,7 +64,7 @@ describe("AutoCreator", () => {
     const s = stub([]);
     const events: string[] = [];
     const send = vi.fn(async (): Promise<SendResult> => ({ status: "failed", error: { kind: "topup", name: "InsufficientSponsorFunds", message: "x" } }));
-    const a = new AutoCreator({ store: s.store, view: s.view, send, ixs, radius: 2, onEvent: (e) => events.push(e.type) });
+    const a = new AutoCreator({ consented: true, capLamports: 1e9, store: s.store, view: s.view, send, ixs, radius: 2, onEvent: (e) => events.push(e.type) });
     a.setFocus(0, 0);
     expect(send).toHaveBeenCalledTimes(1);
     await vi.waitFor(() => expect(a.halted).toBe("topup"));
@@ -76,7 +76,7 @@ describe("AutoCreator", () => {
   it("runs create + populate and counts the rent", async () => {
     const s = stub(["0,0"]);
     const send = vi.fn(async () => ok);
-    const a = new AutoCreator({ store: s.store, view: s.view, send, ixs, radius: 1, concurrency: 1 });
+    const a = new AutoCreator({ consented: true, capLamports: 1e9, store: s.store, view: s.view, send, ixs, radius: 1, concurrency: 1 });
     a.setFocus(0, 0);
     // Radius 1 = the 3×3 square: 8 missing chunks, two gen txs each, then idle.
     await vi.waitFor(() => expect(a.created).toBe(8));
@@ -84,5 +84,42 @@ describe("AutoCreator", () => {
     expect(a.spentLamports).toBe(8 * 554_240);
     expect(a.next()).toBeNull();
     a.dispose();
+  });
+
+  it("waits for consent, then stops at the spend cap until raised", async () => {
+    const s = stub(["0,0"]);
+    const send = vi.fn(async () => ok);
+    const a = new AutoCreator({ store: s.store, view: s.view, send, ixs, radius: 1, concurrency: 1, capLamports: 2 * 554_240 });
+    a.setFocus(0, 0);
+    expect(a.waiting).toBe("consent");
+    expect(send).not.toHaveBeenCalled();
+    a.consent();
+    await vi.waitFor(() => expect(a.waiting).toBe("cap"));
+    expect(a.created).toBe(2);
+    a.raiseCap(554_240);
+    await vi.waitFor(() => expect(a.created).toBe(3));
+    await vi.waitFor(() => expect(a.waiting).toBe("cap"));
+    a.dispose();
+  });
+
+  it("resumes unfinished chunks without consent (no new rent)", () => {
+    const s = stub(["0,0"], { "1,0": 1 });
+    const a = new AutoCreator({ store: s.store, view: s.view, send: async () => ok, ixs, radius: 1 });
+    a.focus = [0, 0];
+    expect(a.next()).toMatchObject({ key: "1,0", step: "populate" });
+  });
+
+  it("dispose stops a run between its txs", async () => {
+    const s = stub(["0,0"]);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const send = vi.fn(async () => (await gate, ok));
+    const a = new AutoCreator({ consented: true, store: s.store, view: s.view, send, ixs, radius: 1, concurrency: 1 });
+    a.setFocus(0, 0);
+    expect(send).toHaveBeenCalledTimes(1);
+    a.dispose();
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(send).toHaveBeenCalledTimes(1); // no populate after dispose
   });
 });

@@ -1,6 +1,6 @@
 // World session glue: chunk store → mesher workers → renderer, the chunk auto-creator, the
 // debug fly camera, and the in-game chunk panel (auto-create toggle, cost, toasts).
-import type { PublicKey } from "@solana/web3.js";
+import { LAMPORTS_PER_SOL, type PublicKey } from "@solana/web3.js";
 import {
   breakBlockIx,
   CHUNK_TOTAL_RENT,
@@ -19,47 +19,60 @@ import type { App } from "../state";
 import { h, sendResultMessage, sol } from "../ui/dom";
 import { openTopUp } from "../ui/hud";
 import { atlasCanvas } from "./atlas";
-import { AutoCreator, type AutoEvent } from "./autocreate";
+import { AutoCreator, DEFAULT_CAP_LAMPORTS, type AutoEvent } from "./autocreate";
 import { FlyCam } from "./flycam";
 import { MeshPool } from "./meshpool";
 import { WorldRenderer } from "./renderer";
 import { ChunkStore } from "./store";
 
 export const LOAD_RADIUS = 4;
-export const CREATE_RADIUS = 3;
+export const CREATE_RADIUS = 2;
 export const EYE = 1.62;
 const AUTO_KEY = "magicraft.autoCreate";
+const CAP_KEY = "magicraft.autoCreate.capSol";
+const consentKey = (world: PublicKey) => `magicraft.autoCreate.consent.${world.toBase58()}`;
 
 export type WorldHandle = {
   store: ChunkStore;
   renderer: WorldRenderer;
   auto: AutoCreator;
-  /** Called with every PlayerState update (sets the player's own chunk). */
+  /** The free-fly debug camera drives the focus (debug mode only). */
+  readonly debugCam: boolean;
+  /** Moves the load / auto-create focus to world position (x, y, z) (block units). The
+   *  debug camera calls it every frame; otherwise the player (Task 25) does. */
+  setFocus(x: number, y: number, z: number): void;
+  /** Called with every PlayerState update (own chunk; focus + camera when not in debug). */
   onPlayerState(s: PlayerStateAccount): void;
   /** The chunk panel + toasts (append into the game screen). */
   ui: HTMLElement;
   stop(): void;
 };
 
-const readPref = () => {
-  try {
-    return localStorage.getItem(AUTO_KEY) !== "off";
-  } catch {
-    return true;
-  }
+const store_ = {
+  get(k: string): string | null {
+    try {
+      return localStorage.getItem(k);
+    } catch {
+      return null;
+    }
+  },
+  set(k: string, v: string) {
+    try {
+      localStorage.setItem(k, v);
+    } catch {
+      /* private mode */
+    }
+  },
 };
-const writePref = (on: boolean) => {
-  try {
-    localStorage.setItem(AUTO_KEY, on ? "on" : "off");
-  } catch {
-    /* private mode */
-  }
-};
+
+/** Debug mode: dev builds, or `?debug` in the URL. */
+export const isDebug = () => !import.meta.env.PROD || new URLSearchParams(location.search).has("debug");
 
 export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey, account: WorldAccount, onFirstMesh: () => void): WorldHandle {
   const renderer = new WorldRenderer(canvas, { viewBlocks: LOAD_RADIUS * 16 + 8 });
   const pool = new MeshPool();
-  const cam = new FlyCam(renderer.camera, canvas);
+  const debugCam = isDebug();
+  const cam = debugCam ? new FlyCam(renderer.camera, canvas) : null;
   let firstMesh = false;
 
   const store: ChunkStore = new ChunkStore({
@@ -89,12 +102,15 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     if (!s) return { status: "failed", error: { kind: "renewSession", message: "No play session." } };
     return s.send(src, opts);
   };
+  const capSol = Number(store_.get(CAP_KEY));
   const auto = new AutoCreator({
     store,
     view: store,
     send,
     radius: CREATE_RADIUS,
     concurrency: 2,
+    capLamports: capSol > 0 ? Math.round(capSol * LAMPORTS_PER_SOL) : DEFAULT_CAP_LAMPORTS,
+    consented: store_.get(consentKey(world)) === "yes",
     ixs: {
       createAndGrow: (cx, cz, view, own) => {
         const auth = app.auth();
@@ -105,7 +121,7 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     },
     onEvent: (e) => onAuto(e),
   });
-  auto.paused = !readPref();
+  auto.paused = store_.get(AUTO_KEY) === "off";
   let tickQueued = false;
   function queueTick() {
     if (tickQueued) return;
@@ -120,26 +136,44 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
   // ------------------------------------------------------------ panel + toasts
 
   const toggle = h("input", { type: "checkbox", id: "auto-create", checked: !auto.paused });
+  const capInput = h("input", {
+    id: "auto-cap",
+    class: "input small",
+    type: "number",
+    min: "0.001",
+    step: "0.005",
+    inputmode: "decimal",
+    value: String(+(auto.capLamports / LAMPORTS_PER_SOL).toFixed(6)),
+  });
   const status = h("p", { class: "chunk-status", role: "status" });
   const totals = h("p", { class: "chunk-totals" });
-  const haltBox = h("div", { class: "chunk-halt", hidden: true });
+  const askBox = h("div", { class: "chunk-halt", hidden: true });
   const toasts = h("div", { class: "toasts", "aria-live": "polite" });
   const panel = h(
     "div",
     { class: "chunk-panel" },
     h("label", { class: "check", for: "auto-create" }, toggle, h("span", {}, "Auto-generate nearby chunks")),
     h("p", { class: "hint" }, `≈ ${sol(CHUNK_TOTAL_RENT, 6)} SOL rent each, paid by your player. Radius ${CREATE_RADIUS}.`),
+    h("label", { class: "cap", for: "auto-cap" }, h("span", {}, "Spend cap this session"), capInput, h("span", { class: "muted" }, "SOL")),
     status,
     totals,
-    haltBox,
+    askBox,
   );
-  const help = h("p", { class: "fly-help" }, "Drag to look · WASD move · Space / Shift up / down · Ctrl faster");
-  const ui = h("div", { class: "world-ui" }, panel, help, toasts);
+  const help = cam ? h("p", { class: "fly-help" }, "Debug camera: drag to look · WASD move · Space up · C / Q down · Shift faster") : null;
+  const ui = h("div", { class: "world-ui" }, panel, help ?? h("span"), toasts);
 
   toggle.addEventListener("change", () => {
-    writePref(toggle.checked);
+    store_.set(AUTO_KEY, toggle.checked ? "on" : "off");
     auto.setPaused(!toggle.checked);
-    renderPanel();
+  });
+  capInput.addEventListener("change", () => {
+    const v = Number(capInput.value);
+    if (!(v > 0)) {
+      capInput.value = String(+(auto.capLamports / LAMPORTS_PER_SOL).toFixed(6));
+      return;
+    }
+    store_.set(CAP_KEY, String(v));
+    auto.setCap(Math.round(v * LAMPORTS_PER_SOL));
   });
 
   function toast(msg: string, kind: "info" | "warn" = "info") {
@@ -150,77 +184,141 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     setTimeout(() => t.remove(), 4600);
   }
 
+  // Creations are toasted in batches: one toast per burst ("N chunks created · X SOL").
+  let batch = { n: 0, lamports: 0 };
+  let batchTimer: ReturnType<typeof setTimeout> | null = null;
+  const flushBatch = () => {
+    batchTimer = null;
+    if (!batch.n) return;
+    const { n, lamports } = batch;
+    batch = { n: 0, lamports: 0 };
+    toast(`${n} chunk${n === 1 ? "" : "s"} created · ${sol(lamports, 6)} SOL · session total ${sol(auto.spentLamports, 6)} SOL`);
+  };
+
   const label = (key: string) => `(${key.replace(",", ", ")})`;
+  let asked: string | null = null;
   function renderPanel() {
     const inflight = [...auto.inflight.entries()].map(([k, s]) => `${s === "populate" ? "populating" : s === "grow" ? "growing" : "creating"} ${label(k)}`);
     const pending = auto.pending();
+    const plural = (n: number) => `${n} chunk${n === 1 ? "" : "s"}`;
     status.textContent = auto.halted
       ? "Paused: needs your attention."
       : auto.paused
         ? pending
-          ? `Paused · ${pending} chunk${pending === 1 ? "" : "s"} nearby not generated.`
+          ? `Paused · ${plural(pending)} nearby not generated.`
           : "Paused."
         : inflight.length
           ? `Generating: ${inflight.join(", ")}…`
-          : pending
-            ? `${pending} chunk${pending === 1 ? "" : "s"} nearby can't be generated from here yet.`
-            : "All nearby chunks generated.";
-    totals.textContent = auto.created ? `${auto.created} chunk${auto.created === 1 ? "" : "s"} created this session · ${sol(auto.spentLamports, 6)} SOL` : "";
-    haltBox.hidden = !auto.halted;
+          : auto.waiting
+            ? "Waiting for your go-ahead."
+            : pending
+              ? `${plural(pending)} nearby can't be generated from here yet.`
+              : "All nearby chunks generated.";
+    totals.textContent = auto.created ? `${plural(auto.created)} created this session · ${sol(auto.spentLamports, 6)} SOL` : "";
+    // The prompt: a halt (top-up / session) wins over a spending question.
+    const want = auto.halted ? `halt:${auto.halted}` : !auto.paused && auto.waiting ? `ask:${auto.waiting}` : null;
+    if (want === asked) return;
+    asked = want;
+    askBox.hidden = !want;
+    if (!want) return askBox.replaceChildren();
+    const btn = (label: string, onclick: () => void, ghost = false) => h("button", { class: `btn small${ghost ? " ghost" : ""}`, type: "button", onclick }, label);
+    if (want === "ask:consent") {
+      askBox.replaceChildren(
+        h("p", {}, `Missing chunks around you can be generated now. Each costs ≈ ${sol(CHUNK_TOTAL_RENT, 6)} SOL of rent from your player, up to your cap of ${sol(auto.capLamports, 6)} SOL this session.`),
+        h(
+          "div",
+          { class: "actions" },
+          btn("Generate chunks", () => {
+            store_.set(consentKey(world), "yes");
+            auto.consent();
+          }),
+          btn("Not now", () => {
+            toggle.checked = false;
+            store_.set(AUTO_KEY, "off");
+            auto.setPaused(true);
+          }, true),
+        ),
+      );
+    } else if (want === "ask:cap") {
+      askBox.replaceChildren(
+        h("p", {}, `Reached your spend cap: ${sol(auto.spentLamports, 6)} SOL on ${plural(auto.created)} this session. Continue?`),
+        h("div", { class: "actions" }, btn(`Continue (+${sol(DEFAULT_CAP_LAMPORTS, 6)} SOL)`, () => {
+          auto.raiseCap();
+          capInput.value = String(+(auto.capLamports / LAMPORTS_PER_SOL).toFixed(6));
+        })),
+      );
+    } else {
+      const msg =
+        auto.halted === "topup"
+          ? "Your player is out of SOL for chunk rent. Top it up, then resume."
+          : (haltMsg ?? "Your play session needs renewing.");
+      askBox.replaceChildren(
+        h("p", { class: "form-error" }, msg),
+        h("div", { class: "actions" }, auto.halted === "topup" ? btn("Top up", () => openTopUp(app)) : null, btn("Resume", () => auto.resume(), true)),
+      );
+    }
   }
 
+  let haltMsg: string | null = null;
   function onAuto(e: AutoEvent) {
     if (e.type === "created") {
-      toast(`Chunk ${label(e.key)} created · ${sol(e.lamports, 6)} SOL rent · session total ${sol(auto.spentLamports, 6)} SOL`);
+      batch.n++;
+      batch.lamports += e.lamports;
+      if (batchTimer !== null) clearTimeout(batchTimer);
+      batchTimer = setTimeout(flushBatch, 1500);
     } else if (e.type === "failed" && e.failure.kind !== "topup" && e.failure.kind !== "renewSession") {
       console.warn(`chunk ${e.key} ${e.step} failed`, e.failure);
       if (e.failure.kind !== "notReady") toast(`Chunk ${label(e.key)}: ${e.step} failed (${e.failure.name ?? e.failure.kind}); retrying later.`, "warn");
     } else if (e.type === "halted") {
-      const msg =
-        e.reason === "topup"
-          ? "Your player is out of SOL for chunk rent. Top it up, then resume."
-          : (sendResultMessage({ status: "failed", error: e.failure }) ?? "Your play session needs renewing.");
-      haltBox.replaceChildren(
-        h("p", { class: "form-error" }, msg),
-        h(
-          "div",
-          { class: "actions" },
-          e.reason === "topup" ? h("button", { class: "btn small", type: "button", onclick: () => openTopUp(app) }, "Top up") : null,
-          h("button", { class: "btn ghost small", type: "button", onclick: () => auto.resume() }, "Resume"),
-        ),
-      );
-      toast(msg, "warn");
+      flushBatch();
+      haltMsg = e.reason === "session" ? sendResultMessage({ status: "failed", error: e.failure }) : null;
+      toast(e.reason === "topup" ? "Out of SOL for chunk rent: auto-generation paused." : "Play session expired: auto-generation paused.", "warn");
     }
     renderPanel();
   }
 
   // ------------------------------------------------------------ camera + focus
 
+  let focus = "";
+  function setFocus(x: number, _y: number, z: number) {
+    const [cx, cz] = [Math.floor(x / 16), Math.floor(z / 16)];
+    const k = chunkKey(cx, cz);
+    if (k === focus) return;
+    focus = k;
+    void store.setCenter(cx, cz).then(() => queueTick());
+    pool.prune((key) => !!store.entry(key));
+    auto.setFocus(cx, cz);
+    renderPanel();
+  }
+
   let placed = false;
+  const eyeAt = (x: number, y: number, z: number) => {
+    if (cam) cam.setPosition(x, y + EYE, z);
+    else {
+      renderer.camera.position.set(x, y + EYE, z);
+      renderer.camera.rotation.set(-0.35, 0, 0, "YXZ");
+    }
+  };
   const placeAt = (s: PlayerStateAccount) => {
     const [x, y, z] = s.move.pos.map((v) => v / FP);
-    cam.setPosition(x, y + EYE, z);
+    eyeAt(x, y, z);
     placed = true;
   };
   if (app.state.playerState) placeAt(app.state.playerState);
   else {
     const [x, y, z] = account.spawn;
-    cam.setPosition(x + 0.5, y + EYE, z + 0.5);
+    eyeAt(x + 0.5, y, z + 0.5);
+  }
+  {
+    const p = renderer.camera.position;
+    setFocus(p.x, p.y - EYE, p.z);
   }
 
-  let focus = "";
   const onFrame = (dt: number) => {
+    if (!cam) return;
     cam.update(dt);
     const p = renderer.camera.position;
-    const [cx, cz] = [Math.floor(p.x / 16), Math.floor(p.z / 16)];
-    const k = chunkKey(cx, cz);
-    if (k !== focus) {
-      focus = k;
-      void store.setCenter(cx, cz).then(() => queueTick());
-      pool.prune((key) => !!store.entry(key));
-      auto.setFocus(cx, cz);
-      renderPanel();
-    }
+    setFocus(p.x, p.y - EYE, p.z);
   };
   renderer.start(onFrame);
   auto.start();
@@ -255,7 +353,9 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     breakBlock: (x: number, y: number, z: number) => sendEdit(() => breakBlockIx(app.program, app.auth(), world, [x, y, z], store)),
     placeBlock: (x: number, y: number, z: number, slot: number) => sendEdit(() => placeBlockIx(app.program, app.auth(), world, [x, y, z], slot, store)),
     cam,
-    goto: (x: number, y: number, z: number, yaw = cam.yaw, pitch = cam.pitch) => {
+    setFocus,
+    goto: (x: number, y: number, z: number, yaw = cam?.yaw ?? 0, pitch = cam?.pitch ?? 0) => {
+      if (!cam) return renderer.camera.position.set(x, y, z);
       cam.yaw = yaw;
       cam.pitch = pitch;
       cam.setPosition(x, y, z);
@@ -269,15 +369,19 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     renderer,
     auto,
     ui,
+    debugCam,
+    setFocus,
     onPlayerState(s) {
       auto.setOwn(Math.floor(s.move.pos[0] / (16 * FP)), Math.floor(s.move.pos[2] / (16 * FP)));
-      if (!placed) placeAt(s);
+      if (!placed || !cam) placeAt(s);
+      if (!cam) setFocus(s.move.pos[0] / FP, s.move.pos[1] / FP, s.move.pos[2] / FP);
     },
     stop() {
+      if (batchTimer !== null) clearTimeout(batchTimer);
       auto.dispose();
       store.dispose();
       pool.dispose();
-      cam.dispose();
+      cam?.dispose();
       renderer.dispose();
       if (g.__magicraft) delete g.__magicraft.world;
     },

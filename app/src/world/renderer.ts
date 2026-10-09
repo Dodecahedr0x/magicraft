@@ -243,5 +243,6 @@ export class WorldRenderer {
     for (const m of Object.values(this.mats)) m.dispose();
     this.atlas.dispose();
     this.renderer.dispose();
+    this.renderer.forceContextLoss();
   }
 }

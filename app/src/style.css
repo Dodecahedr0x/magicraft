@@ -953,6 +953,16 @@ fieldset.plain {
   block-size: 1rem;
   accent-color: var(--grass);
 }
+.chunk-panel .cap {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.chunk-panel .cap input {
+  inline-size: 6.5rem;
+  padding: 0.2rem 0.4rem;
+  font-variant-numeric: tabular-nums;
+}
 .chunk-status {
   color: var(--text);
 }

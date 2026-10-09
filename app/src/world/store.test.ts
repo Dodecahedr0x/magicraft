@@ -1,6 +1,6 @@
 import { Keypair, type AccountInfo, type PublicKey } from "@solana/web3.js";
 import { describe, expect, it, vi } from "vitest";
-import { CHUNK_BLOCKS_OFFSET, CHUNK_DISCRIMINATOR, CHUNK_FULL_LEN, chunkPda, GEN_DONE } from "../chain";
+import { CHUNK_BLOCKS_OFFSET, CHUNK_GEN_STAGE_OFFSET, CHUNK_DISCRIMINATOR, CHUNK_FULL_LEN, chunkPda, GEN_DONE } from "../chain";
 import { ChunkStore, inRadius, type StoreConn } from "./store";
 
 const programId = Keypair.generate().publicKey;
@@ -43,7 +43,7 @@ function fakeConn() {
 function chunkData(fill: (blocks: Uint8Array) => void = () => {}) {
   const d = new Uint8Array(CHUNK_FULL_LEN);
   d.set(CHUNK_DISCRIMINATOR, 0);
-  d[82] = GEN_DONE;
+  d[CHUNK_GEN_STAGE_OFFSET] = GEN_DONE;
   fill(d.subarray(CHUNK_BLOCKS_OFFSET));
   return d;
 }
@@ -81,7 +81,7 @@ describe("ChunkStore", () => {
     const f = fakeConn();
     f.put(0, 0, chunkData((b) => (b[bi(3, 10, 4)] = 7)));
     const stage1 = chunkData();
-    stage1[82] = 1;
+    stage1[CHUNK_GEN_STAGE_OFFSET] = 1;
     f.put(1, 0, stage1);
     const store = new ChunkStore({ conn: f.conn, programId, world, radius: 1 });
     await store.setCenter(0, 0);
@@ -94,7 +94,9 @@ describe("ChunkStore", () => {
     expect(store.getBlock(3, 10, 4)).toBe(7);
     expect(store.getBlock(3, 11, 4)).toBe(0);
     expect(store.getBlock(3, 70, 4)).toBe(0);
-    expect(store.getBlock(-1, 10, 4)).toBeNull();
+    expect(store.getBlock(-1, 10, 4)).toBeNull(); // not loaded
+    expect(store.getBlock(17, 10, 4)).toBeNull(); // (1,0) exists but is not generated
+    expect(store.getBlock(3, -1, 4)).toBeNull();
   });
 
   it("re-meshes on block changes only, and border neighbors too", async () => {

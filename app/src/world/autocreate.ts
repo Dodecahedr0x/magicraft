@@ -1,6 +1,6 @@
 // Auto-creation of missing chunks around the player.
 //
-// Targets: chunks within `radius` (default 3, circle `dx² + dz² ≤ r² + r`) of the focus
+// Targets: chunks within `radius` (default 2, circle `dx² + dz² ≤ r² + r`) of the focus
 // that the store knows to be missing or not fully generated. Order: nearest first, but a
 // missing chunk is only creatable next to a *ready* chunk (the program's adjacency rule),
 // or when it is the player's own chunk (`create_chunk` with the PlayerState), or (0,0)
@@ -14,11 +14,17 @@
 // `create_chunk` lists its neighbors writable iff they exist, so a neighbor appearing
 // between build and execution would fail the tx.
 //
+// Spending guards (creations only; resuming grow / populate costs no new rent):
+// - `consented`: nothing is created until the player opts in (the caller remembers it per
+//   world); `waiting === "consent"` while a creation is blocked on it.
+// - `capLamports` (default 0.01 SOL): a creation that would push this session's spend over
+//   the cap waits (`waiting === "cap"`) until `raiseCap()`.
+//
 // Failures: `topup` (the Player can't sponsor the rent) and `renewSession` halt the creator
-// until `resume()`; `notReady` / `timeout` retry soon; anything else backs off
-// exponentially per chunk.
+// until `resume()`; `notReady` / `timeout` retry soon, `superseded` after a short pause;
+// anything else backs off exponentially per chunk.
 import { PublicKey, type TransactionInstruction } from "@solana/web3.js";
-import { CHUNK_TOTAL_RENT, chunkKey, NBR_OFF, type ChunkView, type IxSource, type SendOptions, type SendResult, type TxFailure } from "../chain";
+import { CHUNK_PAYER_OFFSET, CHUNK_TOTAL_RENT, chunkKey, NBR_OFF, type ChunkView, type IxSource, type SendOptions, type SendResult, type TxFailure } from "../chain";
 import { inRadius, type ChunkStore } from "./store";
 
 export type AutoEvent =
@@ -30,6 +36,8 @@ export type AutoEvent =
   | { type: "state" };
 
 export type Step = "create" | "grow" | "populate";
+
+export const DEFAULT_CAP_LAMPORTS = 10_000_000;
 
 export type AutoCreateDeps = {
   store: Pick<ChunkStore, "entry" | "ready" | "refresh" | "entries">;
@@ -43,6 +51,10 @@ export type AutoCreateDeps = {
   view: ChunkView;
   radius?: number;
   concurrency?: number;
+  /** Session spend cap for creations (default 0.01 SOL). */
+  capLamports?: number;
+  /** Already opted in (default false). */
+  consented?: boolean;
   onEvent?: (e: AutoEvent) => void;
   now?: () => number;
 };
@@ -52,6 +64,12 @@ type Backoff = { until: number; fails: number };
 export class AutoCreator {
   readonly radius: number;
   readonly concurrency: number;
+  /** Session spend cap for creations, lamports. */
+  capLamports: number;
+  /** The player opted in to paying for chunks in this world. */
+  consented: boolean;
+  /** A creation is blocked on consent / the cap (resumes still run). */
+  waiting: "consent" | "cap" | null = null;
   focus: [number, number] | null = null;
   own: [number, number] | null = null;
   paused = false;
@@ -67,7 +85,9 @@ export class AutoCreator {
   private readonly now: () => number;
 
   constructor(readonly deps: AutoCreateDeps) {
-    this.radius = deps.radius ?? 3;
+    this.radius = deps.radius ?? 2;
+    this.capLamports = deps.capLamports ?? DEFAULT_CAP_LAMPORTS;
+    this.consented = deps.consented ?? false;
     this.concurrency = deps.concurrency ?? 2;
     this.now = deps.now ?? Date.now;
   }
@@ -91,6 +111,25 @@ export class AutoCreator {
     this.emit({ type: "state" });
     this.tick();
   }
+  /** The player opted in to paying for chunks. */
+  consent() {
+    this.consented = true;
+    this.waiting = null;
+    this.emit({ type: "state" });
+    this.tick();
+  }
+  /** Sets the session spend cap (lamports); creations continue while under it. */
+  setCap(lamports: number) {
+    this.capLamports = lamports;
+    this.waiting = null;
+    this.emit({ type: "state" });
+    this.tick();
+  }
+  /** Allows `lamports` more spend this session (the "continue?" answer). */
+  raiseCap(lamports = DEFAULT_CAP_LAMPORTS) {
+    this.setCap(Math.max(this.capLamports, this.spentLamports) + lamports);
+  }
+
   /** Clears a halt (after a top-up / session renewal). */
   resume() {
     this.halted = null;
@@ -139,6 +178,8 @@ export class AutoCreator {
       for (let dx = -r; dx <= r; dx++) if (inRadius(dx, dz, r)) cands.push({ key: chunkKey(fx + dx, fz + dz), cx: fx + dx, cz: fz + dz, d: dx * dx + dz * dz });
     cands.sort((a, b) => a.d - b.d);
     const t = this.now();
+    for (const [k, until] of this.recent) if (until <= t) this.recent.delete(k);
+    for (const [k, b] of this.backoff) if (b.until <= t && !this.deps.store.entry(k)) this.backoff.delete(k);
     let anyPresent = false;
     for (const e of store.entries()) if (e.status === "present") anyPresent = true;
     // Unfinished chunks first (already paid for), then creations; nearest first in each.
@@ -160,7 +201,13 @@ export class AutoCreator {
       const origin = c.key === "0,0" && !anyPresent;
       if (own || nextToReady || origin) create = { ...c, step: "create" };
     }
-    return create;
+    // Spending guards apply to creations only.
+    const waiting = !create ? null : !this.consented ? "consent" : this.spentLamports + CHUNK_TOTAL_RENT > this.capLamports ? "cap" : null;
+    if (waiting !== this.waiting) {
+      this.waiting = waiting;
+      this.emit({ type: "state" });
+    }
+    return waiting ? null : create;
   }
 
   private async run(key: string, cx: number, cz: number, first: Step) {
@@ -172,7 +219,7 @@ export class AutoCreator {
         this.emit({ type: "start", key, step });
         const own = !!this.own && this.own[0] === cx && this.own[1] === cz;
         const r = await send(() => ixs.createAndGrow(cx, cz, view, own), { gen: true });
-        if (!this.ok(r, key, step)) return;
+        if (!this.ok(r, key, step) || this.disposed) return;
         this.created++;
         this.recent.set(key, this.now() + 10_000);
         this.spentLamports += CHUNK_TOTAL_RENT;
@@ -182,11 +229,12 @@ export class AutoCreator {
         this.emit({ type: "start", key, step });
         const d = store.entry(key)?.data;
         if (!d) return;
-        const payer = new PublicKey(d.subarray(8, 40));
+        const payer = new PublicKey(d.subarray(CHUNK_PAYER_OFFSET, CHUNK_PAYER_OFFSET + 32));
         const r = await send(() => ixs.grow(cx, cz, payer), { gen: true });
-        if (!this.ok(r, key, step)) return;
+        if (!this.ok(r, key, step) || this.disposed) return;
         step = "populate";
       }
+      if (this.disposed) return;
       this.inflight.set(key, step);
       this.emit({ type: "start", key, step });
       const r = await send(() => ixs.populate(cx, cz), { gen: true });
@@ -194,7 +242,7 @@ export class AutoCreator {
       this.backoff.delete(key);
       this.emit({ type: "done", key });
     } finally {
-      await store.refresh(key);
+      if (!this.disposed) await store.refresh(key);
       this.inflight.delete(key);
       this.emit({ type: "state" });
       if (!this.disposed) setTimeout(() => this.tick(), 0);
@@ -203,7 +251,10 @@ export class AutoCreator {
 
   private ok(r: SendResult, key: string, step: Step): boolean {
     if (r.status === "confirmed") return true;
-    if (r.status === "superseded") return false;
+    if (r.status === "superseded") {
+      this.backoff.set(key, { until: this.now() + 1000, fails: this.backoff.get(key)?.fails ?? 0 });
+      return false;
+    }
     const f = r.error;
     this.emit({ type: "failed", key, step, failure: f });
     if (f.kind === "topup" || f.kind === "renewSession") {

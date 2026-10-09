@@ -13,7 +13,7 @@
 // - Implements `ChunkView` (`exists` / `ready`) for the chain builders and `getBlock` for
 //   physics (Task 25).
 import type { AccountInfo, Connection, PublicKey } from "@solana/web3.js";
-import { accountKind, CHUNK_HEADER_SIZE, chunkBlocks, chunkPda, chunkReady, chunkKey, GEN_DONE, type ChunkView } from "../chain";
+import { accountKind, CHUNK_GEN_STAGE_OFFSET, CHUNK_HEADER_SIZE, chunkBlocks, chunkPda, chunkReady, chunkKey, GEN_DONE, type ChunkView } from "../chain";
 import { borderOf, DIRS } from "./mesher";
 
 export type StoreConn = Pick<
@@ -103,16 +103,20 @@ export class ChunkStore implements ChunkView {
     return this.get(cx, cz)?.status === "missing";
   }
 
-  /** Block id at world block coords; null when that chunk isn't loaded / has no blocks.
-   *  Above the world: air (0); below: null. */
+  /** Block id at **integer** world block coords (callers floor positions first).
+   *
+   *  Contract (physics, Task 25): `null` = unknown — the chunk is not loaded, does not
+   *  exist, or is not fully generated (`gen_stage != DONE`; its blocks may still change and
+   *  the chain rejects moves into it) — and must be treated as **solid**. y < 0 is null
+   *  (solid); y ≥ 64 is air (0). */
   getBlock(x: number, y: number, z: number): number | null {
     if (y >= 64) return 0;
     if (y < 0) return null;
     const cx = Math.floor(x / 16);
     const cz = Math.floor(z / 16);
-    const b = this.get(cx, cz)?.blocks;
-    if (!b) return null;
-    return b[(y * 16 + (z - cz * 16)) * 16 + (x - cx * 16)];
+    const e = this.get(cx, cz);
+    if (!e?.blocks || e.genStage !== GEN_DONE) return null;
+    return e.blocks[(y * 16 + (z - cz * 16)) * 16 + (x - cx * 16)];
   }
 
   /** Mesher input for `key` (copies), or null when it has no blocks. */
@@ -217,7 +221,7 @@ export class ChunkStore implements ChunkView {
     e.version++;
     e.status = data ? "present" : "missing";
     e.data = data;
-    e.genStage = data ? data[82] : -1;
+    e.genStage = data ? data[CHUNK_GEN_STAGE_OFFSET] : -1;
     e.blocks = data ? chunkBlocks(data) : null;
     const next = e.blocks;
     if (!prev !== !next) {
