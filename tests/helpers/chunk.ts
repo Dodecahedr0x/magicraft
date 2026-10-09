@@ -127,11 +127,12 @@ export async function createAndGrow(
   world: web3.PublicKey,
   cx: number,
   cz: number,
-  neighbor: web3.PublicKey | null = null
+  neighbor: web3.PublicKey | null = null,
+  units = 1_400_000
 ): Promise<string> {
   return sendEr(
     [
-      computeBudgetIx(),
+      computeBudgetIx(units),
       await createChunkIx(p, world, cx, cz, { neighbor }),
       await growChunkIx(p.player, world, cx, cz),
     ],

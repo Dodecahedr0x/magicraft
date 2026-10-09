@@ -379,7 +379,9 @@ describe("chunks", () => {
     expect(await openChunks(p)).to.equal(opened - 1);
     expect(await chunkCount(world)).to.equal(count - 1);
 
-    await createAndGrow(p, world, -1, 0, c00());
+    // A different CU limit keeps this tx distinct from the first create + grow, which may
+    // still be within the same blockhash ("already processed" otherwise).
+    await createAndGrow(p, world, -1, 0, c00(), 1_399_999);
     await populate(world, -1, 0);
     const d = (await chunkData(chunkPda(world, -1, 0)))!;
     expect(firstDiff(blocksOf(d), ref(-1, 0).blocks)).to.equal(-1);
