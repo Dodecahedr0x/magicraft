@@ -48,18 +48,22 @@
 //! # Cost: hard bound (modeled SBF ops ≈ CU)
 //! A chunk whose `populate_chunk` exceeded the budget would be stuck at `gen_stage 1`
 //! forever, so every term is bounded by construction; [`STAGE2_OPS_BOUND`] sums them and
-//! is const-asserted ≤ 800k: ix overhead 30k (assumed) + Stage1Info rebuild 73k + worm
-//! replay 57k + column ceilings 15k + neighbor heights 158k (4 strips × 25k + 4 corners ×
-//! 14.5k) + trees 69k + misc 4k + caves ≤ [`CAVE_OPS_CAP`] 380k = **786k**. The op
-//! constants are hand counts of the inner loops, not SBF measurements; the cave cap is
-//! a true hard limit on modeled ops, the other terms are worst-case loop counts.
+//! is const-asserted ≤ 800k **modeled** ops: ix overhead 30k (assumed) + Stage1Info rebuild
+//! 73k + worm replay 57k + column ceilings 15k + neighbor heights 158k (4 strips × 25k + 4
+//! corners × 14.5k) + trees 69k + misc 4k + caves ≤ [`CAVE_OPS_CAP`] 380k = **786k**. The op
+//! constants are hand counts of the inner loops; the cave cap is a true hard limit on modeled
+//! ops, the other terms are worst-case loop counts.
+//!
+//! **SBF-measured (Task 17, `docs/notes/spikes.md`):** the model is far off for the height
+//! terms: one side strip ([`heights_cols`]) costs ≈ 125k CU (modeled 25k), a corner ≈ 100k;
+//! carving costs ≈ 0.88 CU per modeled cave op; Stage1Info rebuild 17-58k; trees without a
+//! corner 8-35k. Whole `populate_chunk`: 587k-802k over 50 chunks. Real worst case ≈ 100k +
+//! 4 × 125k + 4 × 110k + 0.9 × 380k + 34k ≈ **1.42M CU** (cap and 4 corners at once; never
+//! observed — over 10^6 chunks the same model gives p99.999 1.09M, max 1.13M).
 //!
 //! Measured: `scan_cave_tail` (10^6 chunks) — cave demand mean 55k, p99 163k, p99.999
 //! 288k, max 340k (cap never hit); side strips loaded avg 3.93 (max 4), corners avg 0.07
-//! (p99.999 3, max 4). `bench_stage2` (native release): stage 2 ≈ 1.6× stage 1 on average,
-//! ≈ 2.2–2.7× worst chunk; one strip ≈ 20% of a stage 1 (≈ 20–25k est.). Caveat: native
-//! time ratios only approximate SBF CU ratios (different ISA, no bounds-check elision
-//! guarantees, 64-bit multiply cost); measure real CU once `populate_chunk` exists.
+//! (p99.999 3, max 4).
 //!
 //! # SBF stack (4 KB per frame)
 //! [`generate_stage2`] frame ≈ 0.5 KB ([`HeightWindow`] is 420 B); [`carve_caves`] ≈ 1.2 KB;
@@ -486,6 +490,47 @@ pub fn spawn_animals(
         n += 1;
     }
     n
+}
+
+/// World spawn inside a populated chunk (`populate_chunk` of `(0,0)`): the feet block
+/// `(lx, y, lz)` above the **topmost** non-air block of the column nearest the chunk center
+/// (squared distance to `(7.5, 7.5)`, ties → lower `lz * 16 + lx`) whose topmost non-air
+/// block is solid ground (not fluid, Leaves, Log or Cactus) with 2 air above (`y + 1 < 64`).
+/// Fallback when no column qualifies (e.g. open sea): the center column `(8, top + 1, 8)`
+/// (clamped to `y ≤ 62`). Pure; cost ≤ 256 column scans (≈ 256 × 40 × ~5 ≈ 50k ops).
+#[inline(never)]
+pub fn spawn_point(blocks: &[u8; CHUNK_VOL]) -> (u8, u8, u8) {
+    let top = |c: usize| -> usize {
+        let mut y = CHUNK_H - 1;
+        while y > 0 && blocks[y * 256 + c] == Block::Air as u8 {
+            y -= 1;
+        }
+        y
+    };
+    let mut best: Option<(i32, usize, usize)> = None; // (d2, column, y)
+    for c in 0..256 {
+        let (lx, lz) = ((c % 16) as i32, (c / 16) as i32);
+        let d2 = (2 * lx - 15).pow(2) + (2 * lz - 15).pow(2);
+        if best.is_some_and(|(bd, _, _)| bd <= d2) {
+            continue;
+        }
+        let y = top(c);
+        let b = blocks[y * 256 + c];
+        let ground = crate::blocks::is_solid_u8(b)
+            && b != Block::Leaves as u8
+            && b != Block::Log as u8
+            && b != Block::Cactus as u8;
+        if ground && y + 2 < CHUNK_H {
+            best = Some((d2, c, y));
+        }
+    }
+    match best {
+        Some((_, c, y)) => ((c % 16) as u8, y as u8 + 1, (c / 16) as u8),
+        None => {
+            let c = 8 * 16 + 8;
+            (8, (top(c) + 1).min(CHUNK_H - 2) as u8, 8)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1128,5 +1173,40 @@ mod tests {
         );
         println!("side loads:   mean/p99/p99.999/max {:?}", pick(|r| r.2));
         println!("corner loads: mean/p99/p99.999/max {:?}", pick(|r| r.3));
+    }
+
+    #[test]
+    fn spawn_point_rules() {
+        let flat = |h: usize, top: Block| {
+            let mut b = [Block::Air as u8; CHUNK_VOL];
+            for y in 0..h {
+                b[y * 256..(y + 1) * 256].fill(Block::Stone as u8);
+            }
+            b[h * 256..(h + 1) * 256].fill(top as u8);
+            b
+        };
+        // Flat grass: the nearest-center column (7, 7) wins ties by index.
+        let b = flat(30, Block::Grass);
+        assert_eq!(spawn_point(&b), (7, 31, 7));
+        // A tree on (7, 7) and a pillar of water on (8, 7) push it to (7, 8).
+        let mut b = flat(30, Block::Grass);
+        b[block_index(7, 31, 7)] = Block::Log as u8;
+        b[block_index(7, 35, 7)] = Block::Leaves as u8;
+        b[block_index(8, 31, 7)] = Block::WaterSource as u8;
+        assert_eq!(spawn_point(&b), (7, 31, 8));
+        // All water: fallback above the center column's water surface.
+        let b = flat(28, Block::WaterSource);
+        assert_eq!(spawn_point(&b), (8, 29, 8));
+        // Real terrain: feet + head are air, ground below is solid.
+        let s = seed(7);
+        let mut b = [0u8; CHUNK_VOL];
+        let mut info = Stage1Info::EMPTY;
+        generate_stage1(&s, 0, 0, &mut b, &mut info);
+        let mut mobs = [MobSpawn::default(); MAX_SPAWNS];
+        generate_stage2(&s, 0, 0, &mut b, &info, &mut mobs);
+        let (x, y, z) = spawn_point(&b);
+        let (x, y, z) = (x as usize, y as usize, z as usize);
+        assert_eq!(b[block_index(x, y, z)], Block::Air as u8);
+        assert_eq!(b[block_index(x, y + 1, z)], Block::Air as u8);
     }
 }

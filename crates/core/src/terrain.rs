@@ -41,13 +41,13 @@
 //! below `STONE_LINE` (42), bare Stone in `STONE_LINE..=SNOW_LINE`, Snow over Stone above
 //! `SNOW_LINE` (50).
 //!
-//! # Cost estimate (SBF ops ≈ CU)
-//! `generate_stage1`: 4 `fbm_chunk` (3 biome channels × 2 oct + height × 3 oct ≈ 9 octave
-//! passes × 256 × ~20 ops ≈ 46k + corner hashing) + 3 `fbm_grid9` (6 passes × 81 × ~20 ≈ 10k)
-//! ≈ 60k; classification of 81 + 256 points ≈ 5k; box sums + bilinear + height ≈ 10k; column
-//! fill touches only layers `min(h)−3 ..= max(max h, SEA_LEVEL)` per byte (typically 15–35
-//! layers × 256 ≈ 4–9k bytes × ~5 ops ≈ 20–45k); the remaining layers are bulk `fill`s.
-//! Total ≈ 100–120k ops, well under the 600k target.
+//! # Cost (SBF-measured, Task 17; see `docs/notes/spikes.md`)
+//! `generate_stage1` ≈ **556k CU**: [`biomes_chunk`] 257k, [`heights_chunk`] 263k, column fill
+//! ≈ 36k (only layers `min(h)−3 ..= max(max h, SEA_LEVEL)` per byte; the rest are bulk
+//! `fill`s). One 256-column octave pass of `fbm_chunk` ≈ 42k (≈ 165 CU per column, ~8× the
+//! original hand count of ~20 ops). [`heights_cols`] for a 2×16 strip ≈ 125k (mostly
+//! `chunk_sums`). Measured with `overflow-checks = false` for this crate in release (checked
+//! `i64` multiply is a software routine on SBF and made stage 1 exceed 1.4M CU).
 //!
 //! # SBF stack (4 KB per frame)
 //! The heavy functions are `#[inline(never)]` so their locals never pile up in one frame.

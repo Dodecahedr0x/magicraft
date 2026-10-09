@@ -59,3 +59,7 @@ Recorded 2026-10-09 when scaffolding the workspace (Task 1). `anchor build` and
   modular 3.x crates); this compiles cleanly for SBF.
 - The `#[ephemeral]` macro adds a `process_undelegation` instruction to the IDL next to
   `ping`.
+- **`magicraft-core` builds without overflow checks in release** (`[profile.release.package.magicraft-core]
+  overflow-checks = false`, Task 17): checked `i64` multiplication is a software routine on SBF and
+  pushed terrain stage 1 past the 1.4M CU limit (≈ 2.5× slower). Debug/test builds keep the checks;
+  the program crate keeps them in release.

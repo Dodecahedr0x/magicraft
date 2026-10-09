@@ -114,7 +114,9 @@ Deterministic integer math on `hash(world.seed, …)`; independent of chunk crea
   bounded by construction: cave carving stops taking spheres at a modeled 380k ops (measured over
   10^6 chunks: p99.999 288k, max 340k — never hit), and the const `STAGE2_OPS_BOUND` (≈ 786k
   modeled ops incl. 30k ix overhead) is asserted ≤ 800k. Native timing: stage 2 ≈ 1.6× stage 1
-  on average (native ratios only approximate SBF CU; re-measure onchain).
+  on average. **SBF-measured (Task 17):** create + grow tx 604k-632k CU, populate 587k-802k
+  (dominated by the 4 neighbor height strips, ≈ 125k each); modeled max over 10^6 chunks 1.13M,
+  construction bound ≈ 1.42M (see `docs/notes/spikes.md`).
 
 Generation is compute-heavy: anything computed per block costs ≥ ~7 CU per byte (measured:
 16 384 computed bytes ≈ 115k CU above baseline; bulk fills/copies are nearly free), so generation

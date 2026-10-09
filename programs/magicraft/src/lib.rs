@@ -71,6 +71,29 @@ pub mod magicraft {
         instructions::world::callback_seed(ctx, randomness)
     }
 
+    // ----- Chunks (ER) -----
+
+    /// Creates `Chunk (cx, cz)` (10 240 B, `gen_stage 0`) + its empty presence list,
+    /// sponsored by the Player. Same tx: `grow_chunk`.
+    pub fn create_chunk(ctx: Context<CreateChunk>, cx: i32, cz: i32) -> Result<()> {
+        instructions::chunk::create_chunk(ctx, cx, cz)
+    }
+
+    /// Resizes the chunk to full size and writes stage-1 terrain (`gen_stage 1`).
+    pub fn grow_chunk(ctx: Context<GrowChunk>, cx: i32, cz: i32) -> Result<()> {
+        instructions::chunk::grow_chunk(ctx, cx, cz)
+    }
+
+    /// Stage 2 (caves, ores, trees, animals; spawn for (0,0)). Permissionless.
+    pub fn populate_chunk(ctx: Context<PopulateChunk>, cx: i32, cz: i32) -> Result<()> {
+        instructions::chunk::populate_chunk(ctx, cx, cz)
+    }
+
+    /// Closes an unedited, empty chunk + presence; refunds the payer Player.
+    pub fn close_chunk(ctx: Context<CloseChunk>, cx: i32, cz: i32) -> Result<()> {
+        instructions::chunk::close_chunk(ctx, cx, cz)
+    }
+
     // ----- Day crank (ER) -----
 
     /// (Re)arms the World's day crank (permissionless, idempotent).

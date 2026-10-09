@@ -14,3 +14,10 @@ codegen-units = 1
 opt-level = 3
 incremental = false
 codegen-units = 1
+
+# magicraft-core is integer-only and tested for overflow in debug builds (checks on); in the
+# SBF release build checked arithmetic (notably i64 multiply, emulated via 128-bit routines)
+# made stage 1 cost > 1.4M CU instead of ~0.55M (docs/notes/spikes.md, Task 17). The program
+# crate keeps overflow checks. Results are identical whenever no overflow occurs.
+[profile.release.package.magicraft-core]
+overflow-checks = false

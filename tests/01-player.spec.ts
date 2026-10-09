@@ -24,6 +24,13 @@ import {
   until,
   waitForEr,
 } from "./helpers/player";
+import {
+  chunkPda,
+  CHUNK_TOTAL_RENT,
+  createAndGrow,
+  SPONSOR_RESERVE_MARGIN,
+} from "./helpers/chunk";
+import { setupWorld } from "./helpers/world";
 
 async function lamports(conn: web3.Connection, pk: web3.PublicKey) {
   return (await conn.getAccountInfo(pk, "confirmed"))?.lamports ?? 0;
@@ -232,11 +239,6 @@ describe("player lifecycle: top-up and withdraw", () => {
     expect(acc.openChunks).to.equal(0);
   });
 
-  // TODO(Task 17): needs create_chunk.
-  it.skip("withdraw with an open chunk succeeds; base reflects the chunk rent spent on the ER", () => {});
-  // TODO(Task 17): needs create_chunk.
-  it.skip("sponsoring stops at rent_exempt(Player) + margin (InsufficientSponsorFunds)", () => {});
-
   it("withdraw_base rejects more than the balance above rent-exempt", async () => {
     const available = (await lamports(baseConn, p.player)) - rentExempt;
     const err = await p.base.methods
@@ -264,5 +266,71 @@ describe("player lifecycle: top-up and withdraw", () => {
     expect(
       (await lamports(baseConn, p.authority.publicKey)) - walletBefore
     ).to.equal(available - 5_000); // minus the base tx fee
+  });
+});
+
+describe("player sponsoring with chunks", () => {
+  it("withdraw with an open chunk succeeds; base reflects the chunk rent spent on the ER", async () => {
+    const { p, world } = await setupWorld({ depositSol: 0.05 });
+    const baseAtSync = await lamports(baseConn, p.player);
+    const erAtSync = baseAtSync; // nothing committed since delegation
+    await createAndGrow(p, world, 0, 0);
+    const erBefore = await lamports(erConn, p.player);
+    expect((await p.er.account.player.fetch(p.player)).openChunks).to.equal(1);
+
+    await sendEr(
+      [
+        await p.er.methods
+          .withdraw()
+          .accounts({ authority: p.authority.publicKey })
+          .instruction(),
+      ],
+      [p.authority]
+    );
+    const info = await until(
+      async () => {
+        const i = await baseConn.getAccountInfo(p.player, "confirmed");
+        return i?.owner.equals(p.base.programId) ? i : null;
+      },
+      30_000,
+      200
+    );
+    expect(info, "Player owned by magicraft on base again").to.not.be.null;
+    // ER spend = World rent + VRF request (if any) + chunk rent; base moves by it.
+    expect(erAtSync - erBefore).to.be.at.least(CHUNK_TOTAL_RENT);
+    expect(info!.lamports).to.equal(baseAtSync + (erBefore - erAtSync));
+    const acc = p.base.coder.accounts.decode("player", info!.data);
+    expect(acc.openChunks).to.equal(1); // UI warning only; withdraw not blocked
+    // The open chunk survives the sponsor's undelegation on the ER.
+    const chunk = await erConn.getAccountInfo(
+      chunkPda(world, 0, 0),
+      "confirmed"
+    );
+    expect(chunk?.data.length).to.equal(17_152);
+  });
+
+  it("sponsoring stops at rent_exempt(Player) + margin (InsufficientSponsorFunds)", async () => {
+    // A rich player owns the seeded world; poor players create its first chunk
+    // (any session-authed delegated Player may sponsor (0,0)). A Player starts
+    // with rent_exempt + deposit, so the deposit is exactly its spendable excess.
+    const { world } = await setupWorld({ depositSol: 0.05 });
+    const need = CHUNK_TOTAL_RENT + SPONSOR_RESERVE_MARGIN;
+    const short = await setupPlayer({ depositSol: (need - 1) / LAMPORTS });
+    const err = await createAndGrow(short, world, 0, 0).then(
+      () => null,
+      (e: TxError) => e
+    );
+    expect(err?.code, String(err)).to.equal("InsufficientSponsorFunds");
+    expect(err?.number).to.equal(6104);
+
+    const exact = await setupPlayer({ depositSol: need / LAMPORTS });
+    await createAndGrow(exact, world, 0, 0);
+    const info = await erConn.getAccountInfo(exact.player, "confirmed");
+    // (The ER's getMinimumBalanceForRentExemption returns 0; the program's Rent
+    // sysvar matches base.)
+    const rentMin = await baseConn.getMinimumBalanceForRentExemption(
+      info!.data.length
+    );
+    expect(info!.lamports).to.equal(rentMin + SPONSOR_RESERVE_MARGIN);
   });
 });

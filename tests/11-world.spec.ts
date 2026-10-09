@@ -1,6 +1,6 @@
 // Worlds: create_world (ephemeral, Player-sponsored, arms the day crank),
 // request_seed / callback_seed (VRF inside the ER), schedule_day_crank / tick_day.
-import { createHash, randomBytes } from "crypto";
+import { randomBytes } from "crypto";
 import { expect } from "chai";
 import { BN, web3 } from "@anchor-lang/core";
 import {
@@ -9,142 +9,39 @@ import {
   erConn,
   erProgram,
   sendEr,
-  TxError,
 } from "./helpers/env";
 import { setupPlayer, sleep, TestPlayer, until } from "./helpers/player";
 import { createSessionIx, sessionTokenPda } from "./helpers/session";
-
-const WORLD_LEN = 265;
-/** Ephemeral rent: (data_len + 60) * 32 lamports. */
-const ephemeralRent = (len: number) => (len + 60) * 32;
-
-/** core::physics::WorldParams::default(), with a 60 s day for the tests. */
-const PARAMS = {
-  walkSpeed: 1101,
-  sprintSpeed: 1434,
-  swimSpeed: 512,
-  jumpVelocity: 2290,
-  gravity: 8192,
-  maxFallSpeed: 19968,
-  reach: 1280,
-  attackCooldownMs: 600,
-  daySecs: 60,
-  mobTickMs: 333,
-  fluidTickMs: 250,
-  fallDamage: 1,
-  hunger: 1,
-  zombieCapPerChunk: 4,
-  pad: 0,
-};
-function params(over: Partial<typeof PARAMS> = {}) {
-  const p = { ...PARAMS, ...over };
-  const { daySecs, ...rest } = p;
-  return { ...rest, dayLengthSecs: daySecs };
-}
-
-const programId = erProgram.programId;
-
-function worldPda(creator: web3.PublicKey, nonce: BN): web3.PublicKey {
-  return web3.PublicKey.findProgramAddressSync(
-    [
-      Buffer.from("world"),
-      creator.toBuffer(),
-      nonce.toArrayLike(Buffer, "le", 8),
-    ],
-    programId
-  )[0];
-}
-
-/** Day-crank task id: first 8 bytes of sha256("day" ‖ world), LE, masked positive. */
-function dayTaskId(world: web3.PublicKey): bigint {
-  const h = createHash("sha256")
-    .update(Buffer.from("day"))
-    .update(world.toBuffer())
-    .digest();
-  const id = h.readBigInt64LE(0) & 0x7fff_ffff_ffff_ffffn;
-  return id === 0n ? 1n : id;
-}
-
-const nameBytes = (s: string) => {
-  const b = Buffer.alloc(32);
-  b.write(s, "utf8");
-  return [...b];
-};
-
-async function fetchWorld(world: web3.PublicKey) {
-  const info = await erConn.getAccountInfo(world, "confirmed");
-  if (!info) return null;
-  return { info, acc: erProgram.coder.accounts.decode("world", info.data) };
-}
-
-async function cu(sig: string): Promise<number | undefined> {
-  const tx = await erConn.getTransaction(sig, {
-    commitment: "confirmed",
-    maxSupportedTransactionVersion: 0,
-  });
-  return tx?.meta?.computeUnitsConsumed;
-}
-
-const fails = (p: Promise<unknown>) =>
-  p.then(
-    () => null,
-    (e: TxError) => e
-  );
-
-let nonceCounter = Date.now();
-const freshNonce = () => new BN(nonceCounter++);
+import {
+  createWorldIx as createWorldIxFor,
+  cu,
+  dayTaskId,
+  ephemeralRent,
+  fails,
+  fetchWorld,
+  freshNonce,
+  params,
+  programId,
+  requestSeedIx as requestSeedIxFor,
+  waitSeed,
+  WORLD_LEN,
+  worldPda,
+} from "./helpers/world";
 
 describe("world", () => {
   let p: TestPlayer;
 
-  async function createWorldIx(o: {
-    nonce: BN;
-    params?: ReturnType<typeof params>;
-    signer?: web3.PublicKey;
-    sessionToken?: web3.PublicKey | null;
-  }) {
-    return p.er.methods
-      .createWorld(o.nonce, nameBytes("test world"), o.params ?? params())
-      .accountsPartial({
-        signer: o.signer ?? p.authority.publicKey,
-        player: p.player,
-        sessionToken: o.sessionToken ?? null,
-        world: worldPda(p.authority.publicKey, o.nonce),
-      })
-      .instruction();
-  }
-
-  async function requestSeedIx(
+  const createWorldIx = (o: Parameters<typeof createWorldIxFor>[1]) =>
+    createWorldIxFor(p, o);
+  const requestSeedIx = (
     world: web3.PublicKey,
-    o: { signer?: web3.PublicKey; sessionToken?: web3.PublicKey | null } = {}
-  ) {
-    return p.er.methods
-      .requestSeed([...randomBytes(32)])
-      .accountsPartial({
-        signer: o.signer ?? p.authority.publicKey,
-        player: p.player,
-        sessionToken: o.sessionToken ?? null,
-        world,
-        oracleQueue: ER_TEST_QUEUE,
-      })
-      .instruction();
-  }
+    o: Parameters<typeof requestSeedIxFor>[2] = {}
+  ) => requestSeedIxFor(p, world, o);
 
   async function newWorld(): Promise<web3.PublicKey> {
     const nonce = freshNonce();
     await sendEr([await createWorldIx({ nonce })], [p.authority]);
     return worldPda(p.authority.publicKey, nonce);
-  }
-
-  async function waitSeed(world: web3.PublicKey, timeoutMs = 10_000) {
-    return until(
-      async () => {
-        const w = await fetchWorld(world);
-        return w?.acc.seedSet ? w : null;
-      },
-      timeoutMs,
-      20
-    );
   }
 
   before(async () => {
@@ -288,7 +185,8 @@ describe("world", () => {
     const accepted = sent.filter((r) => r.status === "fulfilled").length;
     for (const r of sent) {
       if (r.status === "rejected") {
-        expect(String(r.reason)).to.include("AccountDataTooSmall");
+        // Queue full, or the first callback already landed before this request.
+        expect(String(r.reason)).to.match(/AccountDataTooSmall|SeedAlreadySet/);
       }
     }
     const first = await waitSeed(w2);

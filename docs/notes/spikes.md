@@ -517,3 +517,52 @@ Test: `tests/11-world.spec.ts`. Measured on the local stack (CU of the whole ix)
   stays usable for re-requests while `seed_set == false`). Any session-authed delegated Player may
   pay `request_seed` (VRF output is unbiasable). While `!seed_set`, `tick_day` only records
   liveness (no re-anchor, `time_of_day` stays 0).
+
+## 2026-10-09: Chunk generation and reclaim (Task 17, permanent code)
+
+Test: `tests/12-chunk.spec.ts` (+ the two chunk tests in `01-player.spec.ts`). Reference bytes
+come from `cargo run --release -p magicraft-core --example gen -- <seed_hex> <cx> <cz>`
+(`crates/core/examples/gen.rs`); stage-1 blocks, biomes, final blocks, animals and the spawn all
+match the onchain result byte for byte, and a closed chunk regenerates identically.
+
+**SBF-measured CU** (local ER, whole ix incl. Anchor; tx = 1.4M ComputeBudget limit):
+
+| Ix / tx | CU |
+|---|---|
+| `create_chunk` (2 ephemeral creates, 1 bump search each for chunk + presence) | 17.7k-28.2k |
+| `grow_chunk` (resize + `generate_stage1`; varies with the seed / terrain) | 584k-604k |
+| tx 1: ComputeBudget + `create_chunk` + `grow_chunk` | 604k-632k |
+| `populate_chunk` (tx 2; incl. spawn search for (0,0)) | 587k-802k over 50 chunks (2 seeds), typical 620k-700k |
+| `close_chunk` (2 ephemeral closes; no crank to cancel yet) | 17.1k |
+
+Stage-1 split (profiled with `sol_log_compute_units`): `biomes_chunk` 257k, `heights_chunk` 263k,
+`generate_stage1` total ≈ 556k. Stage-2 split: `stage1_info_from_blocks` 17k-58k; caves ≈ 535k
+of which ≈ 500k is the 4 neighbor height strips (`heights_cols` ≈ 125k each, always loaded) and
+≈ 0.88 CU per modeled cave op (cap 380k modeled → ≤ ≈ 335k CU); ores ≈ 4.5k; trees 8k-35k, or
+≈ 105k-128k when a diagonal corner is loaded (≈ 100k per corner); cacti + animals < 1k.
+
+**The hand estimates were ~5× low** (stage 1 modeled 100-120k → 556k measured; one side strip
+modeled 20-25k → 125k). The value-noise grids (`fbm_grid`, ≈ 165 CU per column per octave) and
+`chunk_sums` dominate. And **with overflow checks on, stage 1 did not fit at all**:
+`biomes_chunk` 668k + `heights_chunk` > 696k → `grow_chunk` hit the 1.4M limit. Checked `i64`
+multiplication on SBF is a software routine. Fix: `[profile.release.package.magicraft-core]
+overflow-checks = false` in the workspace `Cargo.toml` (core keeps checks in debug/test builds,
+where every overflow would panic; results are identical whenever nothing overflows; the program
+crate keeps its checks).
+
+**Worst case populate** (no split needed, but little headroom): modeled per chunk from the
+`scan_cave_tail` stats (10^6 chunks) as 100k fixed + 125k × side strips + 110k × corners +
+0.9 × cave ops + 34k trees: p50 682k (matches the measured ≈ 650k), p99 843k, p99.999 1.09M,
+**max 1.13M** (none > 1.2M). The construction bound (cave cap fully used **and** 4 corners) is
+≈ 1.42M, i.e. a chunk could in principle exceed 1.4M and stay at `gen_stage 1`; never observed.
+If that matters, the cheapest lever is the noise grid inner loop (core), not another split
+(caves and trees share the neighbor height window, which is the bulk of the cost).
+
+Other findings:
+- `AccountInfo::data_len()` borrows the data: calling it while a `RefMut` of the same account is
+  alive panics (`solana-account-info` lib.rs:105). Read the length first.
+- The ER's `getMinimumBalanceForRentExemption` returns 0; the program's `Rent` sysvar matches the
+  base layer (1 621 680 for the 105-byte Player).
+- Rent per chunk: (17 152 + 60) × 32 + (48 + 60) × 32 = **554 240** lamports (create 333 056,
+  grow +221 184), refunded exactly by `close_chunk`; a chunk closed before growing refunds
+  333 056.

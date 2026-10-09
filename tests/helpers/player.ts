@@ -83,7 +83,7 @@ export async function setupPlayer(opts: { depositSol: number }) {
   const tx = new web3.Transaction().add(
     ...(await initDepositDelegateIxs(
       authority.publicKey,
-      opts.depositSol * LAMPORTS
+      Math.round(opts.depositSol * LAMPORTS)
     ))
   );
   await base.provider.sendAndConfirm!(tx, [], { skipPreflight: true });
