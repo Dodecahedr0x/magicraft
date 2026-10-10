@@ -14,7 +14,8 @@
 // Env (defaults = MagicBlock devnet EU): SMOKE_BASE_RPC, SMOKE_ER_RPC, SMOKE_ER_VALIDATOR,
 // SMOKE_PROGRAM_ID, SMOKE_DEPOSIT_SOL (0.05), SMOKE_TOPUP_SOL (0.01), SMOKE_OUT (JSON
 // results file), SMOKE_LATE_MOVES_AFTER_S (0 = off: wait, sampling the World clock, then walk
-// again). A wallet whose Player is still delegated from an earlier run resumes after onboarding. Every step is recorded as works / fails (+ error); the script continues
+// again). A wallet whose Player is still delegated from an earlier run resumes after onboarding;
+// one withdrawn by an earlier run is re-funded and re-delegated. Every step is recorded as works / fails (+ error); the script continues
 // past failures where later steps do not depend on them.
 import { readFileSync, writeFileSync } from "node:fs";
 import {
@@ -62,6 +63,7 @@ import {
 import { chunkKey, chunkPda, presencePda, pstatePda, worldPda } from "../app/src/chain/pdas";
 import {
   eSplRentPda,
+  onboardingIxs,
   onboardingTx,
   playerStatus,
   topUpIx,
@@ -301,7 +303,10 @@ async function main() {
       player = pre.player;
       return { resumed: "Player already delegated (earlier run)", erLamports: pre.erLamports, player: player.toBase58() };
     }
-    await sendBase(await onboardingTx(program, cfg, base, wallet.publicKey, DEPOSIT), "onboarding");
+    if (pre.state === "base")
+      // Withdrawn by an earlier run: deposit + delegate again (init_player would fail).
+      await sendBase(await walletTx(base, wallet.publicKey, (await onboardingIxs(program, cfg, wallet.publicKey, DEPOSIT)).slice(1)), "onboarding");
+    else await sendBase(await onboardingTx(program, cfg, base, wallet.publicKey, DEPOSIT), "onboarding");
     const baseMs = Date.now() - t0;
     const st = await until(
       async () => {
@@ -332,50 +337,15 @@ async function main() {
 
   // 3. World + VRF seed (Player PDA pays the VRF request on DEFAULT_EPHEMERAL_QUEUE)
   const params = { ...DEFAULT_WORLD_PARAMS, zombieCapPerChunk: 0, dayLengthSecs: 120 };
-  const nonce = freshNonce();
-  const world = worldPda(pid, wallet.publicKey, nonce);
+  let nonce = 0n;
+  let world = PublicKey.default;
   let hint = 0;
   await step("measure the ER slot rate (create_world hint)", async () => {
     hint = await measureUsPerSlot(er);
     if (!hint) throw new Error("slot did not advance");
     return { usPerSlot: hint };
   });
-  await step("create_world (session-signed, 0-lamport fee payer)", async () => {
-    const before = await erLamports(player);
-    const r = await ok("create_world", async () => [await createWorldIx(program, auth, nonce, "devnet smoke", params, hint)]);
-    return {
-      sig: r.sig,
-      confirmMs: r.ms,
-      cu: await cu(r.sig),
-      world: world.toBase58(),
-      playerErDelta: (await erLamports(player)) - before,
-      sessionKeyErLamports: await erLamports(session.kp.publicKey),
-    };
-  });
-  await step("request_seed (Player PDA payer, DEFAULT_EPHEMERAL_QUEUE) → seed arrives", async () => {
-    const before = await erLamports(player);
-    const queueBefore = await erLamports(DEFAULT_EPHEMERAL_QUEUE);
-    const r = await ok("request_seed", async () => [await requestSeedIx(program, auth, world)]);
-    const t0 = Date.now();
-    const w = await until(
-      async () => {
-        const d = await account(world);
-        return d && decodeWorld(d).seedSet ? decodeWorld(d) : null;
-      },
-      60_000,
-      "VRF seed",
-    );
-    return {
-      sig: r.sig,
-      cu: await cu(r.sig),
-      seedAfterMs: Date.now() - t0,
-      playerErDelta: (await erLamports(player)) - before,
-      queueErDelta: (await erLamports(DEFAULT_EPHEMERAL_QUEUE)) - queueBefore,
-      seedPrefix: Buffer.from(w.seed.subarray(0, 4)).toString("hex"),
-    };
-  });
-
-  // 4. Chunk (0,0) + spawn
+  // 4. Chunk helpers (per world)
   const existing = new Set<string>();
   const view = () => viewOf(existing);
   const generate = async (cx: number, cz: number) => {
@@ -386,48 +356,97 @@ async function main() {
     return { createGrow: { ms: a.ms, cu: await cu(a.sig) }, populate: { ms: b.ms, cu: await cu(b.sig) } };
   };
   const blocksOf = async (cx: number, cz: number) => chunkBlocks((await account(chunkPda(pid, world, cx, cz)))!)!;
-  await step("chunk (0,0): create_chunk + grow_chunk, populate_chunk (CU)", async () => {
-    const before = await erLamports(player);
-    const g = await generate(0, 0);
-    return { ...g, playerErDelta: (await erLamports(player)) - before };
-  });
   let spawn!: V3;
-  await step("set_spawn", async () => {
-    const r = await ok("set_spawn", async () => [await setSpawnIx(program, world)]);
-    spawn = decodeWorld((await account(world))!).spawn;
-    return { cu: await cu(r.sig), spawn };
-  });
-
-  // Path from spawn into a neighbor ending on a hand-breakable block (like live.test.ts).
   let path: V3[] = [];
   let target: [number, number] | null = null;
-  await step("neighbors: generate until a walkable border crossing exists", async () => {
-    const made: string[] = [];
-    for (const t of [
-      [1, 0],
-      [-1, 0],
-      [0, 1],
-      [0, -1],
-    ] as [number, number][]) {
-      await generate(t[0], t[1]);
-      made.push(chunkKey(...t));
-      const blocks = new Map([
-        ["0,0", await blocksOf(0, 0)],
-        [chunkKey(...t), await blocksOf(...t)],
-      ]);
-      const p = planWalk(blocks, [spawn[0], spawn[2]], t);
-      if (!p || p.length < 2) continue;
-      const [x, y, z] = p[p.length - 1];
-      const under = blocks.get(chunkKey(...t))![blockIndex(x - t[0] * 16, y - 1, z - t[1] * 16)];
-      if (HAND_DROPS.has(under)) {
-        path = p;
-        target = t;
-        break;
+  // Worlds whose spawn is boxed in (no walkable crossing into a neighbor) are replaced.
+  for (let attempt = 1; attempt <= 3 && !path.length; attempt++) {
+    nonce = freshNonce();
+    world = worldPda(pid, wallet.publicKey, nonce);
+    existing.clear();
+    await step("create_world (session-signed, 0-lamport fee payer)", async () => {
+      const before = await erLamports(player);
+      const r = await ok("create_world", async () => [await createWorldIx(program, auth, nonce, "devnet smoke", params, hint)]);
+      return {
+        sig: r.sig,
+        confirmMs: r.ms,
+        cu: await cu(r.sig),
+        world: world.toBase58(),
+        playerErDelta: (await erLamports(player)) - before,
+        sessionKeyErLamports: await erLamports(session.kp.publicKey),
+      };
+    });
+    await step("request_seed (Player PDA payer, DEFAULT_EPHEMERAL_QUEUE) → seed arrives", async () => {
+      const before = await erLamports(player);
+      const queueBefore = await erLamports(DEFAULT_EPHEMERAL_QUEUE);
+      const r = await ok("request_seed", async () => [await requestSeedIx(program, auth, world)]);
+      const t0 = Date.now();
+      const w = await until(
+        async () => {
+          const d = await account(world);
+          return d && decodeWorld(d).seedSet ? decodeWorld(d) : null;
+        },
+        60_000,
+        "VRF seed",
+      );
+      return {
+        sig: r.sig,
+        cu: await cu(r.sig),
+        seedAfterMs: Date.now() - t0,
+        playerErDelta: (await erLamports(player)) - before,
+        queueErDelta: (await erLamports(DEFAULT_EPHEMERAL_QUEUE)) - queueBefore,
+        seedPrefix: Buffer.from(w.seed.subarray(0, 4)).toString("hex"),
+      };
+    });
+
+    await step("chunk (0,0): create_chunk + grow_chunk, populate_chunk (CU)", async () => {
+      const before = await erLamports(player);
+      const g = await generate(0, 0);
+      return { ...g, playerErDelta: (await erLamports(player)) - before };
+    });
+    await step("set_spawn", async () => {
+      const r = await ok("set_spawn", async () => [await setSpawnIx(program, world)]);
+      spawn = decodeWorld((await account(world))!).spawn;
+      return { cu: await cu(r.sig), spawn };
+    });
+
+    // Path from spawn into a neighbor ending on a hand-breakable block (like live.test.ts).
+    await step(`neighbors: generate until a walkable border crossing exists (world ${attempt})`, async () => {
+      const made: string[] = [];
+      for (const t of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ] as [number, number][]) {
+        await generate(t[0], t[1]);
+        made.push(chunkKey(...t));
+        const blocks = new Map([
+          ["0,0", await blocksOf(0, 0)],
+          [chunkKey(...t), await blocksOf(...t)],
+        ]);
+        const p = planWalk(blocks, [spawn[0], spawn[2]], t);
+        if (!p || p.length < 2) continue;
+        const [x, y, z] = p[p.length - 1];
+        const under = blocks.get(chunkKey(...t))![blockIndex(x - t[0] * 16, y - 1, z - t[1] * 16)];
+        if (HAND_DROPS.has(under)) {
+          path = p;
+          target = t;
+          break;
+        }
       }
+      if (!path.length) throw new Error(`no walkable crossing from spawn (chunks ${made.join(" ")})`);
+      return { chunks: made, pathLen: path.length, target };
+    }, attempt === 3);
+  }
+
+  // A boxed-in spawn is a property of the terrain, not a failure: keep it as a note.
+  for (const r of results)
+    if (path.length && !r.ok && r.step.startsWith("neighbors")) {
+      r.ok = true;
+      r.detail = { replacedWorld: r.error };
+      delete r.error;
     }
-    if (!path.length) throw new Error(`no walkable crossing from spawn (chunks ${made.join(" ")})`);
-    return { chunks: made, pathLen: path.length, target };
-  });
 
   // 5. Join + moves
   const pstate = () => pstatePda(pid, world, player);
@@ -475,31 +494,8 @@ async function main() {
   }, false);
   await step("moves: walk to the neighbor and back (fresh world, one in flight at a time)", () => walk("move"), false);
 
-  await step("world clock: estimate vs local wall clock over 60 s (|error| < 1 s)", async () => {
-    const samples: { t: number; err: number | null; fine: boolean; usPerSlot: number }[] = [];
-    const t0 = Date.now();
-    while (Date.now() - t0 < 60_000) {
-      const c = await chainNow(world);
-      samples.push({ t: Math.round((Date.now() - t0) / 1000), err: c.errVsLocalMs, fine: c.fine, usPerSlot: c.usPerSlot });
-      await sleep(2_000);
-    }
-    const worst = Math.max(...samples.map((x) => Math.abs(x.err ?? Infinity)));
-    const r = { worstAbsErrMs: worst, allFine: samples.every((x) => x.fine), first: samples[0], last: samples[samples.length - 1] };
-    if (worst >= 1_000 || !r.allFine) throw new Error(`clock off: ${JSON.stringify(r)}`);
-    return r;
-  }, false);
-
-  // 6. Day crank
-  await step("day crank: World.day_ticks / last_tick_ms advance (Magic-program ScheduleTask)", async () => {
-    const w0 = decodeWorld((await account(world))!);
-    await sleep(6_000);
-    const w1 = decodeWorld((await account(world))!);
-    const d = { dayTicks: [w0.dayTicks, w1.dayTicks], timeOfDayMs: [w0.timeOfDayMs, w1.timeOfDayMs], lastTickMs: [w0.lastTickMs, w1.lastTickMs], taskId: w0.dayTaskId };
-    if (w1.dayTicks <= w0.dayTicks) throw new Error(`day crank not ticking: ${JSON.stringify(d, big)}`);
-    return d;
-  }, false);
-
-  // 7. Chunk crank (mobs / fluid)
+  // 7. Chunk crank (mobs / fluid / fresh presence: right after the walk, before the
+  //    player's presence goes stale and idle chunks cancel their crank)
   await step("chunk crank: tick_count advances on chunks with mobs / players", async () => {
     const keys = [...existing];
     const read = async () =>
@@ -522,6 +518,30 @@ async function main() {
     }));
     if (!per.some((p) => p.ticks[1] > p.ticks[0])) throw new Error(`no chunk ticked: ${JSON.stringify(per)}`);
     return per;
+  }, false);
+
+  // 6. Day crank
+  await step("day crank: World.day_ticks / last_tick_ms advance (Magic-program ScheduleTask)", async () => {
+    const w0 = decodeWorld((await account(world))!);
+    await sleep(6_000);
+    const w1 = decodeWorld((await account(world))!);
+    const d = { dayTicks: [w0.dayTicks, w1.dayTicks], timeOfDayMs: [w0.timeOfDayMs, w1.timeOfDayMs], lastTickMs: [w0.lastTickMs, w1.lastTickMs], taskId: w0.dayTaskId };
+    if (w1.dayTicks <= w0.dayTicks) throw new Error(`day crank not ticking: ${JSON.stringify(d, big)}`);
+    return d;
+  }, false);
+
+  await step("world clock: estimate vs local wall clock over 60 s (|error| < 1 s)", async () => {
+    const samples: { t: number; err: number | null; fine: boolean; usPerSlot: number }[] = [];
+    const t0 = Date.now();
+    while (Date.now() - t0 < 60_000) {
+      const c = await chainNow(world);
+      samples.push({ t: Math.round((Date.now() - t0) / 1000), err: c.errVsLocalMs, fine: c.fine, usPerSlot: c.usPerSlot });
+      await sleep(2_000);
+    }
+    const worst = Math.max(...samples.map((x) => Math.abs(x.err ?? Infinity)));
+    const r = { worstAbsErrMs: worst, allFine: samples.every((x) => x.fine), first: samples[0], last: samples[samples.length - 1] };
+    if (worst >= 1_000 || !r.allFine) throw new Error(`clock off: ${JSON.stringify(r)}`);
+    return r;
   }, false);
 
   // 7b. Moves again once the World clock has had time to converge (optional wait).
