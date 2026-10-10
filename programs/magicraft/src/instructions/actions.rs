@@ -1,4 +1,4 @@
-//! Player actions: `break_block`, `place_block`, `select_slot`, `craft`, `attack_mob`,
+//! Player actions: `break_block`, `pickup_item`, `place_block`, `select_slot`, `craft`, `attack_mob`,
 //! `eat`, `respawn`. All delegate the rules to `magicraft-core`.
 //!
 //! # Common to every action
@@ -10,6 +10,9 @@
 //!   signer or rent sponsor here, and it is passed **read-only**.
 //! - `World` is read-only (params, spawn, seed, chain time via `World::chain_ms_ro`).
 //! - Dead players (`health == 0`) are rejected with `Dead`, except by `respawn`.
+//! - Players out of the world (`PlayerState.in_world == 0`: left, or expired after a minute
+//!   of silence, `play::expire_players`) are rejected with `NotInWorld` by every action but
+//!   `select_slot` and `respawn`: they are out until `enter_world`.
 //! - Positions come from the stored `MoveState` (the last accepted move).
 //!
 //! # Reach
@@ -25,9 +28,18 @@
 //! break_time_ms(block, held tool)`. The client shows the mining progress *before* sending,
 //! so the chain enforces the rate (one block per break time) without a start/finish
 //! handshake. Air, water and bedrock (and out-of-palette bytes) → `Unbreakable`. The drop
-//! (`can_harvest` + `drop_item`) goes to the inventory; **if it does not fit it is lost and
-//! the block still breaks** (Minecraft would drop it on the ground, which we don't model).
+//! (`can_harvest` + `drop_item`) lands on the first solid block below the broken one
+//! (`core::ground::landing_y`), in the chunk's ground items (`GroundItems::drop_at`, lives
+//! 5 min); items that rested on the broken block fall too (`settle_column`, whatever the
+//! block and tool). A chunk grown before ground items
+//! existed has no ground region, so there the drop goes to the inventory (lost if full).
 //! A held tool loses one durability per break (`Inventory::damage_tool`, breaks at 0).
+//!
+//! # `pickup_item(idx)` (ground slot `idx` of `chunk`, any ready chunk of the world)
+//! `core::ground::GroundItems::pickup`: the item is live (`NoItem`), within 2 blocks + 0.5
+//! slack of the player's body center at the stored position (`OutOfReach`), and some of it
+//! fits (`InventoryFull`); as much as fits is taken, the rest stays. No cooldown: the
+//! client sends it when the player walks near an item.
 //!
 //! # `place_block(x, y, z, slot)`
 //! Target is Air or water (`InvalidTarget`); the slot's item must be a block item
@@ -76,7 +88,23 @@
 //! (fist); a held tool loses one durability. On death: `mobs::drops(kind, world seed,
 //! nonce)` with `nonce = (mob.id << 32) ^ chain_ms ^ slot` (not retryable for a reroll in
 //! the same slot; a killer could still pick the timing of the last blow, which only shifts
-//! a 1-3 item roll), items added (overflow lost), slot cleared.
+//! a 1-3 item roll), items added (overflow lost), slot cleared. A surviving mob is knocked
+//! back `mobs::KNOCKBACK` (1.2 blocks) away from the attacker with the walking collision
+//! rules, staying in this chunk (`mobs::knockback`; the chunk must be ready, `ChunkNotReady`).
+//!
+//! # `attack_player(target)` (PvP; `target` = the victim's Player PDA)
+//! `chunk` (any chunk of the world) and its `presence` list (mut) must hold a **fresh**
+//! entry of `target` (`now − last_seen ≤ STALE_MS`, else `NoPlayer`: a player who left the
+//! world, `leave_world`, or stopped sending moves can't be hit); not oneself
+//! (`InvalidTarget`); same reach (`mob_in_reach` on the entry's position: a 2-block
+//! column), cooldown and damage rules as `attack_mob` (shared `attack_until_ms`). The
+//! damage is added to the entry's `pending_damage`, which the victim's next `move_player`
+//! (or `leave_world`) applies, exactly like a zombie hit.
+//! Knockback: a living target is pushed up to `physics::PLAYER_KNOCKBACK` (0.9 block) away
+//! from the attacker (`physics::knockback_pos`: free body box all the way, still on ground
+//! if it was, inside `chunk`), written to its PlayerState (`target_state`, mut; velocity
+//! 0, `last_ms + 1` so the victim's client adopts it as an external move) and to its
+//! presence entry; no room → no push.
 //!
 //! # `eat(slot)`, `select_slot(slot)`, `respawn()`
 //! `eat`: core `inventory::eat` (`NotFood`, `FoodFull`, …). `select_slot`: sets
@@ -100,10 +128,11 @@ use magicraft_core::coords::block_index;
 use magicraft_core::fluid::{
     enqueue_neighbors, BlockAccess, ChunkNeighborhood, FluidQueue, EAST, NORTH, SOUTH, WEST,
 };
+use magicraft_core::ground::{drop_pos, landing_y, GroundItems};
 use magicraft_core::hash::Seed;
 use magicraft_core::inventory::{eat as core_eat, INV_SLOTS, MAX_FOOD};
-use magicraft_core::mobs::{damage_mob, drops, MOB_SLOTS};
-use magicraft_core::physics::{MoveState, GROUND_HALF_W};
+use magicraft_core::mobs::{damage_mob, drops, knockback, MOB_SLOTS};
+use magicraft_core::physics::{knockback_pos, ChunkQuad, MoveState, GROUND_HALF_W};
 use magicraft_core::recipes::{craft as core_craft, Stations};
 use session_keys::{session_auth_or, Session, SessionError, SessionTokenV2};
 
@@ -112,8 +141,9 @@ use crate::instructions::crank::maybe_arm_chunk;
 use crate::instructions::play::{chunk_of, spawn_pos};
 use crate::presence::STALE_MS;
 use crate::state::{
-    chunk_header, chunk_header_mut, presence_entries_ro, ready_chunk_blocks_ro,
-    ready_chunk_mut_for, ChunkHeader, Player, PlayerState, World, CHUNK_SEED, MAX_HEALTH,
+    chunk_ground_mut, chunk_header, presence_entries_ro, presence_of, ready_chunk_blocks_ro,
+    ready_chunk_mut, ready_chunk_mut_for, ChunkHeader, LeI32, Player, PlayerState, PresenceEntry,
+    World, CHUNK_SEED, MAX_HEALTH,
 };
 
 /// Eye height above the feet, FP (1.62 blocks).
@@ -487,6 +517,26 @@ pub struct BreakBlock<'info> {
 }
 
 #[derive(Accounts, Session)]
+pub struct PickupItem<'info> {
+    pub signer: Signer<'info>,
+    /// Read-only; tied to `player_state`.
+    pub player: Account<'info, Player>,
+    #[session(signer = signer, authority = player.authority.key())]
+    pub session_token: Option<Account<'info, SessionTokenV2>>,
+    /// Read-only: chain time.
+    pub world: Account<'info, World>,
+    #[account(
+        mut,
+        constraint = player_state.player == player.key() @ MagicraftError::Unauthorized,
+        constraint = player_state.world == world.key() @ MagicraftError::Unauthorized
+    )]
+    pub player_state: Account<'info, PlayerState>,
+    /// CHECK: the chunk holding the item (any ready chunk of `world`; stored identity).
+    #[account(mut)]
+    pub chunk: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts, Session)]
 pub struct PlaceBlock<'info> {
     /// Wallet or session key of `player`'s authority.
     pub signer: Signer<'info>,
@@ -575,6 +625,38 @@ pub struct AttackMob<'info> {
 }
 
 #[derive(Accounts, Session)]
+#[instruction(target: Pubkey)]
+pub struct AttackPlayer<'info> {
+    pub signer: Signer<'info>,
+    pub player: Account<'info, Player>,
+    #[session(signer = signer, authority = player.authority.key())]
+    pub session_token: Option<Account<'info, SessionTokenV2>>,
+    /// Read-only: params, chain time.
+    pub world: Account<'info, World>,
+    #[account(
+        mut,
+        constraint = player_state.player == player.key() @ MagicraftError::Unauthorized,
+        constraint = player_state.world == world.key() @ MagicraftError::Unauthorized
+    )]
+    pub player_state: Account<'info, PlayerState>,
+    /// CHECK: a chunk of `world` (stored identity) whose presence lists the target.
+    pub chunk: UncheckedAccount<'info>,
+    /// CHECK: the presence list of `chunk` (`presence_of`); the target's entry is written.
+    #[account(mut)]
+    pub presence: UncheckedAccount<'info>,
+    /// The target's PlayerState in this world: knockback moves it. `dup`: a self-hit passes
+    /// our own PlayerState here and must fail with `InvalidTarget` (the handler), not
+    /// Anchor's duplicate check; a succeeding call never aliases (target ≠ us).
+    #[account(
+        mut,
+        dup,
+        constraint = target_state.player == target @ MagicraftError::NoPlayer,
+        constraint = target_state.world == world.key() @ MagicraftError::NoPlayer
+    )]
+    pub target_state: Account<'info, PlayerState>,
+}
+
+#[derive(Accounts, Session)]
 pub struct Respawn<'info> {
     pub signer: Signer<'info>,
     pub player: Account<'info, Player>,
@@ -602,6 +684,7 @@ pub fn break_block(ctx: Context<BreakBlock>, x: i32, y: i32, z: i32) -> Result<(
         let a = &ctx.accounts;
         let ps = &a.player_state;
         require!(!ps.is_dead(), MagicraftError::Dead);
+        require!(ps.in_world != 0, MagicraftError::NotInWorld);
         require!(
             (0..CHUNK_H as i32).contains(&y),
             MagicraftError::InvalidTarget
@@ -635,13 +718,24 @@ pub fn break_block(ctx: Context<BreakBlock>, x: i32, y: i32, z: i32) -> Result<(
         })?;
         arm_chunks(&a.chunk, nbr, e.has_work, &a.world, now)?;
 
-        if let Some(b) = Block::from_u8(e.old) {
-            if blk::can_harvest(b, tool) {
-                if let Some((item, n)) = blk::drop_item(b) {
-                    // Leftover (inventory full) is lost; the block breaks anyway.
-                    inv.add(item, n as u32);
-                }
+        let drop = Block::from_u8(e.old)
+            .filter(|&b| blk::can_harvest(b, tool))
+            .and_then(blk::drop_item);
+        if let Some((blocks, mut bytes)) = chunk_ground_mut(&a.chunk)? {
+            // Items resting on the broken block fall; the drop lands below it too.
+            let (lx, lz) = ((x & 15) as usize, (z & 15) as usize);
+            let land = landing_y(y, |yy| {
+                blk::is_solid_u8(blocks[block_index(lx, yy as usize, lz)])
+            });
+            let mut g = GroundItems::from_bytes(&bytes);
+            g.settle_column(x, y, z, land, now);
+            if let Some((item, n)) = drop {
+                g.drop_at(item, n, drop_pos([x, land, z]), now);
             }
+            *bytes = g.to_bytes();
+        } else if let Some((item, n)) = drop {
+            // Legacy chunk (no ground region): to the inventory, leftover lost.
+            inv.add(item, n as u32);
         }
         if tool.is_some() {
             inv.damage_tool(held);
@@ -651,6 +745,38 @@ pub fn break_block(ctx: Context<BreakBlock>, x: i32, y: i32, z: i32) -> Result<(
     let ps = &mut ctx.accounts.player_state;
     ps.set_inventory(&inv);
     ps.break_until_ms = until;
+    Ok(())
+}
+
+/// Picks ground item slot `idx` of `chunk` up into the inventory (see the module docs).
+#[session_auth_or(
+    ctx.accounts.player.authority == ctx.accounts.signer.key(),
+    MagicraftError::Unauthorized
+)]
+pub fn pickup_item(ctx: Context<PickupItem>, idx: u8) -> Result<()> {
+    let inv = {
+        let a = &ctx.accounts;
+        let ps = &a.player_state;
+        require!(!ps.is_dead(), MagicraftError::Dead);
+        require!(ps.in_world != 0, MagicraftError::NotInWorld);
+        {
+            let h = chunk_header(&a.chunk)?;
+            require!(
+                h.world == a.world.key() && h.is_done(),
+                MagicraftError::InvalidChunk
+            );
+        }
+        let now = a.world.chain_ms_ro(&Clock::get()?).ms;
+        let pos = ps.move_state()?.pos;
+        let (_, mut bytes) = chunk_ground_mut(&a.chunk)?.ok_or(error!(MagicraftError::NoItem))?;
+        let mut g = GroundItems::from_bytes(&bytes);
+        let mut inv = ps.inventory();
+        g.pickup(idx as usize, &mut inv, pos, now)
+            .map_err(MagicraftError::from)?;
+        *bytes = g.to_bytes();
+        inv
+    };
+    ctx.accounts.player_state.set_inventory(&inv);
     Ok(())
 }
 
@@ -665,6 +791,7 @@ pub fn place_block(ctx: Context<PlaceBlock>, x: i32, y: i32, z: i32, slot: u8) -
         let a = &ctx.accounts;
         let ps = &a.player_state;
         require!(!ps.is_dead(), MagicraftError::Dead);
+        require!(ps.in_world != 0, MagicraftError::NotInWorld);
         require!(
             (0..CHUNK_H as i32).contains(&y),
             MagicraftError::InvalidTarget
@@ -745,6 +872,7 @@ pub fn select_slot(ctx: Context<SelfAction>, slot: u8) -> Result<()> {
 pub fn eat(ctx: Context<SelfAction>, slot: u8) -> Result<()> {
     let ps = &mut ctx.accounts.player_state;
     require!(!ps.is_dead(), MagicraftError::Dead);
+    require!(ps.in_world != 0, MagicraftError::NotInWorld);
     let mut inv = ps.inventory();
     let food = core_eat(&mut inv, slot as usize, ps.food).map_err(MagicraftError::from)?;
     ps.food = food;
@@ -789,6 +917,7 @@ pub fn craft(
         let a = &ctx.accounts;
         let ps = &a.player_state;
         require!(!ps.is_dead(), MagicraftError::Dead);
+        require!(ps.in_world != 0, MagicraftError::NotInWorld);
         let pos = ps.move_state()?.pos;
         let (reach, world) = (a.world.params.reach, a.world.key());
         let near = Stations {
@@ -827,13 +956,11 @@ pub fn attack_mob(ctx: Context<AttackMob>, idx: u8) -> Result<()> {
         let a = &ctx.accounts;
         let ps = &a.player_state;
         require!(!ps.is_dead(), MagicraftError::Dead);
+        require!(ps.in_world != 0, MagicraftError::NotInWorld);
         require!((idx as usize) < MOB_SLOTS, MagicraftError::NoMob);
         let pos = ps.move_state()?.pos;
-        let mut h = chunk_header_mut(&a.chunk)?;
-        require!(
-            h.world == a.world.key() && h.is_done(),
-            MagicraftError::InvalidChunk
-        );
+        let (mut h, mut blocks) = ready_chunk_mut(&a.chunk)?;
+        require!(h.world == a.world.key(), MagicraftError::InvalidChunk);
         let mut mob = h.mob(idx as usize);
         require!(!mob.is_empty() && mob.hp > 0, MagicraftError::NoMob);
         require!(mob_in_reach(pos, mob.pos), MagicraftError::OutOfReach);
@@ -859,6 +986,11 @@ pub fn attack_mob(ctx: Context<AttackMob>, idx: u8) -> Result<()> {
                 }
             }
             mob.clear();
+        } else {
+            // Knockback: pushed away from the attacker, staying in this chunk (core::mobs).
+            let (cx, cz) = (h.cx.get(), h.cz.get());
+            let hood = ChunkNeighborhood::new(cx, cz, &mut blocks, [None, None, None, None]);
+            knockback(&hood, cx, cz, &mut mob, pos);
         }
         h.set_mob(idx as usize, &mob);
         (
@@ -869,6 +1001,84 @@ pub fn attack_mob(ctx: Context<AttackMob>, idx: u8) -> Result<()> {
     let ps = &mut ctx.accounts.player_state;
     ps.set_inventory(&inv);
     ps.attack_until_ms = until;
+    Ok(())
+}
+
+/// The entry of `target` in `entries` if it is fresh at `now` (pure).
+pub fn fresh_entry(entries: &[PresenceEntry], target: &Pubkey, now: i64) -> Option<usize> {
+    entries
+        .iter()
+        .position(|e| e.player == *target && now.saturating_sub(e.last_seen_ms.get()) <= STALE_MS)
+}
+
+/// Attacks player `target` (PvP, module docs).
+#[session_auth_or(
+    ctx.accounts.player.authority == ctx.accounts.signer.key(),
+    MagicraftError::Unauthorized
+)]
+pub fn attack_player(ctx: Context<AttackPlayer>, target: Pubkey) -> Result<()> {
+    let (inv, until, pushed) = {
+        let a = &ctx.accounts;
+        let ps = &a.player_state;
+        require!(!ps.is_dead(), MagicraftError::Dead);
+        require!(ps.in_world != 0, MagicraftError::NotInWorld);
+        require_keys_neq!(target, a.player.key(), MagicraftError::InvalidTarget);
+        {
+            let h = chunk_header(&a.chunk)?;
+            require!(h.world == a.world.key(), MagicraftError::InvalidChunk);
+        }
+        let pos = ps.move_state()?.pos;
+        let now = a.world.chain_ms_ro(&Clock::get()?).ms;
+        require!(now >= ps.attack_until_ms, MagicraftError::Cooldown);
+        let (_, mut entries) = presence_of(&a.presence, a.chunk.key)?;
+        let i = fresh_entry(&entries, &target, now).ok_or(error!(MagicraftError::NoPlayer))?;
+        require!(
+            mob_in_reach(pos, entries[i].pos.map(|v| v.get())),
+            MagicraftError::OutOfReach
+        );
+        let mut inv = ps.inventory();
+        let held = ps.held_slot as usize;
+        let info = inv
+            .slot(held)
+            .and_then(|s| s.get_item())
+            .and_then(|it| it.tool_info());
+        let dmg = info.map_or(1, |(_, _, d)| d);
+        if info.is_some() {
+            inv.damage_tool(held);
+        }
+        entries[i].pending_damage = entries[i].pending_damage.saturating_add(dmg);
+        // Knockback: the target is pushed away from us, within this chunk (its own: the
+        // presence entry is fresh), only to a free spot (core::physics::knockback_pos).
+        let pushed = if a.target_state.is_dead() {
+            None
+        } else {
+            let h = chunk_header(&a.chunk)?;
+            let (cx, cz) = (h.cx.get(), h.cz.get());
+            drop(h);
+            let blocks = ready_chunk_blocks_ro(&a.chunk, &a.world.key(), cx, cz)?;
+            let w = ChunkQuad::new(cx, cz, [Some(&blocks), None, None, None]);
+            let mut ms = a.target_state.move_state()?;
+            knockback_pos(&w, &ms, pos).map(|p| {
+                ms.pos = p;
+                ms.vel = [0; 3];
+                // Newer than the target's confirmed state: its client adopts the push.
+                ms.last_ms = ms.last_ms.saturating_add(1);
+                entries[i].pos = p.map(LeI32::new);
+                ms
+            })
+        };
+        (
+            inv,
+            now.saturating_add(a.world.params.attack_cooldown_ms as i64),
+            pushed,
+        )
+    };
+    let ps = &mut ctx.accounts.player_state;
+    ps.set_inventory(&inv);
+    ps.attack_until_ms = until;
+    if let Some(ms) = pushed {
+        ctx.accounts.target_state.set_move_state(&ms);
+    }
     Ok(())
 }
 
@@ -909,6 +1119,20 @@ mod tests {
     /// Feet at the center of block column (x, z), standing at y.
     fn feet(x: i32, y: i32, z: i32) -> [i32; 3] {
         [x * B + 128, y * B, z * B + 128]
+    }
+
+    #[test]
+    fn pvp_targets_fresh_entries_only() {
+        use crate::presence::new_entry;
+        let k = |b: u8| Pubkey::new_from_array([b; 32]);
+        let now = 100_000;
+        let entries = [
+            new_entry(&k(1), [0; 3], now - STALE_MS - 1),
+            new_entry(&k(2), [0; 3], now - STALE_MS),
+        ];
+        assert_eq!(fresh_entry(&entries, &k(1), now), None); // stale: left / idle
+        assert_eq!(fresh_entry(&entries, &k(2), now), Some(1));
+        assert_eq!(fresh_entry(&entries, &k(3), now), None); // not listed
     }
 
     #[test]

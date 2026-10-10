@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { B } from "./blocks";
 import { BORDER, borderOf, CVOL, meshChunk, quadCount, waterHeight, type MeshArrays, type MeshInput } from "./mesher";
+import { AROUND, skyBrightness, skyLight } from "./skylight";
 
 const idx = (x: number, y: number, z: number) => (y * 16 + z) * 16 + x;
 
@@ -59,10 +60,18 @@ describe("opaque greedy mesher", () => {
     }
   });
 
-  it("two adjacent blocks: shared faces culled (10 unit faces) and merged into 6 quads", () => {
+  // Merge tests sit on y = 0 (no bottom face; evenly sky-lit): under a raised block the
+  // smooth sky light varies per corner, which correctly prevents merging.
+  it("two adjacent blocks: shared faces culled (8 unit faces on the floor) and merged into 5 quads", () => {
+    const m = meshChunk(input(chunk([[5, 0, 5, B.STONE], [6, 0, 5, B.STONE]])));
+    expect(area(m.opaque)).toBe(8);
+    expect(quadCount(m.opaque)).toBe(5);
+  });
+
+  it("faces with different sky light are not merged (a raised pair's bottom splits)", () => {
     const m = meshChunk(input(chunk([[5, 10, 5, B.STONE], [6, 10, 5, B.STONE]])));
     expect(area(m.opaque)).toBe(10);
-    expect(quadCount(m.opaque)).toBe(6);
+    expect(byFace(m.opaque)["-y"]).toBe(2);
   });
 
   it("different tiles are not merged", () => {
@@ -73,10 +82,10 @@ describe("opaque greedy mesher", () => {
 
   it("a 16×16 floor merges into one quad per side", () => {
     const b = chunk();
-    for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) b[idx(x, 10, z)] = B.STONE;
+    for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) b[idx(x, 0, z)] = B.STONE;
     const m = meshChunk(input(b));
-    expect(quadCount(m.opaque)).toBe(6);
-    expect(area(m.opaque)).toBe(256 * 2 + 16 * 4);
+    expect(quadCount(m.opaque)).toBe(5);
+    expect(area(m.opaque)).toBe(256 + 16 * 4);
   });
 
   it("a filled chunk with all neighbors solid only shows its top", () => {
@@ -158,5 +167,65 @@ describe("cutout and water", () => {
     const ys = new Set<number>();
     for (let v = 0; v < m.water.positions.length / 3; v++) ys.add(m.water.positions[v * 3 + 1]);
     expect(ys.has(11)).toBe(true);
+  });
+});
+
+describe("sky light", () => {
+  /** `dark` of the first vertex of the first quad facing `face` ("+y", …). */
+  const darkOf = (m: MeshArrays, face: string) => {
+    for (let q = 0; q < quadCount(m); q++) {
+      const v = m.indices[q * 6];
+      const n = [m.normals[v * 3], m.normals[v * 3 + 1], m.normals[v * 3 + 2]];
+      const a = n.findIndex((c) => c !== 0);
+      if (`${n[a] > 0 ? "+" : "-"}${"xyz"[a]}` === face) return m.dark[v];
+    }
+    return -1;
+  };
+
+  it("open sky: faces fully lit (dark 0)", () => {
+    const m = meshChunk(input(chunk([[5, 10, 5, B.STONE]])));
+    expect(darkOf(m.opaque, "+y")).toBe(0);
+  });
+
+  it("a sealed cave is dark; torch-free faces keep only the floor", () => {
+    // Solid chunk with a 3-block hollow at y 20..22 and solid neighbors all around.
+    const b = new Uint8Array(CVOL).fill(B.STONE);
+    for (let x = 6; x < 9; x++) b[idx(x, 21, 7)] = 0;
+    const solid = new Uint8Array(CVOL).fill(B.STONE);
+    const borders = [0, 1, 2, 3].map(() => new Uint8Array(BORDER).fill(B.STONE));
+    const m = meshChunk({ blocks: b, borders, around: Array(8).fill(solid) });
+    expect(darkOf(m.opaque, "+y")).toBe(Math.round((1 - skyBrightness(0)) * 255));
+  });
+
+  it("light enters from a neighbor's shaft and fades along a tunnel", () => {
+    // Roof at y = 30 over the whole area, a tunnel at y = 29 along +x from the west border;
+    // the west neighbor has a shaft open to the sky at its east edge.
+    const roofed = () => {
+      const c = new Uint8Array(CVOL);
+      for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) for (let y = 0; y < 64; y++) c[idx(x, y, z)] = y === 29 ? 0 : B.STONE;
+      return c;
+    };
+    const mid = roofed();
+    for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) if (z !== 8) mid[idx(x, 29, z)] = B.STONE;
+    const west = roofed();
+    for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) if (z !== 8) west[idx(x, 29, z)] = B.STONE;
+    for (let y = 29; y < 64; y++) west[idx(15, y, 8)] = 0; // shaft
+    const around = AROUND.map(([dx, dz]) => (dx === -1 && dz === 0 ? west : roofed()));
+    const L = skyLight(mid, around);
+    const at = (x: number) => L[((29 + 1) * 18 + (8 + 1)) * 18 + (x + 1)];
+    expect(at(-1)).toBe(15); // the shaft cell
+    expect(at(0)).toBe(14);
+    expect(at(5)).toBe(9);
+    expect(at(14)).toBe(0);
+  });
+
+  it("water absorbs: 2 more per block", () => {
+    const b = chunk();
+    for (let y = 40; y < 64; y++) b[idx(5, y, 5)] = B.WATER_SOURCE;
+    for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) if (x !== 5 || z !== 5) for (let y = 0; y < 64; y++) b[idx(x, y, z)] = B.STONE;
+    const solid = new Uint8Array(CVOL).fill(B.STONE);
+    const L = skyLight(b, Array(8).fill(solid));
+    expect(L[((63 + 1) * 18 + 6) * 18 + 6]).toBe(13);
+    expect(L[((60 + 1) * 18 + 6) * 18 + 6]).toBe(7);
   });
 });

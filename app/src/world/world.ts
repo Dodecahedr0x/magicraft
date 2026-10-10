@@ -34,7 +34,9 @@ import { flickerPhase, TorchIndex } from "./torches";
 export const LOAD_RADIUS = 4;
 export const CREATE_RADIUS = 2;
 export const EYE = 1.62;
-const AUTO_KEY = "magicraft.autoCreate";
+// On by default; only the settings toggle turns it off. (v2: drops the "off" an old
+// "Not now" on the former consent prompt stored.)
+const AUTO_KEY = "magicraft.autoCreate.v2";
 const CAP_KEY = "magicraft.autoCreate.capSol";
 const TORCH_KEY = "magicraft.torchLights";
 /** Stored torch quality, else 8 (4 on touch / coarse-pointer devices). */
@@ -49,7 +51,6 @@ function torchQuality(stored: string | null): TorchQuality {
   }
   return coarse ? 4 : 8;
 }
-const consentKey = (world: PublicKey) => `magicraft.autoCreate.consent.${world.toBase58()}`;
 
 export type WorldHandle = {
   store: ChunkStore;
@@ -73,8 +74,10 @@ export type WorldHandle = {
   /** Called with every PlayerState update (own chunk for auto-create; first camera spot). */
   onPlayerState(s: PlayerStateAccount): void;
   toast(msg: string, kind?: "info" | "warn"): void;
-  /** The chunk panel + toasts (append into the game screen). */
+  /** The chunk prompts, controls hint + toasts (append into the game screen). */
   ui: HTMLElement;
+  /** The chunk settings (auto-generate, cap, torch lights, status) for the settings menu. */
+  settings: HTMLElement;
   stop(): void;
 };
 
@@ -162,7 +165,7 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     radius: CREATE_RADIUS,
     concurrency: 2,
     capLamports: capSol > 0 ? Math.round(capSol * LAMPORTS_PER_SOL) : DEFAULT_CAP_LAMPORTS,
-    consented: store_.get(consentKey(world)) === "yes",
+    consented: true,
     ixs: {
       createAndGrow: (cx, cz, view, own) => {
         const auth = app.auth();
@@ -204,7 +207,10 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
   );
   const status = h("p", { class: "chunk-status", role: "status" });
   const totals = h("p", { class: "chunk-totals" });
-  const askBox = h("div", { class: "chunk-halt", hidden: true });
+  // Corner card when generation stopped and needs the player (out of SOL, session); the
+  // actions (top up, raise the cap, resume) live in the Esc menu (`menuAsk`).
+  const askBox = h("div", { class: "chunk-panel chunk-halt", role: "status", hidden: true });
+  const menuAsk = h("div", { class: "chunk-halt", hidden: true });
   const toasts = h("div", { class: "toasts", "aria-live": "polite" });
   const panel = h(
     "div",
@@ -215,15 +221,15 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     h("label", { class: "cap", for: "torch-lights" }, h("span", {}, "Torch lights"), torchSel),
     status,
     totals,
-    askBox,
+    menuAsk,
   );
   const help = h(
     "p",
     { class: "fly-help" },
-    "Click to capture the mouse (Esc releases) · WASD move · Space jump / swim · Shift sprint · Left mine / attack · Right place / eat · 1–9 or wheel hotbar · E inventory" +
+    "Click to capture the mouse · Esc menu · WASD move · Space jump / swim · Shift sprint · Left mine / attack · Right place / eat · 1–9 or wheel hotbar · E inventory" +
       (cam ? " · F debug fly camera" : ""),
   );
-  const ui = h("div", { class: "world-ui" }, panel, help, toasts);
+  const ui = h("div", { class: "world-ui" }, askBox, help, toasts);
 
   toggle.addEventListener("change", () => {
     store_.set(AUTO_KEY, toggle.checked ? "on" : "off");
@@ -277,55 +283,63 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
           : "Paused."
         : inflight.length
           ? `Generating: ${inflight.join(", ")}…`
-          : auto.waiting
-            ? "Waiting for your go-ahead."
+          : auto.waiting === "cap"
+            ? "Stopped at your spend cap."
             : pending
               ? `${plural(pending)} nearby can't be generated from here yet.`
               : "All nearby chunks generated.";
     totals.textContent = auto.created ? `${plural(auto.created)} created this session · ${sol(auto.spentLamports, 6)} SOL` : "";
-    // The prompt: a halt (top-up / session) wins over a spending question.
-    const want = auto.halted ? `halt:${auto.halted}` : !auto.paused && auto.waiting ? `ask:${auto.waiting}` : null;
+    // A halt (top-up / session) wins over the spend cap.
+    const want = auto.halted ? `halt:${auto.halted}` : !auto.paused && auto.waiting === "cap" ? "cap" : null;
     if (want === asked) return;
     asked = want;
-    askBox.hidden = !want;
-    if (!want) return askBox.replaceChildren();
+    askBox.hidden = !want || want === "cap";
+    menuAsk.hidden = !want;
+    if (!want) {
+      askBox.replaceChildren();
+      menuAsk.replaceChildren();
+      return;
+    }
     const btn = (label: string, onclick: () => void, ghost = false) => h("button", { class: `btn small${ghost ? " ghost" : ""}`, type: "button", onclick }, label);
-    if (want === "ask:consent") {
-      askBox.replaceChildren(
-        h("p", {}, `Missing chunks around you can be generated now. Each costs ≈ ${sol(CHUNK_TOTAL_RENT, 6)} SOL of rent from your player, up to your cap of ${sol(auto.capLamports, 6)} SOL this session.`),
-        h(
-          "div",
-          { class: "actions" },
-          btn("Generate chunks", () => {
-            store_.set(consentKey(world), "yes");
-            auto.consent();
-          }),
-          btn("Not now", () => {
-            toggle.checked = false;
-            store_.set(AUTO_KEY, "off");
-            auto.setPaused(true);
-          }, true),
-        ),
-      );
-    } else if (want === "ask:cap") {
-      askBox.replaceChildren(
-        h("p", {}, `Reached your spend cap: ${sol(auto.spentLamports, 6)} SOL on ${plural(auto.created)} this session. Continue?`),
+    if (want === "cap") {
+      askBox.replaceChildren();
+      menuAsk.replaceChildren(
+        h("p", {}, `Reached your spend cap: ${sol(auto.spentLamports, 6)} SOL on ${plural(auto.created)} this session.`),
         h("div", { class: "actions" }, btn(`Continue (+${sol(DEFAULT_CAP_LAMPORTS, 6)} SOL)`, () => {
           auto.raiseCap();
           capInput.value = String(+(auto.capLamports / LAMPORTS_PER_SOL).toFixed(6));
         })),
       );
-    } else {
-      const msg =
-        auto.halted === "topup"
-          ? "Your player is out of SOL for chunk rent. Top it up, then resume."
-          : (haltMsg ?? "Your play session needs renewing.");
-      askBox.replaceChildren(
-        h("p", { class: "form-error" }, msg),
-        h("div", { class: "actions" }, auto.halted === "topup" ? btn("Top up", () => openTopUp(app)) : null, btn("Resume", () => auto.resume(), true)),
+    } else if (want === "halt:topup") {
+      askBox.replaceChildren(h("strong", {}, "Out of SOL for chunk rent"), h("p", {}, "Press Esc to top up your player. Chunk generation resumes on its own."));
+      menuAsk.replaceChildren(
+        h("p", { class: "form-error" }, "Your player is out of SOL for chunk rent."),
+        h("div", { class: "actions" }, btn("Top up", () => openTopUp(app)), btn("Resume", () => auto.resume(), true)),
       );
+    } else {
+      const msg = haltMsg ?? "Your play session needs renewing.";
+      askBox.replaceChildren(h("strong", {}, "Chunk generation stopped"), h("p", {}, `${msg} Press Esc for options.`));
+      menuAsk.replaceChildren(h("p", { class: "form-error" }, msg), h("div", { class: "actions" }, btn("Resume", () => auto.resume(), true)));
     }
   }
+
+  // Out of SOL: resume by itself once the Player's ER balance goes up (a top-up landed).
+  let haltBalance: number | null = null;
+  const topupWatch = setInterval(() => {
+    const player = app.state.player;
+    if (auto.halted !== "topup" || !player) return void (haltBalance = null);
+    void app.conns.er.getBalance(player, "confirmed").then(
+      (b) => {
+        if (auto.halted !== "topup") return;
+        if (haltBalance === null) haltBalance = b;
+        else if (b > haltBalance) {
+          haltBalance = null;
+          auto.resume();
+        }
+      },
+      () => {},
+    );
+  }, 3000);
 
   let haltMsg: string | null = null;
   function onAuto(e: AutoEvent) {
@@ -485,6 +499,7 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     mobs,
     torches,
     ui,
+    settings: panel,
     debugCam,
     get flying() {
       return flying;
@@ -505,6 +520,7 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     },
     stop() {
       if (batchTimer !== null) clearTimeout(batchTimer);
+      clearInterval(topupWatch);
       frameCbs.clear();
       auto.dispose();
       store.dispose();

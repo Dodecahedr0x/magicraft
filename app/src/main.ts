@@ -27,6 +27,8 @@ function fatal(e: unknown) {
 async function main() {
   const app = createApp(import.meta.env);
   let game: GameHandle | null = null;
+  /** Shown once on the next world list (why the game ended, e.g. counted out). */
+  let notice: string | null = null;
   let running = 0;
   const hud = createHud(app, { onWithdrawn: () => void flow(), onDisconnect: () => void flow() });
   hud.el.querySelector(".brand")!.after(regionPicker(app, (id) => switchRegion(id)));
@@ -87,9 +89,19 @@ async function main() {
     }
     // A region switch dropped the sender (it is bound to the old ER): rebuild it.
     if (!app.state.sender) useSession(app, app.state.session);
-    showWorlds(app, screen, (world, account) => {
-      game = enterGame(app, screen, world, account, () => void flow());
-    });
+    const shown = notice;
+    notice = null;
+    showWorlds(
+      app,
+      screen,
+      (world, account) => {
+        game = enterGame(app, screen, world, account, (why) => {
+          notice = why ?? null;
+          void flow();
+        });
+      },
+      shown,
+    );
   }
 
   if (!(await tryAutoConnect(app, () => void flow()))) await flow();

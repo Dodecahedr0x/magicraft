@@ -7,7 +7,7 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-magicraft = "4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9"
+magicraft = "4y2JKsSfShA6tL5K9Vk3NZPPev1bq29AqqNK9iYF9euz"
 
 [provider]
 cluster = "localnet"
@@ -15,3 +15,5 @@ wallet = "~/.config/solana/id.json"
 
 [scripts]
 test = "NODE_OPTIONS=\"--no-experimental-strip-types ${NODE_OPTIONS:-}\" pnpm exec ts-mocha -p ./tsconfig.json -t 1000000 \"${TEST_SPEC:-tests/**/*.spec.ts}\""
+
+[hooks]

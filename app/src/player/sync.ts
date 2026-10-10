@@ -21,11 +21,15 @@
 //   PlayerState, snap the player to it (velocity 0); every candidate failing with TimeSkew →
 //   counted, and after ~1 s snap back + recalibrate the clock; `timeout` (may still land) → re-read and
 //   adopt the onchain state without snapping; `notReady` → hold; `dead` → stop (`onDead`);
-//   `topup` / `renewSession` → `onIssue`, sends pause 5 s.
+//   `topup` / `renewSession` → `onIssue`, sends pause 5 s; `NotInWorld` (counted out of the
+//   world: expired or left elsewhere) → stop, `onKicked` (back to the world list).
 // - PlayerState notifications (health / food changes from damage, our own moves landing)
 //   only move `prev` forward when they carry a newer `last_ms`; a newer state that is not
 //   one of our moves (respawn, teleport) snaps the player to it.
 // - Idle: an unchanged position is re-sent only every `heartbeatMs` (presence freshness).
+//   While the page is hidden there are no render frames: the controller records
+//   `idleFrame`s (standing still on the ground) from a worker-driven 1 s tick, so a player
+//   who tabs away stays present (visible, attackable) until it leaves the world.
 // - Day-crank watchdog: `schedule_day_crank` when `World.last_tick_ms` is > 3 s behind
 //   chain time, at most every 5 s.
 import type { TransactionInstruction } from "@solana/web3.js";
@@ -169,6 +173,8 @@ export type SyncDeps = {
   onDead?: () => void;
   /** Top-up / session problems (sends pause for `issuePauseMs`). */
   onIssue?: (f: TxFailure) => void;
+  /** A move failed `NotInWorld`: the player was counted out of the world (sends stop). */
+  onKicked?: () => void;
   /** Local time, ms (stats, pauses, watchdog rate limit). */
   perfNow?: () => number;
   intervalMs?: number;
@@ -369,6 +375,16 @@ export class MoveSync {
     if (i) this.frames.splice(0, i);
   }
 
+  /** Records the player standing still at time `t` (the page is hidden: no render frames,
+   *  so no physics). Only when the confirmed state stands on the ground and the newest frame
+   *  is that same spot at rest, so the move is a pure presence heartbeat. */
+  idleFrame(t: number) {
+    const prev = this.prevState;
+    const last = this.frames[this.frames.length - 1];
+    if (!prev || !prev.onGround || (last && (!same(last.pos, prev.pos) || !last.onGround))) return;
+    this.record({ t, pos: [...prev.pos] as V3, vel: [0, 0, 0], onGround: true });
+  }
+
   /** Clears recorded frames (the player was moved by something other than physics). */
   resetFrames() {
     this.frames = [];
@@ -504,6 +520,13 @@ export class MoveSync {
     } else if (e.kind === "topup" || e.kind === "renewSession") {
       this.pausedUntil = this.perfNow() + (this.deps.issuePauseMs ?? 5000);
       this.deps.onIssue?.(e);
+    } else if (e.name === "NotInWorld") {
+      // Counted out of the world (expired after a minute of silence, or left from another
+      // tab): kicked. Stop sending; the game returns to the world list.
+      if (!this.stopped) {
+        this.stopped = true;
+        this.deps.onKicked?.();
+      }
     } else {
       this.stats.rejected[e.name ?? e.kind] = (this.stats.rejected[e.name ?? e.kind] ?? 0) + 1;
       this.log(`move failed (${e.kind})`, e.message);

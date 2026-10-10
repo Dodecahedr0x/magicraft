@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use magicraft_core::ground::GroundError;
 use magicraft_core::inventory::InvError;
 use magicraft_core::physics::MoveError;
 use magicraft_core::recipes::CraftError;
@@ -117,6 +118,30 @@ pub enum MagicraftError {
     SpawnNotSet, // 6143
     #[msg("The spawn chunk (0, 0) cannot be closed")]
     SpawnChunk, // 6144
+
+    // ----- ground items (appended) -----
+    #[msg("No item in that ground slot")]
+    NoItem, // 6145
+
+    // ----- worlds (appended) -----
+    #[msg("Someone joined this world or it has chunks beyond the spawn: it can't be closed")]
+    WorldInUse, // 6146
+
+    // ----- players (appended) -----
+    #[msg("That player is not in the world here")]
+    NoPlayer, // 6147
+    #[msg("Not in the world: enter it first")]
+    NotInWorld, // 6148
+}
+
+impl From<GroundError> for MagicraftError {
+    fn from(e: GroundError) -> Self {
+        match e {
+            GroundError::NoItem => Self::NoItem,
+            GroundError::OutOfReach => Self::OutOfReach,
+            GroundError::InventoryFull => Self::InventoryFull,
+        }
+    }
 }
 
 impl From<MoveError> for MagicraftError {
@@ -212,11 +237,15 @@ mod tests {
             SpawnAlreadySet,
             SpawnNotSet,
             SpawnChunk,
+            NoItem,
+            WorldInUse,
+            NoPlayer,
+            NotInWorld,
         ];
         for (i, e) in all.into_iter().enumerate() {
             assert_eq!(u32::from(e), 6100 + i as u32, "{e:?}");
         }
-        assert_eq!(all.len(), 45);
+        assert_eq!(all.len(), 49);
     }
 
     #[test]

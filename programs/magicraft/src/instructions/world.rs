@@ -1,5 +1,6 @@
 //! Worlds: `create_world` (ephemeral World sponsored by the Player, arms the day crank),
-//! `request_seed` (VRF inside the ER, any delegated Player PDA pays), `callback_seed`.
+//! `request_seed` (VRF inside the ER, any delegated Player PDA pays), `callback_seed`,
+//! `close_world` (reclaim an untouched world's rent).
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke_signed;
@@ -14,11 +15,13 @@ use ephemeral_rollups_sdk::vrf::instructions::{
 use ephemeral_rollups_sdk::vrf::types::SerializableAccountMeta;
 use session_keys::{session_auth_or, Session, SessionError, SessionTokenV2};
 
-use crate::auth::{player_seeds, world_seeds};
+use crate::auth::{chunk_seeds, player_seeds, world_seeds};
 use crate::errors::MagicraftError;
 use crate::instructions::crank::arm_day_crank;
+use crate::scheduler;
 use crate::state::{
-    ensure_sponsor_reserve, Player, TimeAnchor, World, WorldParams, PLAYER_SEED, WORLD_SEED,
+    chunk_for, ensure_sponsor_reserve, presence_for, Player, TimeAnchor, World, WorldParams,
+    PLAYER_SEED, WORLD_SEED,
 };
 
 /// VRF queue for the world seed: the ER queue (fee-exempt, so the Player PDA can pay).
@@ -105,7 +108,9 @@ pub fn create_world(
         day_ticks: 0,
         day_epoch: 0,
         first_join_ms: 0,
-        _reserved: [0; 9],
+        players_online: 0,
+        entries: 0,
+        _reserved: [0; 1],
     };
     world.day_task_id = arm_day_crank(&world_ai, &world)?;
     world.try_serialize(&mut &mut world_ai.try_borrow_mut_data()?[..])?;
@@ -196,4 +201,113 @@ pub struct CallbackSeed<'info> {
 /// generation here).
 pub fn callback_seed(ctx: Context<CallbackSeed>, randomness: [u8; 32]) -> Result<()> {
     ctx.accounts.world.set_seed(randomness)
+}
+
+// ---------- close_world (ER) ----------
+
+#[derive(Accounts, Session)]
+pub struct CloseWorld<'info> {
+    pub signer: Signer<'info>,
+    /// The creator's Player (the World's sponsor); receives the refunds. Delegated.
+    #[account(mut, seeds = [PLAYER_SEED, player.authority.as_ref()], bump = player.bump)]
+    pub player: Account<'info, Player>,
+    #[session(signer = signer, authority = player.authority.key())]
+    pub session_token: Option<Account<'info, SessionTokenV2>>,
+    /// CHECK: owner + discriminator checked in the handler (closed here, so not an
+    /// `Account`: its exit would write the data back).
+    #[account(mut)]
+    pub world: UncheckedAccount<'info>,
+    /// CHECK: chunk (0,0)'s PDA; validated by `chunk_for` when the world has it.
+    /// Writable iff it exists (the ER rejects a writable missing account; the close CPI
+    /// needs it writable).
+    pub chunk: UncheckedAccount<'info>,
+    /// CHECK: its presence list; validated by `presence_for` when the chunk exists.
+    /// Writable iff the chunk exists.
+    pub presence: UncheckedAccount<'info>,
+    /// CHECK: ephemeral rent vault
+    #[account(mut, address = EPHEMERAL_VAULT_ID)]
+    pub vault: UncheckedAccount<'info>,
+    pub magic_program: Program<'info, MagicProgram>,
+}
+
+/// Closes an **untouched** World, refunding all its rent to the creator's Player. Creator
+/// only (wallet or session key). Untouched: nobody ever joined (`first_join_ms == 0`) and
+/// it holds at most the spawn chunk (`chunk_count ≤ 1`; (0,0) is always the first chunk
+/// and never closable on its own, so `chunk_count == 1` means only (0,0)), else
+/// `WorldInUse`. The spawn chunk, if any, must be paid by this Player (`Unauthorized`),
+/// unedited (`ChunkEdited`) and empty (`ChunkOccupied`); it is closed with its presence
+/// list and its tick crank cancelled (it has no neighbors to unlink). The day crank is
+/// cancelled (unknown ids are a no-op). A pending VRF callback then simply fails.
+#[session_auth_or(
+    ctx.accounts.player.authority == ctx.accounts.signer.key(),
+    MagicraftError::Unauthorized
+)]
+pub fn close_world(ctx: Context<CloseWorld>) -> Result<()> {
+    let a = &ctx.accounts;
+    let world_ai = a.world.to_account_info();
+    require_keys_eq!(*world_ai.owner, crate::ID, MagicraftError::Unauthorized);
+    let world = World::try_deserialize(&mut &world_ai.try_borrow_data()?[..])?;
+    require_keys_eq!(
+        world.creator,
+        a.player.authority,
+        MagicraftError::Unauthorized
+    );
+    require!(
+        world.first_join_ms == 0 && world.chunk_count <= 1,
+        MagicraftError::WorldInUse
+    );
+
+    let player_ai = a.player.to_account_info();
+    let vault_ai = a.vault.to_account_info();
+    let authority = a.player.authority;
+    let pbump = [a.player.bump];
+    let pseeds = player_seeds(&authority, &pbump);
+    let mut closed_chunk = false;
+
+    if world.chunk_count == 1 {
+        let chunk_ai = a.chunk.to_account_info();
+        let presence_ai = a.presence.to_account_info();
+        let (task_id, cbump) = {
+            let h = chunk_for(&chunk_ai, world_ai.key, 0, 0)?;
+            require_keys_eq!(h.payer, a.player.key(), MagicraftError::Unauthorized);
+            require!(h.edited == 0, MagicraftError::ChunkEdited);
+            (h.task_id.get(), h.bump)
+        };
+        {
+            let (h, _) = presence_for(&presence_ai, chunk_ai.key)?;
+            require!(h.count.get() == 0, MagicraftError::ChunkOccupied);
+        }
+        if task_id != 0 {
+            let (zero, b) = (0i32.to_le_bytes(), [cbump]);
+            scheduler::cancel(
+                &chunk_ai,
+                &chunk_seeds(world_ai.key, &zero, &zero, &b),
+                task_id,
+            )?;
+        }
+        for eph in [&chunk_ai, &presence_ai] {
+            EphemeralAccount::new(&player_ai, eph, &vault_ai)
+                .with_signer_seeds(&[&pseeds])
+                .close()?;
+        }
+        closed_chunk = true;
+    }
+
+    if world.day_task_id != 0 {
+        let (nonce, wbump) = (world.nonce.to_le_bytes(), [world.bump]);
+        scheduler::cancel(
+            &world_ai,
+            &world_seeds(&world.creator, &nonce, &wbump),
+            world.day_task_id,
+        )?;
+    }
+    EphemeralAccount::new(&player_ai, &world_ai, &vault_ai)
+        .with_signer_seeds(&[&pseeds])
+        .close()?;
+
+    if closed_chunk {
+        let p = &mut ctx.accounts.player;
+        p.open_chunks = p.open_chunks.saturating_sub(1);
+    }
+    Ok(())
 }

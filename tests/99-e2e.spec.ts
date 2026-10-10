@@ -47,9 +47,18 @@ import {
   nextClientMs,
   pstatePda,
 } from "./helpers/play";
-import { Col, Plan, scoutTour, scoutWork, Terrain, V3 } from "./helpers/scout";
+import {
+  Col,
+  pickupWalk,
+  Plan,
+  scoutTour,
+  scoutWork,
+  Terrain,
+  V3,
+} from "./helpers/scout";
 import {
   breakIx,
+  collectIxs,
   countItem,
   craftIx,
   decodeInventory,
@@ -207,10 +216,34 @@ describe("e2e: one player's journey", () => {
   async function breakBlock(b: V3, name: string) {
     await ensureBlock(b);
     await waitBreak();
-    return er(
+    const sig = await er(
       [name],
       [breakIx(p, world, b, { neighbors: existing, ...auth() })]
     );
+    // The drop lands below the block: walk over, pick it up, walk back (if a
+    // walk reaches it; a block dug out of the ground leaves it in the hole).
+    const ck = chunkPda(world, Math.floor(b[0] / 16), Math.floor(b[2] / 16));
+    const w = pickupWalk(await live(), await myCol(), b);
+    if (w) {
+      await walk(w.there);
+      const feet = (await state()).move.pos;
+      const picks = collectIxs(
+        p,
+        world,
+        b,
+        (await chunkData(ck))!,
+        await chainMs(world),
+        feet,
+        auth()
+      );
+      if (picks.length)
+        await er(
+          picks.map(() => "pickup_item"),
+          picks
+        );
+      await walk(w.back);
+    }
+    return sig;
   }
 
   /** Current terrain of the existing chunks (walk planning after edits). */
@@ -306,7 +339,8 @@ describe("e2e: one player's journey", () => {
       const end = tr.path.length ? tr.path[tr.path.length - 1] : sp;
       const tw = copy();
       const pl = scoutWork(tw, [end[0], end[2]], sp, { fed: true });
-      if (typeof pl === "string" || pl.soft.length < SOFT_BLOCKS) {
+      // Spare soft blocks: a drop may land out of walking reach.
+      if (typeof pl === "string" || pl.soft.length < SOFT_BLOCKS * 1.5) {
         console.log(
           `    world ${attempt}: ${
             typeof pl === "string" ? pl : `${pl.soft.length} soft blocks`
@@ -366,8 +400,9 @@ describe("e2e: one player's journey", () => {
   it("breaks a block next to water and the water flows in", async () => {
     await walk(plan.pathW);
     const q = plan.Q;
+    // Q's chunk, and the water feeding Q (may sit across a chunk border), must exist.
+    await ensure(key(Math.floor(q[0] / 16), Math.floor(q[2] / 16)));
     expect(await blockAt(q)).to.not.equal(0);
-    // The water feeding Q may sit across a chunk border: it must exist.
     for (const [dx, dz] of N4) {
       const [cx, cz] = [
         Math.floor((q[0] + dx) / 16),
@@ -450,11 +485,16 @@ describe("e2e: one player's journey", () => {
       ["select_slot"],
       [selectIx(p, world, slotOf(inv, ITEM.WOOD_SHOVEL), auth())]
     );
-    for (const b of plan.soft.slice(0, SOFT_BLOCKS))
+    const placeable = async () =>
+      (await state()).inv
+        .filter((x) => x.item >= 1 && x.item <= 22)
+        .reduce((n, x) => n + x.count, 0);
+    // A drop that lands out of walking reach stays on the ground: dig on.
+    for (const b of plan.soft) {
+      if ((await placeable()) >= SOFT_BLOCKS + 5) break;
       await breakBlock(b, "break_block (soft, shovel)");
-    const blocks = (await state()).inv
-      .filter((x) => x.item >= 1 && x.item <= 22)
-      .reduce((n, x) => n + x.count, 0);
+    }
+    const blocks = await placeable();
     expect(blocks).to.be.at.least(SOFT_BLOCKS + 5);
     await phase(`gathered ${blocks} blocks`);
   });

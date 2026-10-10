@@ -140,6 +140,24 @@ export function mobBox(kind: number): { halfW: number; height: number } {
   }
 }
 
+/** Hit-box of a player (the client body: 0.3 half-width, 1.8 tall). */
+export const PLAYER_BOX = { halfW: 0.3, height: 1.8 } as const;
+
+/** The nearest player whose box the ray hits within `maxDist` blocks (`pos`: feet, blocks). */
+export function pickPlayer<P extends { pos: readonly number[] }>(origin: readonly number[], dir: readonly number[], maxDist: number, players: Iterable<P>): { player: P; dist: number } | null {
+  const len = Math.hypot(dir[0], dir[1], dir[2]);
+  if (!(len > 0)) return null;
+  const d = dir.map((x) => x / len);
+  const { halfW, height } = PLAYER_BOX;
+  let best: { player: P; dist: number } | null = null;
+  for (const p of players) {
+    const [x, y, z] = p.pos;
+    const t = rayBox(origin, d, [x - halfW, y, z - halfW], [x + halfW, y + height, z + halfW]);
+    if (t !== null && t <= maxDist && (!best || t < best.dist)) best = { player: p, dist: t };
+  }
+  return best;
+}
+
 export type MobRef = { cx: number; cz: number; idx: number; kind: number; hp: number; pos: V3 };
 
 /** The nearest mob whose box the ray hits within `maxDist` blocks (`pos` in FP). */

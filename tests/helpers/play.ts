@@ -179,6 +179,42 @@ export async function joinWorldIx(
     .instruction();
 }
 
+/** enter_world (back into a joined world); `expire`: PlayerStates to count out on the
+ *  way (remaining accounts, writable). */
+export async function enterWorldIx(
+  p: TestPlayer,
+  world: web3.PublicKey,
+  expire: web3.PublicKey[] = []
+) {
+  return p.er.methods
+    .enterWorld()
+    .accountsPartial({
+      signer: p.authority.publicKey,
+      player: p.player,
+      sessionToken: null,
+      world,
+      playerState: pstatePda(world, p.player),
+    })
+    .remainingAccounts(
+      expire.map((pubkey) => ({ pubkey, isSigner: false, isWritable: true }))
+    )
+    .instruction();
+}
+
+/** expire_players (permissionless): counts out the silent `states`. */
+export async function expirePlayersIx(
+  world: web3.PublicKey,
+  states: web3.PublicKey[]
+) {
+  return erProgram.methods
+    .expirePlayers()
+    .accountsPartial({ world })
+    .remainingAccounts(
+      states.map((pubkey) => ({ pubkey, isSigner: false, isWritable: true }))
+    )
+    .instruction();
+}
+
 /** move_player with the window chunks derived from `prev → pos`: a chunk is
  *  passed if `(cx, cz)` is in `existing` (keys "cx,cz"). */
 export async function moveIx(

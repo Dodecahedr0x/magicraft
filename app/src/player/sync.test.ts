@@ -300,6 +300,39 @@ describe("MoveSync", () => {
     expect(s.f.calls).toHaveLength(1);
   });
 
+  it("hidden page: idle frames keep the heartbeat going; never after a move frame elsewhere", async () => {
+    const s = setup();
+    s.setChain(10_100);
+    s.sync.idleFrame(10_050);
+    void s.sync.tick();
+    await flush();
+    expect(s.f.calls).toHaveLength(1);
+    expect(s.f.calls[0].args.pos).toEqual(HOME);
+    expect(s.f.calls[0].args.vel).toEqual([0, 0, 0]);
+    // The newest frame is somewhere else (moving): no idle frame is made up.
+    const t = setup();
+    t.sync.record(t.frame(9_900, 64));
+    t.sync.idleFrame(10_050);
+    expect(t.sync.frames.at(-1)!.pos[0]).toBe(HOME[0] + 64);
+  });
+
+  it("NotInWorld (counted out of the world): kicked once, nothing more is sent", async () => {
+    let kicks = 0;
+    const s = setup({ onKicked: () => kicks++ });
+    s.setChain(10_100);
+    s.sync.record(s.frame(10_050, 64));
+    void s.sync.tick();
+    await flush();
+    s.f.calls[0].resolve({ status: "failed", error: { kind: "other", name: "NotInWorld", message: "Not in the world" } });
+    await flush();
+    expect(kicks).toBe(1);
+    s.setChain(11_500);
+    s.sync.record(s.frame(11_400, 80));
+    await s.sync.tick();
+    expect(s.f.calls).toHaveLength(1);
+    expect(kicks).toBe(1);
+  });
+
   it("day-crank watchdog: schedule_day_crank when stale, rate-limited", async () => {
     const s = setup({ dayCrankIx: async () => new TransactionInstruction({ keys: [], programId: Keypair.generate().publicKey, data: Buffer.alloc(0) }) });
     s.sync.onWorld({ lastTickMs: 9_000 }); // 1 s behind: fine

@@ -809,6 +809,51 @@ pub fn check_move(
     Ok(MoveOutcome { fall_damage, state })
 }
 
+/// Distance a hit pushes a player back, FP (0.9 block).
+pub const PLAYER_KNOCKBACK: i64 = 230;
+
+/// Where a hit pushes a player in state `s`: horizontally away from `from` (the attacker's
+/// feet, FP), by the longest eighth (1..=8) of [`PLAYER_KNOCKBACK`] such that the body box
+/// is free at every eighth up to it and, when `s` is on the ground, the player still
+/// stands on ground there (a push never leaves a grounded state hovering). `None` when no
+/// push is possible (blocked, or the attacker stands on the player's column center).
+/// Blocks outside `w` read as solid, so a single-chunk window keeps the push in it.
+pub fn knockback_pos(w: &impl BlockAccess, s: &MoveState, from: [i32; 3]) -> Option<[i32; 3]> {
+    let [px, py, pz] = s.pos.map(i64::from);
+    let (dx, dz) = (px - from[0] as i64, pz - from[2] as i64);
+    let len = isqrt(dx * dx + dz * dz);
+    if len == 0 {
+        return None;
+    }
+    let (kx, kz) = (dx * PLAYER_KNOCKBACK / len, dz * PLAYER_KNOCKBACK / len);
+    let mut best = None;
+    for q in 1..=8 {
+        let (nx, nz) = (px + kx * q / 8, pz + kz * q / 8);
+        if !box_clear(w, nx, py, py, nz) {
+            break;
+        }
+        if !s.on_ground || grounded(w, nx, py, nz) {
+            best = Some([nx as i32, py as i32, nz as i32]);
+        }
+    }
+    best
+}
+
+/// Integer square root (floor) of `v` (0 for `v ≤ 0`); integers only (floats are emulated
+/// on SBF).
+pub(crate) fn isqrt(v: i64) -> i64 {
+    if v < 2 {
+        return v.max(0);
+    }
+    let mut x = v;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    x
+}
+
 /// Read-only 2×2 chunk window `(cx0..=cx0+1, cz0..=cz0+1)` for [`check_move`].
 /// Missing slots and anything outside read as Stone, `y < 0` as Bedrock, `y ≥ 64` as Air.
 pub struct ChunkQuad<'a> {
@@ -1861,5 +1906,81 @@ mod tests {
             assert!(r.is_ok());
         }
         println!("worst-case step: {:?}/call", t.elapsed() / (n / 10));
+    }
+
+    /// One chunk (0, 0): stone below y = 10 (feet at 10), plus `extra` stone blocks.
+    fn one_chunk(extra: &[(usize, usize, usize)]) -> Box<[u8; CHUNK_VOL]> {
+        let mut c = Box::new([AIR; CHUNK_VOL]);
+        for y in 0..10 {
+            for z in 0..CHUNK_W {
+                for x in 0..CHUNK_W {
+                    c[block_index(x, y, z)] = STONE;
+                }
+            }
+        }
+        for &(x, y, z) in extra {
+            c[block_index(x, y, z)] = STONE;
+        }
+        c
+    }
+
+    const FEET: i32 = 10 * 256;
+    const fn mid(b: i32) -> i32 {
+        b * 256 + 128
+    }
+
+    #[test]
+    fn knockback_pos_pushes_away_and_stays_grounded() {
+        let c = one_chunk(&[]);
+        let w = ChunkQuad::new(0, 0, [Some(&c), None, None, None]);
+        let s = grounded([mid(5), FEET, mid(5)], 0);
+        // Attacker west: pushed +x by the full distance.
+        assert_eq!(
+            knockback_pos(&w, &s, [mid(4), FEET, mid(5)]),
+            Some([mid(5) + PLAYER_KNOCKBACK as i32, FEET, mid(5)])
+        );
+        // Same column center: no push.
+        assert_eq!(knockback_pos(&w, &s, s.pos), None);
+        // A wall at x = 6 (feet and head rows): a shorter push, still clear of it.
+        let c = one_chunk(&[(6, 10, 5), (6, 11, 5)]);
+        let w = ChunkQuad::new(0, 0, [Some(&c), None, None, None]);
+        let p = knockback_pos(&w, &s, [mid(4), FEET, mid(5)]).unwrap();
+        assert!(p[0] > mid(5) && p[0] + HALF_W <= 6 * 256, "{p:?}");
+        // The chunk border (x = 16) reads solid: the push stays in the chunk.
+        let c = one_chunk(&[]);
+        let w = ChunkQuad::new(0, 0, [Some(&c), None, None, None]);
+        let s = grounded([16 * 256 - HALF_W - 10, FEET, mid(5)], 0);
+        assert_eq!(knockback_pos(&w, &s, [mid(14), FEET, mid(5)]), None);
+    }
+
+    #[test]
+    fn knockback_pos_never_leaves_a_grounded_player_hovering() {
+        // Ground ends at x = 6 (a hole from there on): a grounded player at the edge is
+        // pushed only as far as it still stands; an airborne one is pushed the full way.
+        let mut c = one_chunk(&[]);
+        for x in 6..CHUNK_W {
+            for z in 0..CHUNK_W {
+                for y in 0..10 {
+                    c[block_index(x, y, z)] = AIR;
+                }
+            }
+        }
+        let w = ChunkQuad::new(0, 0, [Some(&c), None, None, None]);
+        let s = grounded([mid(5), FEET, mid(5)], 0);
+        let p = knockback_pos(&w, &s, [mid(4), FEET, mid(5)]).unwrap();
+        assert!(grounded_at(&w, p), "{p:?}");
+        assert!(p[0] < mid(5) + PLAYER_KNOCKBACK as i32);
+        let air = MoveState {
+            on_ground: false,
+            ..s
+        };
+        assert_eq!(
+            knockback_pos(&w, &air, [mid(4), FEET, mid(5)]),
+            Some([mid(5) + PLAYER_KNOCKBACK as i32, FEET, mid(5)])
+        );
+    }
+
+    fn grounded_at(w: &ChunkQuad, p: [i32; 3]) -> bool {
+        super::grounded(w, p[0] as i64, p[1] as i64, p[2] as i64)
     }
 }

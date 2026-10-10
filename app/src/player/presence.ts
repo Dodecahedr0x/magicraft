@@ -98,6 +98,19 @@ export class PresenceWatch {
     return nowMs === null ? out : out.filter((e) => nowMs - e.lastSeenMs <= PRESENCE_STALE_MS + FRESH_MARGIN_MS);
   }
 
+  /** The newest cached entry of `player` (base58) fresh at chain time `nowMs`
+   *  (`PRESENCE_STALE_MS`, no margin: the program must still see it fresh), with its chunk. */
+  find(player: string, nowMs: number): { cx: number; cz: number; entry: PresenceEntry } | null {
+    let best: { cx: number; cz: number; entry: PresenceEntry } | null = null;
+    for (const s of this.slots.values())
+      for (const e of s.entries ?? [])
+        if (nowMs - e.lastSeenMs <= PRESENCE_STALE_MS && e.player.toBase58() === player && (!best || e.lastSeenMs > best.entry.lastSeenMs)) {
+          const [cx, cz] = s.key.split(",").map(Number);
+          best = { cx, cz, entry: e };
+        }
+    return best;
+  }
+
   /** The cached lists of the subscribed chunks (unfiltered). */
   *lists(): IterableIterator<PresenceEntry[]> {
     for (const s of this.slots.values()) if (s.entries) yield s.entries;

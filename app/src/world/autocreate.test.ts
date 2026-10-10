@@ -81,7 +81,7 @@ describe("AutoCreator", () => {
     // Radius 1 = the 3×3 square: 8 missing chunks, two gen txs each, then idle.
     await vi.waitFor(() => expect(a.created).toBe(8));
     await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(16));
-    expect(a.spentLamports).toBe(8 * 554_240);
+    expect(a.spentLamports).toBe(8 * 566_528);
     expect(a.next()).toBeNull();
     a.dispose();
   });
@@ -89,14 +89,14 @@ describe("AutoCreator", () => {
   it("waits for consent, then stops at the spend cap until raised", async () => {
     const s = stub(["0,0"]);
     const send = vi.fn(async () => ok);
-    const a = new AutoCreator({ store: s.store, view: s.view, send, ixs, radius: 1, concurrency: 1, capLamports: 2 * 554_240 });
+    const a = new AutoCreator({ store: s.store, view: s.view, send, ixs, radius: 1, concurrency: 1, capLamports: 2 * 566_528 });
     a.setFocus(0, 0);
     expect(a.waiting).toBe("consent");
     expect(send).not.toHaveBeenCalled();
     a.consent();
     await vi.waitFor(() => expect(a.waiting).toBe("cap"));
     expect(a.created).toBe(2);
-    a.raiseCap(554_240);
+    a.raiseCap(566_528);
     await vi.waitFor(() => expect(a.created).toBe(3));
     await vi.waitFor(() => expect(a.waiting).toBe("cap"));
     a.dispose();

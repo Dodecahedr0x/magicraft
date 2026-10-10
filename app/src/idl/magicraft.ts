@@ -5,7 +5,7 @@
  * IDL can be found at `target/idl/magicraft.json`.
  */
 export type Magicraft = {
-  "address": "4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9",
+  "address": "4y2JKsSfShA6tL5K9Vk3NZPPev1bq29AqqNK9iYF9euz",
   "metadata": {
     "name": "magicraft",
     "version": "0.1.0",
@@ -100,9 +100,72 @@ export type Magicraft = {
       ]
     },
     {
+      "name": "attackPlayer",
+      "docs": [
+        "Attacks the player `target` (Player PDA) listed fresh in `presence` (PvP): the damage",
+        "goes to its presence entry and lands on its next move."
+      ],
+      "discriminator": [
+        204,
+        207,
+        73,
+        170,
+        216,
+        244,
+        173,
+        255
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "player"
+        },
+        {
+          "name": "sessionToken",
+          "optional": true
+        },
+        {
+          "name": "world",
+          "docs": [
+            "Read-only: params, chain time."
+          ]
+        },
+        {
+          "name": "playerState",
+          "writable": true
+        },
+        {
+          "name": "chunk"
+        },
+        {
+          "name": "presence",
+          "writable": true
+        },
+        {
+          "name": "targetState",
+          "docs": [
+            "The target's PlayerState in this world: knockback moves it. `dup`: a self-hit passes",
+            "our own PlayerState here and must fail with `InvalidTarget` (the handler), not",
+            "Anchor's duplicate check; a succeeding call never aliases (target ≠ us)."
+          ],
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "target",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
       "name": "breakBlock",
       "docs": [
-        "Breaks a block within reach (cooldown = break time; drop to inventory, fluid enqueue)."
+        "Breaks a block within reach (cooldown = break time; the drop floats where the block",
+        "was; fluid enqueue)."
       ],
       "discriminator": [
         145,
@@ -349,6 +412,90 @@ export type Magicraft = {
           "type": "i32"
         }
       ]
+    },
+    {
+      "name": "closeWorld",
+      "docs": [
+        "Closes an untouched world (nobody joined, at most the spawn chunk) and its spawn",
+        "chunk; refunds the creator's Player."
+      ],
+      "discriminator": [
+        250,
+        171,
+        64,
+        179,
+        30,
+        236,
+        152,
+        24
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "player",
+          "docs": [
+            "The creator's Player (the World's sponsor); receives the refunds. Delegated."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  108,
+                  97,
+                  121,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "player.authority",
+                "account": "player"
+              }
+            ]
+          }
+        },
+        {
+          "name": "sessionToken",
+          "optional": true
+        },
+        {
+          "name": "world",
+          "docs": [
+            "`Account`: its exit would write the data back)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "chunk",
+          "docs": [
+            "Writable iff it exists (the ER rejects a writable missing account; the close CPI",
+            "needs it writable)."
+          ]
+        },
+        {
+          "name": "presence",
+          "docs": [
+            "Writable iff the chunk exists."
+          ]
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "address": "MagicVau1t999999999999999999999999999999999"
+        },
+        {
+          "name": "magicProgram",
+          "address": "Magic11111111111111111111111111111111111111"
+        }
+      ],
+      "args": []
     },
     {
       "name": "craft",
@@ -824,38 +971,38 @@ export type Magicraft = {
             "program": {
               "kind": "const",
               "value": [
-                48,
-                137,
-                70,
-                76,
-                148,
-                75,
-                16,
-                66,
-                104,
-                222,
-                201,
-                224,
-                1,
-                24,
-                131,
-                245,
-                94,
-                181,
-                167,
-                141,
-                195,
-                41,
-                59,
-                86,
-                137,
-                187,
-                240,
-                221,
-                49,
-                242,
-                105,
-                234
+                58,
+                237,
+                13,
+                246,
+                193,
+                145,
+                34,
+                243,
+                7,
+                180,
+                0,
+                164,
+                220,
+                176,
+                138,
+                170,
+                241,
+                173,
+                202,
+                71,
+                188,
+                18,
+                18,
+                17,
+                150,
+                156,
+                235,
+                98,
+                216,
+                136,
+                144,
+                245
               ]
             }
           }
@@ -960,7 +1107,7 @@ export type Magicraft = {
         },
         {
           "name": "ownerProgram",
-          "address": "4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9"
+          "address": "4y2JKsSfShA6tL5K9Vk3NZPPev1bq29AqqNK9iYF9euz"
         },
         {
           "name": "delegationProgram",
@@ -1074,6 +1221,77 @@ export type Magicraft = {
           "type": "u8"
         }
       ]
+    },
+    {
+      "name": "enterWorld",
+      "docs": [
+        "Back into a joined world (counted in `World.players_online`); `remaining_accounts`:",
+        "≤ 8 silent PlayerStates to count out on the way."
+      ],
+      "discriminator": [
+        197,
+        198,
+        78,
+        220,
+        130,
+        175,
+        252,
+        106
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "player",
+          "docs": [
+            "Read-only; tied to `player_state`."
+          ]
+        },
+        {
+          "name": "sessionToken",
+          "optional": true
+        },
+        {
+          "name": "world",
+          "docs": [
+            "`players_online` +1."
+          ],
+          "writable": true
+        },
+        {
+          "name": "playerState",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "expirePlayers",
+      "docs": [
+        "Permissionless: counts out the given PlayerStates silent for over a minute."
+      ],
+      "discriminator": [
+        192,
+        184,
+        65,
+        183,
+        168,
+        173,
+        114,
+        126
+      ],
+      "accounts": [
+        {
+          "name": "world",
+          "docs": [
+            "`players_online` − the expired count."
+          ],
+          "writable": true
+        }
+      ],
+      "args": []
     },
     {
       "name": "growChunk",
@@ -1298,6 +1516,88 @@ export type Magicraft = {
       "args": []
     },
     {
+      "name": "leaveWorld",
+      "docs": [
+        "Leaves the world for now: removes the player's presence entry (nobody sees or can",
+        "attack it until it enters again), applying its pending damage first; counts it out."
+      ],
+      "discriminator": [
+        17,
+        47,
+        81,
+        64,
+        139,
+        223,
+        8,
+        113
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "player",
+          "docs": [
+            "Presence rent sponsor (the freed entry is refunded to it). `mut` ⇒ delegated."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  108,
+                  97,
+                  121,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "player.authority",
+                "account": "player"
+              }
+            ]
+          }
+        },
+        {
+          "name": "sessionToken",
+          "optional": true
+        },
+        {
+          "name": "world",
+          "docs": [
+            "`players_online` −1."
+          ],
+          "writable": true
+        },
+        {
+          "name": "playerState",
+          "writable": true
+        },
+        {
+          "name": "chunk"
+        },
+        {
+          "name": "presence",
+          "writable": true
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "address": "MagicVau1t999999999999999999999999999999999"
+        },
+        {
+          "name": "magicProgram",
+          "address": "Magic11111111111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "movePlayer",
       "docs": [
         "Validates and applies one movement update (presence, damage, hunger). World read-only."
@@ -1429,6 +1729,58 @@ export type Magicraft = {
         {
           "name": "clientMs",
           "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "pickupItem",
+      "docs": [
+        "Picks ground item slot `idx` of `chunk` up (within 2 blocks; as much as fits)."
+      ],
+      "discriminator": [
+        227,
+        155,
+        134,
+        52,
+        209,
+        36,
+        82,
+        49
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "player",
+          "docs": [
+            "Read-only; tied to `player_state`."
+          ]
+        },
+        {
+          "name": "sessionToken",
+          "optional": true
+        },
+        {
+          "name": "world",
+          "docs": [
+            "Read-only: chain time."
+          ]
+        },
+        {
+          "name": "playerState",
+          "writable": true
+        },
+        {
+          "name": "chunk",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "idx",
+          "type": "u8"
         }
       ]
     },
@@ -2414,6 +2766,26 @@ export type Magicraft = {
       "code": 6144,
       "name": "spawnChunk",
       "msg": "The spawn chunk (0, 0) cannot be closed"
+    },
+    {
+      "code": 6145,
+      "name": "noItem",
+      "msg": "No item in that ground slot"
+    },
+    {
+      "code": 6146,
+      "name": "worldInUse",
+      "msg": "Someone joined this world or it has chunks beyond the spawn: it can't be closed"
+    },
+    {
+      "code": 6147,
+      "name": "noPlayer",
+      "msg": "That player is not in the world here"
+    },
+    {
+      "code": 6148,
+      "name": "notInWorld",
+      "msg": "Not in the world: enter it first"
     }
   ],
   "types": [
@@ -2558,11 +2930,20 @@ export type Magicraft = {
             "type": "i64"
           },
           {
+            "name": "inWorld",
+            "docs": [
+              "1 while the player is in the world (counted in `World.players_online`): set by",
+              "`join_world` / `enter_world`, cleared by `leave_world` / `expire_players`.",
+              "`move_player` requires it (`NotInWorld`)."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "reserved",
             "type": {
               "array": [
                 "u8",
-                26
+                25
               ]
             }
           }
@@ -2785,11 +3166,27 @@ export type Magicraft = {
             "type": "i64"
           },
           {
+            "name": "playersOnline",
+            "docs": [
+              "Players in the world now: `PlayerState.in_world` set (`join_world` / `enter_world`",
+              "+1; `leave_world` / `expire_players` −1). See `instructions::play` (\"Players in the",
+              "world\")."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "entries",
+            "docs": [
+              "Wrapping count of entries (`join_world` + `enter_world` that set `in_world`)."
+            ],
+            "type": "u32"
+          },
+          {
             "name": "reserved",
             "type": {
               "array": [
                 "u8",
-                9
+                1
               ]
             }
           }

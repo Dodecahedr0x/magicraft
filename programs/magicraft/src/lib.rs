@@ -14,7 +14,7 @@ pub mod state;
 pub use instructions::*;
 pub use state::WorldParams;
 
-declare_id!("4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9");
+declare_id!("4y2JKsSfShA6tL5K9Vk3NZPPev1bq29AqqNK9iYF9euz");
 
 #[ephemeral]
 #[program]
@@ -103,11 +103,34 @@ pub mod magicraft {
         instructions::chunk::close_chunk(ctx, cx, cz)
     }
 
+    /// Closes an untouched world (nobody joined, at most the spawn chunk) and its spawn
+    /// chunk; refunds the creator's Player.
+    pub fn close_world(ctx: Context<CloseWorld>) -> Result<()> {
+        instructions::world::close_world(ctx)
+    }
+
     // ----- Playing (ER) -----
 
     /// Creates the player's `PlayerState` in the world at the spawn (sponsored by the Player).
     pub fn join_world(ctx: Context<JoinWorld>) -> Result<()> {
         instructions::play::join_world(ctx)
+    }
+
+    /// Back into a joined world (counted in `World.players_online`); `remaining_accounts`:
+    /// ≤ 8 silent PlayerStates to count out on the way.
+    pub fn enter_world(ctx: Context<EnterWorld>) -> Result<()> {
+        instructions::play::enter_world(ctx)
+    }
+
+    /// Permissionless: counts out the given PlayerStates silent for over a minute.
+    pub fn expire_players(ctx: Context<ExpirePlayers>) -> Result<()> {
+        instructions::play::expire_players(ctx)
+    }
+
+    /// Leaves the world for now: removes the player's presence entry (nobody sees or can
+    /// attack it until it enters again), applying its pending damage first; counts it out.
+    pub fn leave_world(ctx: Context<LeaveWorld>) -> Result<()> {
+        instructions::play::leave_world(ctx)
     }
 
     /// Validates and applies one movement update (presence, damage, hunger). World read-only.
@@ -121,9 +144,15 @@ pub mod magicraft {
         instructions::play::move_player(ctx, pos, vel, on_ground, client_ms)
     }
 
-    /// Breaks a block within reach (cooldown = break time; drop to inventory, fluid enqueue).
+    /// Breaks a block within reach (cooldown = break time; the drop floats where the block
+    /// was; fluid enqueue).
     pub fn break_block(ctx: Context<BreakBlock>, x: i32, y: i32, z: i32) -> Result<()> {
         instructions::actions::break_block(ctx, x, y, z)
+    }
+
+    /// Picks ground item slot `idx` of `chunk` up (within 2 blocks; as much as fits).
+    pub fn pickup_item(ctx: Context<PickupItem>, idx: u8) -> Result<()> {
+        instructions::actions::pickup_item(ctx, idx)
     }
 
     /// Places the block item of `slot` at a free, face-adjacent position within reach.
@@ -151,6 +180,12 @@ pub mod magicraft {
     /// Attacks the mob in slot `idx` of `chunk` (drops to inventory on death).
     pub fn attack_mob(ctx: Context<AttackMob>, idx: u8) -> Result<()> {
         instructions::actions::attack_mob(ctx, idx)
+    }
+
+    /// Attacks the player `target` (Player PDA) listed fresh in `presence` (PvP): the damage
+    /// goes to its presence entry and lands on its next move.
+    pub fn attack_player(ctx: Context<AttackPlayer>, target: Pubkey) -> Result<()> {
+        instructions::actions::attack_player(ctx, target)
     }
 
     /// Eats the food in `slot`.

@@ -50,7 +50,9 @@
 //! | 243 | `day_ticks` | u32 (wrapping count of `tick_day` executions; diagnostics) |
 //! | 247 | `day_epoch` | u8 (day-crank task id epoch, bumped by a stale re-arm) |
 //! | 248 | `first_join_ms` | i64 (chain ms of the first `join_world`; 0 = none: the clock may still step back) |
-//! | 256 | `_reserved` | [u8; 9] |
+//! | 256 | `players_online` | u32 (players with `PlayerState.in_world` set) |
+//! | 260 | `entries` | u32 (wrapping count of entries into the world) |
+//! | 264 | `_reserved` | [u8; 1] |
 //!
 //! # `PlayerState` (ephemeral), PDA `["pstate", world, player]`, 432 bytes
 //! | off | field | type |
@@ -70,12 +72,15 @@
 //! | 382 | `attack_until_ms` | i64 |
 //! | 390 | `food_tick_ms` | i64 (last hunger / regen step) |
 //! | 398 | `respawn_ms` | i64 (chain ms of the last `respawn`, 0 = never; own presence entries last seen before it lose their `pending_damage`) |
-//! | 406 | `_reserved` | [u8; 26] |
+//! | 406 | `in_world` | u8 (1 = in the world, counted in `World.players_online`) |
+//! | 407 | `_reserved` | [u8; 25] |
 //!
 //! # `Chunk` (ephemeral), PDA `["chunk", world, cx i32 LE, cz i32 LE]`
 //! Created at [`CHUNK_INITIAL_LEN`] (10 240) bytes, then resized to [`CHUNK_FULL_LEN`]
-//! (17 152) by `grow_chunk`. Blocks start at [`CHUNK_BLOCKS_OFFSET`] (768), index
-//! `y * 256 + z * 16 + x`.
+//! (17 536) by `grow_chunk`. Blocks start at [`CHUNK_BLOCKS_OFFSET`] (768), index
+//! `y * 256 + z * 16 + x`; ground items (`core::ground`, 16 × 24 B) at
+//! [`CHUNK_GROUND_OFFSET`] (17 152). A chunk grown before ground items existed is 17 152
+//! bytes long: still playable, but its drops go straight to the inventory.
 //!
 //! | off | field | type |
 //! |---|---|---|
@@ -101,6 +106,7 @@
 //! | 765 | `task_epoch` | u8 (epoch mixed into `task_id`; bumped by a stale re-arm with a write) |
 //! | 766 | `repair_s` | u16 (chain seconds mod 2^16 of the last list repair; throttle) |
 //! | 768 | blocks | [u8; 16 384] |
+//! | 17 152 | `ground` | [u8; 384] (16 × `core::ground::GroundItem`, 24 B each) |
 //!
 //! # `ChunkPresence` (ephemeral), PDA `["presence", chunk]`, `48 + 56·n` bytes
 //! | off | field | type |
@@ -122,6 +128,7 @@ use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use magicraft_core::consts::CHUNK_VOL;
 use magicraft_core::fluid::FluidQueue;
+use magicraft_core::ground::GroundItems;
 use magicraft_core::inventory::Inventory;
 use magicraft_core::mobs::{Mob, MOB_SLOTS};
 use magicraft_core::physics::{self as phys, MoveState};
@@ -477,7 +484,13 @@ pub struct World {
     /// Chain ms of the first `join_world` (0 = nobody joined yet). Until then the day crank
     /// may step the clock backward (see [`TimeAnchor`]); afterwards it is monotonic.
     pub first_join_ms: i64,
-    pub _reserved: [u8; 9],
+    /// Players in the world now: `PlayerState.in_world` set (`join_world` / `enter_world`
+    /// +1; `leave_world` / `expire_players` −1). See `instructions::play` ("Players in the
+    /// world").
+    pub players_online: u32,
+    /// Wrapping count of entries (`join_world` + `enter_world` that set `in_world`).
+    pub entries: u32,
+    pub _reserved: [u8; 1],
 }
 
 // `create_world` creates the World in one CPI (≤ 10 240 bytes).
@@ -599,7 +612,11 @@ pub struct PlayerState {
     /// Chain ms of the last `respawn` (0 = never). Pending damage on an own presence entry
     /// last seen before it hit the dead body and is dropped (`presence::upsert`).
     pub respawn_ms: i64,
-    pub _reserved: [u8; 26],
+    /// 1 while the player is in the world (counted in `World.players_online`): set by
+    /// `join_world` / `enter_world`, cleared by `leave_world` / `expire_players`.
+    /// `move_player` requires it (`NotInWorld`).
+    pub in_world: u8,
+    pub _reserved: [u8; 25],
 }
 
 const _: () = assert!(MoveState::SIZE == 72 && Inventory::SIZE == 216);
@@ -689,7 +706,12 @@ pub const CHUNK_BLOCKS_OFFSET: usize = CHUNK_HEADER_SIZE;
 /// Length at creation (max growth of one CPI).
 pub const CHUNK_INITIAL_LEN: usize = 10_240;
 /// Length after `grow_chunk`.
-pub const CHUNK_FULL_LEN: usize = CHUNK_BLOCKS_OFFSET + CHUNK_VOL;
+pub const CHUNK_FULL_LEN: usize = CHUNK_GROUND_OFFSET + GroundItems::SIZE;
+/// End of the block region: a chunk at least this long is playable. Chunks grown before
+/// ground items existed end here (no ground region: their drops go to the inventory).
+pub const CHUNK_BLOCKS_END: usize = CHUNK_BLOCKS_OFFSET + CHUNK_VOL;
+/// Ground items (`core::ground::GroundItems` layout, 16 × 24 B) after the blocks.
+pub const CHUNK_GROUND_OFFSET: usize = CHUNK_BLOCKS_END;
 
 /// Fixed header of a `Chunk` account (layout table in the module docs).
 #[repr(C)]
@@ -844,7 +866,10 @@ pub fn chunk_header_from_mut(data: &mut [u8]) -> Result<&mut ChunkHeader> {
 /// [`CHUNK_FULL_LEN`]; generation stage not checked).
 pub fn chunk_parts_from_mut(data: &mut [u8]) -> Result<(&mut ChunkHeader, &mut [u8; CHUNK_VOL])> {
     chunk_header_from(data)?;
-    require!(data.len() >= CHUNK_FULL_LEN, MagicraftError::ChunkNotReady);
+    require!(
+        data.len() >= CHUNK_BLOCKS_END,
+        MagicraftError::ChunkNotReady
+    );
     let (h, rest) = data.split_at_mut(CHUNK_BLOCKS_OFFSET);
     let blocks: &mut [u8; CHUNK_VOL] = (&mut rest[..CHUNK_VOL]).try_into().unwrap();
     Ok((bytemuck::from_bytes_mut(h), blocks))
@@ -1011,12 +1036,38 @@ pub fn ready_chunk_blocks_ro<'a>(
         MagicraftError::InvalidChunk
     );
     require!(
-        h.is_done() && data.len() >= CHUNK_FULL_LEN,
+        h.is_done() && data.len() >= CHUNK_BLOCKS_END,
         MagicraftError::ChunkNotReady
     );
     Ok(core::cell::Ref::map(data, |d| {
-        <&[u8; CHUNK_VOL]>::try_from(&d[CHUNK_BLOCKS_OFFSET..CHUNK_FULL_LEN]).unwrap()
+        <&[u8; CHUNK_VOL]>::try_from(&d[CHUNK_BLOCKS_OFFSET..CHUNK_BLOCKS_END]).unwrap()
     }))
+}
+
+/// Blocks + ground items of a chunk account (owner + discriminator checked), `None` for a
+/// chunk without the ground region (grown before it existed, or not grown yet).
+#[allow(clippy::type_complexity)]
+pub fn chunk_ground_mut<'a>(
+    ai: &'a AccountInfo,
+) -> Result<
+    Option<(
+        RefMut<'a, [u8; CHUNK_VOL]>,
+        RefMut<'a, [u8; GroundItems::SIZE]>,
+    )>,
+> {
+    check_owner(ai)?;
+    let mut data = ai.try_borrow_mut_data()?;
+    chunk_header_from_mut(&mut data)?;
+    if data.len() < CHUNK_FULL_LEN {
+        return Ok(None);
+    }
+    Ok(Some(RefMut::map_split(data, |d| {
+        let (blocks, ground) = d[CHUNK_BLOCKS_OFFSET..CHUNK_FULL_LEN].split_at_mut(CHUNK_VOL);
+        (
+            <&mut [u8; CHUNK_VOL]>::try_from(blocks).unwrap(),
+            <&mut [u8; GroundItems::SIZE]>::try_from(ground).unwrap(),
+        )
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,7 +1308,9 @@ mod tests {
             day_ticks: 16,
             day_epoch: 0,
             first_join_ms: 17,
-            _reserved: [0; 9],
+            players_online: 0,
+            entries: 0,
+            _reserved: [0; 1],
         };
         let mut b = World::DISCRIMINATOR.to_vec();
         b.extend(borsh(&w));
@@ -1303,7 +1356,8 @@ mod tests {
             attack_until_ms: 200,
             food_tick_ms: 300,
             respawn_ms: 400,
-            _reserved: [0; 26],
+            in_world: 0,
+            _reserved: [0; 25],
         };
         s.set_move_state(&ms);
         s.set_inventory(&inv);
@@ -1377,12 +1431,14 @@ mod tests {
         assert!(chunk_header_from_mut(&mut data).is_ok());
         let e = chunk_parts_from_mut(&mut data).err().unwrap();
         assert_eq!(e, error!(MagicraftError::ChunkNotReady));
-        data.resize(CHUNK_FULL_LEN, 0);
+        // A legacy chunk (blocks, no ground region) is playable.
+        data.resize(CHUNK_BLOCKS_END, 0);
         let (h, blocks) = chunk_parts_from_mut(&mut data).unwrap();
         assert_eq!(h.cx.get(), 0);
         blocks[CHUNK_VOL - 1] = 42;
-        assert_eq!(data[CHUNK_FULL_LEN - 1], 42);
-        assert_eq!(CHUNK_FULL_LEN, 17_152);
+        assert_eq!(data[CHUNK_BLOCKS_END - 1], 42);
+        assert_eq!(CHUNK_BLOCKS_END, 17_152);
+        assert_eq!(CHUNK_FULL_LEN, 17_536);
     }
 
     #[test]
@@ -1494,7 +1550,9 @@ mod tests {
             day_ticks: 0,
             day_epoch: 0,
             first_join_ms: 0,
-            _reserved: [0; 9],
+            players_online: 0,
+            entries: 0,
+            _reserved: [0; 1],
         }
     }
 

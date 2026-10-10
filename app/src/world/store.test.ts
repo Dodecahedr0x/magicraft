@@ -99,7 +99,7 @@ describe("ChunkStore", () => {
     expect(store.getBlock(3, -1, 4)).toBeNull();
   });
 
-  it("re-meshes on block changes only, and border neighbors too", async () => {
+  it("re-meshes on block changes only, and every loaded neighbor too (sky light)", async () => {
     vi.useFakeTimers();
     try {
       const f = fakeConn();
@@ -120,22 +120,16 @@ describe("ChunkStore", () => {
       vi.runAllTimers();
       expect(dirty).toEqual([]);
 
-      // Interior change: only (0,0).
+      // Any block change: (0,0) and its loaded neighbors (sky light crosses borders).
       f.push(0, 0, chunkData((b) => (b[bi(5, 5, 5)] = 3)));
       vi.runAllTimers();
-      expect(dirty).toEqual([["0,0"]]);
+      expect(new Set(dirty.flat())).toEqual(new Set(["0,0", "-1,0", "0,1"]));
       dirty.length = 0;
 
-      // West border column (lx = 0) changes: (0,0) and its west neighbor (−1,0).
-      f.push(0, 0, chunkData((b) => ((b[bi(5, 5, 5)] = 3), (b[bi(0, 5, 5)] = 3))));
-      vi.runAllTimers();
-      expect(new Set(dirty.flat())).toEqual(new Set(["0,0", "-1,0"]));
-      dirty.length = 0;
-
-      // A chunk appearing marks itself and its loaded neighbors.
+      // A chunk appearing marks itself and its loaded neighbors (diagonals included).
       f.push(1, 0, chunkData());
       vi.runAllTimers();
-      expect(new Set(dirty.flat())).toEqual(new Set(["1,0", "0,0"]));
+      expect(new Set(dirty.flat())).toEqual(new Set(["1,0", "0,0", "0,1"]));
       expect(store.meshInput("0,0")!.borders.map((b) => !!b)).toEqual([false, true, true, true]);
     } finally {
       vi.useRealTimers();

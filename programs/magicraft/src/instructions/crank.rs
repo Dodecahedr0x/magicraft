@@ -963,7 +963,9 @@ mod tests {
             day_ticks: 0,
             day_epoch: 0,
             first_join_ms: 0,
-            _reserved: [0; 9],
+            players_online: 0,
+            entries: 0,
+            _reserved: [0; 1],
         };
         let mut data = World::DISCRIMINATOR.to_vec();
         w.serialize(&mut data).unwrap();

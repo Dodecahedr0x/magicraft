@@ -313,6 +313,20 @@ export async function closeChunkIx(
   return setWritable(ix, slots);
 }
 
+/** `close_world` (creator only, nobody joined, at most the spawn chunk): closes the World
+ *  and its spawn chunk, refunding all rent to the Player. The chunk (0,0) and its presence
+ *  are writable iff the chunk exists (`World.chunkCount > 0`). */
+export async function closeWorldIx(program: MagicraftProgram, auth: Auth, world: PublicKey, hasSpawnChunk: boolean) {
+  const pid = program.programId;
+  const chunk = chunkPda(pid, world, 0, 0);
+  const presence = presencePda(pid, chunk);
+  const ix = await program.methods
+    .closeWorld()
+    .accountsPartial({ ...authAccounts(auth), world, chunk, presence })
+    .instruction();
+  return setWritable(ix, [chunk, presence].map((pubkey) => ({ pubkey, writable: hasSpawnChunk })));
+}
+
 /** Permissionless chunk-crank watchdog re-arm (no-op unless stale). */
 export async function armChunkIx(program: MagicraftProgram, world: PublicKey, cx: number, cz: number) {
   return program.methods
@@ -621,10 +635,93 @@ export async function attackMobIx(
     .instruction();
 }
 
+/** `pickup_item(idx)`: ground slot `idx` of chunk `(cx, cz)` into the inventory. */
+export async function pickupItemIx(
+  program: MagicraftProgram,
+  auth: Auth,
+  world: PublicKey,
+  cx: number,
+  cz: number,
+  idx: number,
+) {
+  return program.methods
+    .pickupItem(idx)
+    .accountsPartial({
+      ...authAccounts(auth),
+      world,
+      playerState: pstateOf(program, auth, world),
+      chunk: chunkPda(program.programId, world, cx, cz),
+    })
+    .instruction();
+}
+
 /** `respawn` (only when dead: back to spawn, inventory cleared). */
 export async function respawnIx(program: MagicraftProgram, auth: Auth, world: PublicKey) {
   return program.methods
     .respawn()
     .accountsPartial({ ...authAccounts(auth), world, playerState: pstateOf(program, auth, world) })
+    .instruction();
+}
+
+/** `attack_player(target)` (PvP): `target` = the victim's Player PDA, listed (fresh) in the
+ *  presence list of chunk `(cx, cz)`. */
+export async function attackPlayerIx(
+  program: MagicraftProgram,
+  auth: Auth,
+  world: PublicKey,
+  target: PublicKey,
+  cx: number,
+  cz: number,
+) {
+  const pid = program.programId;
+  const chunk = chunkPda(pid, world, cx, cz);
+  return program.methods
+    .attackPlayer(target)
+    .accountsPartial({
+      ...authAccounts(auth),
+      world,
+      playerState: pstateOf(program, auth, world),
+      chunk,
+      presence: presencePda(pid, chunk),
+      // Knockback moves the target's PlayerState.
+      targetState: pstatePda(pid, world, target),
+    })
+    .instruction();
+}
+
+/** `leave_world`: removes the player's presence entry in its current chunk `(cx, cz)`
+ *  (`PlayerState.cx/cz`): nobody sees or can hit it until its next move. */
+export async function leaveWorldIx(program: MagicraftProgram, auth: Auth, world: PublicKey, cx: number, cz: number) {
+  const pid = program.programId;
+  const chunk = chunkPda(pid, world, cx, cz);
+  return program.methods
+    .leaveWorld()
+    .accountsPartial({
+      ...authAccounts(auth),
+      world,
+      playerState: pstateOf(program, auth, world),
+      chunk,
+      presence: presencePda(pid, chunk),
+    })
+    .instruction();
+}
+
+/** `enter_world`: back into a joined world (counted in `World.playersOnline`; a no-op if
+ *  already in). `expire`: ≤ `MAX_EXPIRE` silent PlayerStates of the world to count out on
+ *  the way (see `findSilentPlayers`). */
+export async function enterWorldIx(program: MagicraftProgram, auth: Auth, world: PublicKey, expire: PublicKey[] = []) {
+  return program.methods
+    .enterWorld()
+    .accountsPartial({ ...authAccounts(auth), world, playerState: pstateOf(program, auth, world) })
+    .remainingAccounts(expire.map((pubkey) => ({ pubkey, isSigner: false, isWritable: true })))
+    .instruction();
+}
+
+/** `expire_players` (permissionless): counts out the given silent PlayerStates of `world`. */
+export async function expirePlayersIx(program: MagicraftProgram, world: PublicKey, states: PublicKey[]) {
+  return program.methods
+    .expirePlayers()
+    .accountsPartial({ world })
+    .remainingAccounts(states.map((pubkey) => ({ pubkey, isSigner: false, isWritable: true })))
     .instruction();
 }

@@ -150,6 +150,7 @@ describe("delegation record", () => {
   it("decodes the validator, owner, slot, lamports and commit frequency", () => {
     const r = decodeDelegationRecord(DEVNET_RECORD)!;
     expect(r.validator!.toBase58()).toBe(EU);
+    // Recorded under the first devnet program id (closed 2026-10-10).
     expect(r.owner.toBase58()).toBe("4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9");
     expect(r.delegationSlot).toBe(509_445_328n);
     expect(r.lamports).toBe(51_183_640n);

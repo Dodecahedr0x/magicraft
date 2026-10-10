@@ -5,6 +5,10 @@
 //   Only targets the program would accept are highlighted: blocks within reach of the eye
 //   at the **onchain** position (`MoveSync.prevState`, the program's rule: center ≤ reach +
 //   0.5), mobs within melee reach (3 + 0.5 to the mob column).
+// - Other players (drawn by world/players.ts, picked where drawn) are targets while their
+//   presence entry is fresh: left click sends `attack_player` (PvP, the shared attack
+//   cooldown); the program checks reach against that entry. `leaveWorld` takes us out of
+//   the presence lists (the game's "Back to worlds").
 // - Left mouse (held): mine the targeted block. Progress runs over `break_time_ms(block,
 //   held tool)` (core wasm) and is gated by the onchain cooldown (`break_until_ms`, plus a
 //   local guard after each break: the program sets `break_until = now + time of the block
@@ -16,16 +20,26 @@
 //   hit face if the client checks pass (`rules.placeError`: reach, replaceable target,
 //   face-adjacent support, no overlap with the placer's onchain + local box or any fresh
 //   presence entry); optimistic with rollback. Held: repeats every 250 ms.
+// - Ground items (the drops of broken blocks, onchain in the chunk accounts) are drawn by
+//   `GroundLayer` and picked up automatically: an item within pickup reach of the onchain
+//   position gets a `pickup_item` (it flies to the player meanwhile; back on failure). One
+//   the inventory can't take waits until the inventory changes.
+// - The block being mined shows a crack texture of the progress (`CrackOverlay`).
 // - The tool the program uses is the onchain `held_slot`: hotbar selections are sent as
 //   `select_slot` (debounced, `SlotSelect`), and a break / attack first waits until the
 //   onchain slot matches the local selection.
 import * as THREE from "three";
-import type { PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { PublicKey, type TransactionInstruction } from "@solana/web3.js";
 import {
   attackMobIx,
+  attackPlayerIx,
   breakBlockIx,
   craftIx,
+  decodeGroundItems,
   decodeMob,
+  inPickupReach,
+  leaveWorldIx,
+  pickupItemIx,
   MOBS_OFFSET,
   eatIx,
   GEN_DONE,
@@ -46,9 +60,11 @@ import type { ChunkStore } from "../world/store";
 import type { WorldHandle } from "../world/world";
 import { itemInfo, itemName } from "../ui/items";
 import { BLOCK_NAMES } from "../world/blocks";
+import { CrackOverlay } from "../world/crack";
+import { GroundLayer, type ShownItem } from "../world/drops";
 import type { PlayerSession } from "./controller";
 import { placePresenceChunks, PRESENCE_RADIUS, PresenceWatch } from "./presence";
-import { blockInReach, FLUID, mobBox, mobInReach, nearestStation, pickMob, placeError, raycast, SOLID, type BlockHit, type MobRef } from "./rules";
+import { blockInReach, FLUID, mobBox, mobInReach, nearestStation, pickMob, pickPlayer, placeError, PLAYER_BOX, raycast, SOLID, type BlockHit, type MobRef } from "./rules";
 
 /** Short player-facing messages for action failures (null = stay silent). */
 const MESSAGES: Record<string, string | null> = {
@@ -71,6 +87,8 @@ const MESSAGES: Record<string, string | null> = {
   UnknownRecipe: "Unknown recipe.",
   ChunkNotReady: "That chunk is still generating.",
   NoMob: null,
+  // Counted out of the world: the game returns to the world list (`onKicked`).
+  NotInWorld: null,
   Cooldown: null,
   Dead: null,
   NotDead: null,
@@ -192,6 +210,33 @@ export class MobIndex {
   }
 }
 
+// ---------------------------------------------------------------- ground items
+
+/** Ground items of every loaded chunk (decoded, cached per chunk version; expiry is
+ *  applied by the caller). Keys change when a slot's item, count or position changes. */
+export class GroundIndex {
+  private cache = new Map<string, { version: number; items: ShownItem[] }>();
+  constructor(private readonly store: WorldHandle["store"]) {}
+
+  all(): ShownItem[] {
+    const out: ShownItem[] = [];
+    const seen = new Set<string>();
+    for (const e of this.store.entries()) {
+      seen.add(e.key);
+      if (!e.data || e.genStage !== GEN_DONE) continue;
+      let c = this.cache.get(e.key);
+      if (!c || c.version !== e.version) {
+        const items = decodeGroundItems(e.data, -Infinity).map((g) => ({ ...g, key: `${e.key}:${g.idx}:${g.item}:${g.count}:${g.pos.join(",")}` }));
+        c = { version: e.version, items };
+        this.cache.set(e.key, c);
+      }
+      out.push(...c.items);
+    }
+    for (const k of this.cache.keys()) if (!seen.has(k)) this.cache.delete(k);
+    return out;
+  }
+}
+
 // ---------------------------------------------------------------- optimistic edits
 
 export type EditStore = Pick<ChunkStore, "setLocal" | "clearLocal" | "revertLocal">;
@@ -231,7 +276,13 @@ export async function optimisticEdit(o: {
 
 // ---------------------------------------------------------------- interaction
 
-export type Target = { kind: "block"; hit: BlockHit; inReach: boolean } | { kind: "mob"; mob: LiveMob; dist: number; inReach: boolean };
+/** Another player as drawn (`pos`: interpolated feet, blocks); `key` = its Player PDA. */
+export type ShownPlayer = { key: string; pos: readonly number[] };
+
+export type Target =
+  | { kind: "block"; hit: BlockHit; inReach: boolean }
+  | { kind: "mob"; mob: LiveMob; dist: number; inReach: boolean }
+  | { kind: "player"; key: string; shown: readonly number[]; cx: number; cz: number; dist: number; inReach: boolean };
 
 export type InteractUi = {
   toast(msg: string, kind?: "info" | "warn"): void;
@@ -257,6 +308,8 @@ export type InteractDeps = {
 type Mining = { key: string; block: V3; id: number; item: number; start: number; time: number };
 
 const RIGHT_REPEAT_MS = 250;
+/** Concurrent `pickup_item` txs. */
+const MAX_PICKUPS = 3;
 const COOLDOWN_RETRY_MS = 60;
 const MAX_COOLDOWN_RETRIES = 20;
 
@@ -268,18 +321,25 @@ export type InteractStats = {
   placeFailures: number;
   placeBlockedLocally: Record<string, number>;
   attacks: number;
+  playerHits: number;
   eats: number;
   crafts: number;
+  pickups: number;
+  pickupFailures: number;
 };
 
 export class Interaction {
   readonly select: SlotSelect;
   readonly presence: PresenceWatch;
   readonly mobs: MobIndex;
+  readonly groundItems: GroundIndex;
+  readonly ground: GroundLayer;
   target: Target | null = null;
   /** Input blocked (inventory open, dead). */
   blocked = false;
-  readonly stats: InteractStats = { breaks: 0, breakFailures: 0, cooldownRetries: 0, places: 0, placeFailures: 0, placeBlockedLocally: {}, attacks: 0, eats: 0, crafts: 0 };
+  readonly stats: InteractStats = { breaks: 0, breakFailures: 0, cooldownRetries: 0, places: 0, placeFailures: 0, placeBlockedLocally: {}, attacks: 0, playerHits: 0, eats: 0, crafts: 0, pickups: 0, pickupFailures: 0 };
+  /** Other players as drawn (set by the game once its player layer exists). */
+  players: (() => Iterable<ShownPlayer>) | null = null;
 
   private buttons = { left: false, right: false };
   private virtual = { left: 0, right: 0 };
@@ -293,6 +353,13 @@ export class Interaction {
   private attacking = false;
   private eating = false;
   private pendingPlace = new Map<number, number>();
+  private readonly crack: CrackOverlay;
+  /** Item key → pickup start (performance ms): sent, flying to the player / hidden. */
+  private collecting = new Map<string, number>();
+  /** Item key → inventory bytes when the pickup failed with `InventoryFull`. */
+  private full = new Map<string, string>();
+  private pickups = 0;
+  private readonly flyTo = new THREE.Vector3();
   private readonly outline: THREE.LineSegments;
   private readonly mobOutline: THREE.LineSegments;
   private off: (() => void)[] = [];
@@ -304,6 +371,9 @@ export class Interaction {
     // The same lists show other players (world/players.ts).
     this.presence = new PresenceWatch(app.conns.er, app.cfg.programId, world, PRESENCE_RADIUS);
     this.mobs = new MobIndex(d.view.store);
+    this.groundItems = new GroundIndex(d.view.store);
+    this.ground = new GroundLayer(d.view.renderer);
+    this.crack = new CrackOverlay(d.view.renderer.scene);
 
     const edges = (w: number, h: number) => new THREE.EdgesGeometry(new THREE.BoxGeometry(w, h, w));
     this.outline = new THREE.LineSegments(edges(1.004, 1.004), new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.6 }));
@@ -380,10 +450,17 @@ export class Interaction {
     const prev = session.sync.prevState;
     const st = this.d.state();
     const dead = !st || st.s.health === 0 || session.sync.dead;
+    const now = performance.now();
+    const items = this.liveItems();
+    if (prev && st && !dead) this.autoPickup(items, prev.pos, st.inv);
+    const cam = view.renderer.camera.position;
+    this.flyTo.set(cam.x, cam.y - 0.8, cam.z);
+    this.ground.update(items, now, this.collecting, this.flyTo);
     if (!prev || dead || this.blocked || view.flying) {
       this.setTarget(null);
       this.mining = null;
       this.d.ui.progress(null);
+      this.crack.set(null);
       this.rightWas = this.pressed("right");
       return;
     }
@@ -393,15 +470,21 @@ export class Interaction {
     this.setTarget(this.computeTarget(prev.pos));
 
     const t = this.target;
-    const now = performance.now();
     // Left: mine / attack.
     if (this.pressed("left") && t?.inReach) {
       if (t.kind === "mob") {
         this.mining = null;
-        void this.attack(t.mob);
+        const m = t.mob;
+        void this.attack(() => attackMobIx(this.d.app.program, this.d.app.auth(), this.d.world, m.cx, m.cz, m.idx), "mob");
+      } else if (t.kind === "player") {
+        this.mining = null;
+        const { key, cx: pcx, cz: pcz } = t;
+        void this.attack(() => attackPlayerIx(this.d.app.program, this.d.app.auth(), this.d.world, new PublicKey(key), pcx, pcz), "player");
       } else this.mine(t.hit, now);
     } else this.mining = null;
-    this.d.ui.progress(this.mining ? this.progressOf(this.mining, now) : null);
+    const frac = this.mining ? this.progressOf(this.mining, now) : null;
+    this.d.ui.progress(frac);
+    this.crack.set(this.mining?.block ?? null, frac ?? 0);
 
     // Right: use (edge, then repeat while held).
     const right = this.pressed("right");
@@ -427,6 +510,13 @@ export class Interaction {
     // reach check uses the account position, as the program does.
     const shown = this.mobs.all().map((m) => ({ m, pos: this.d.view.mobs.renderPos(m.id) ?? m.pos }));
     const mob = pickMob(origin, d, Math.min(maxDist, hit?.dist ?? Infinity), shown.map((s) => ({ ...s.m, pos: s.pos, src: s.m })));
+    // Players: picked where drawn; the reach check uses their (fresh) presence entry, which
+    // is what the program checks. A player without a fresh entry (left, idle) is no target.
+    const chain = this.chainNow;
+    const pl = this.players && chain !== null ? pickPlayer(origin, d, Math.min(maxDist, mob?.dist ?? hit?.dist ?? Infinity), this.players()) : null;
+    const listed = pl && chain !== null ? this.presence.find(pl.player.key, chain) : null;
+    if (pl && listed)
+      return { kind: "player", key: pl.player.key, shown: pl.player.pos, cx: listed.cx, cz: listed.cz, dist: pl.dist, inReach: mobInReach(pos, listed.entry.pos) };
     if (mob) return { kind: "mob", mob: mob.mob.src, dist: mob.dist, inReach: mobInReach(pos, mob.mob.src.pos) };
     if (hit) return { kind: "block", hit, inReach: blockInReach(pos, hit.block, reach) };
     return null;
@@ -436,7 +526,7 @@ export class Interaction {
     this.target = t;
     const show = t?.inReach ? t : null;
     this.outline.visible = show?.kind === "block";
-    this.mobOutline.visible = show?.kind === "mob";
+    this.mobOutline.visible = show?.kind === "mob" || show?.kind === "player";
     if (show?.kind === "block") {
       const [x, y, z] = show.hit.block;
       this.outline.position.set(x + 0.5, y + 0.5, z + 0.5);
@@ -447,6 +537,11 @@ export class Interaction {
       const p = this.d.view.mobs.renderPos(show.mob.id) ?? show.mob.pos;
       this.mobOutline.position.set(p[0] / 256, p[1] / 256 + height / 2, p[2] / 256);
       this.d.ui.target(`${MOB_NAMES[show.mob.kind] ?? "Mob"} · ${show.mob.hp} HP`);
+    } else if (show?.kind === "player") {
+      const { halfW, height } = PLAYER_BOX;
+      this.mobOutline.scale.set(halfW * 2, height, halfW * 2);
+      this.mobOutline.position.set(show.shown[0], show.shown[1] + height / 2, show.shown[2]);
+      this.d.ui.target(`Player ${show.key.slice(0, 4)}…${show.key.slice(-4)}`);
     } else this.d.ui.target(null);
   }
 
@@ -516,32 +611,109 @@ export class Interaction {
     }
   }
 
+  // ------------------------------------------------------------ ground items
+
+  /** Loaded ground items not expired at chain time (all while the clock is unknown); the
+   *  bookkeeping of items that are gone is dropped. */
+  private liveItems(): ShownItem[] {
+    const chain = this.chainNow;
+    const items = this.groundItems.all().filter((g) => chain === null || g.expiresMs > chain);
+    if (this.collecting.size || this.full.size) {
+      const keys = new Set(items.map((g) => g.key));
+      for (const k of this.collecting.keys()) if (!keys.has(k)) this.collecting.delete(k);
+      for (const k of this.full.keys()) if (!keys.has(k)) this.full.delete(k);
+    }
+    return items;
+  }
+
+  /** Sends `pickup_item` for items within reach of the onchain position `pos`. */
+  private autoPickup(items: ShownItem[], pos: V3, inv: Uint8Array) {
+    if (this.pickups >= MAX_PICKUPS || this.chainNow === null) return;
+    let invKey: string | null = null;
+    for (const g of items) {
+      if (this.pickups >= MAX_PICKUPS) return;
+      if (this.collecting.has(g.key) || !inPickupReach(pos, g.pos)) continue;
+      const full = this.full.get(g.key);
+      if (full !== undefined && full === (invKey ??= inv.join())) continue;
+      void this.pickup(g);
+    }
+  }
+
+  private async pickup(g: ShownItem) {
+    const { app, world } = this.d;
+    const [cx, cz] = g.key.split(":")[0].split(",").map(Number);
+    this.collecting.set(g.key, performance.now());
+    this.full.delete(g.key);
+    this.pickups++;
+    try {
+      const r = await this.send(() => pickupItemIx(app.program, app.auth(), world, cx, cz, g.idx));
+      if (r.status === "confirmed") {
+        // Stays hidden until the chunk update drops the item (`liveItems`).
+        this.stats.pickups++;
+        return;
+      }
+      this.stats.pickupFailures++;
+      this.collecting.delete(g.key);
+      if (r.status !== "failed") return;
+      if (r.error.name === "InventoryFull") {
+        const inv = this.d.state()?.inv;
+        if (inv) this.full.set(g.key, inv.join());
+        this.toast(MESSAGES.InventoryFull, "info");
+      } else if (r.error.name !== "NoItem" && r.error.name !== "OutOfReach") this.fail(r.error, "Picking up");
+    } finally {
+      this.pickups--;
+    }
+  }
+
   // ------------------------------------------------------------ attack
 
-  /** Attacks mob slot `mob.idx` of chunk `(mob.cx, mob.cz)`. Race (accepted): the ix names
-   *  a slot, not a mob id — if the mob dies or moves to another chunk before the tx lands,
-   *  the program answers `NoMob` (silent here), or hits whichever mob took that slot in the
-   *  meantime if it is in reach too (slots are only reused by spawns / mobs walking in).
-   *  The tool is the onchain held slot, synced first (`SlotSelect.sync`). */
-  private async attack(mob: LiveMob) {
+  /** Sends one attack (`attack_mob` / `attack_player`) once the shared attack cooldown
+   *  allows. Mobs: the ix names a slot, not a mob id — if the mob dies or moves to another
+   *  chunk before the tx lands, the program answers `NoMob` (silent here), or hits whichever
+   *  mob took that slot meanwhile if it is in reach too. Players: `NoPlayer` once the target
+   *  left the world or went idle (silent). The tool is the onchain held slot, synced first
+   *  (`SlotSelect.sync`). */
+  private async attack(build: () => Promise<TransactionInstruction>, what: "mob" | "player") {
     const chain = this.chainNow;
     const st = this.d.state();
     if (this.attacking || chain === null || !st) return;
     if (chain < Math.max(st.s.attackUntilMs, this.attackGuard)) return;
     this.attacking = true;
-    const { app, world } = this.d;
     try {
       if (!(await this.select.sync())) return;
       this.attackGuard = (this.chainNow ?? chain) + this.d.account.params.attackCooldownMs;
-      const r = await this.send(() => attackMobIx(app.program, app.auth(), world, mob.cx, mob.cz, mob.idx));
-      if (r.status === "confirmed") this.stats.attacks++;
-      else if (r.status === "failed") {
+      const r = await this.send(build);
+      if (r.status === "confirmed") {
+        if (what === "mob") this.stats.attacks++;
+        else this.stats.playerHits++;
+      } else if (r.status === "failed") {
         if (r.error.kind !== "retry") this.attackGuard = 0;
         this.fail(r.error, "Attack");
       }
     } finally {
       this.attacking = false;
     }
+  }
+
+  // ------------------------------------------------------------ leaving
+
+  /** `leave_world` from the current chunk (the onchain `cx/cz`): our presence entry goes, so
+   *  nobody sees or hits us until our next move — the caller stops moving first. Waits for
+   *  an in-flight move to settle (it could re-add the entry), then sends; resolves after at
+   *  most `timeoutMs` whatever happens (leaving must never hang; a stale entry stops counting
+   *  after 5 s anyway). */
+  async leaveWorld(timeoutMs = 4000): Promise<boolean> {
+    const { app, world } = this.d;
+    const st = this.d.state();
+    const sender = app.state.sessionStale ? null : app.state.sender;
+    if (!st || !sender) return false;
+    const go = async () => {
+      const end = performance.now() + 2000;
+      while (sender.busy("move") && performance.now() < end) await new Promise((r) => setTimeout(r, 50));
+      const r = await this.send(() => leaveWorldIx(app.program, app.auth(), world, st.s.cx, st.s.cz));
+      return r.status === "confirmed";
+    };
+    return Promise.race([go().catch(() => false), new Promise<boolean>((r) => setTimeout(() => r(false), timeoutMs))]);
   }
 
   // ------------------------------------------------------------ use (right click)
@@ -681,6 +853,8 @@ export class Interaction {
     this.off = [];
     this.select.dispose();
     this.presence.dispose();
+    this.ground.dispose();
+    this.crack.dispose();
     for (const o of [this.outline, this.mobOutline]) {
       this.d.view.renderer.scene.remove(o);
       o.geometry.dispose();

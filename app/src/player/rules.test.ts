@@ -3,7 +3,7 @@ import { blockFlags } from "../wasm";
 import { placePresenceChunks } from "./presence";
 import { SlotSelect, actionMessage, optimisticEdit, type EditStore } from "./interact";
 import type { SendResult } from "../chain";
-import { blockInReach, boxOverlapsBlock, mobInReach, nearestStation, pickMob, placeError, raycast, rayBox, within, type PlaceInput } from "./rules";
+import { blockInReach, boxOverlapsBlock, mobInReach, nearestStation, pickMob, pickPlayer, placeError, raycast, rayBox, within, type PlaceInput } from "./rules";
 import type { V3 } from "../chain";
 
 const B = 256;
@@ -224,6 +224,19 @@ describe("mobs and stations", () => {
     expect(hit.mob.idx).toBe(1);
     expect(pickMob(eye, [1, -0.1, 0], 1.5, mobs)).toBeNull();
     expect(pickMob(eye, [0, 1, 0], 6, mobs)).toBeNull();
+  });
+
+  it("picks the nearest player box along the ray (feet in blocks, 0.6 × 1.8)", () => {
+    const players = [
+      { key: "far", pos: [4.5, 10, 0.5] },
+      { key: "near", pos: [2.5, 10, 0.5] },
+      { key: "aside", pos: [2.5, 10, 3.5] },
+    ];
+    const eye = [0.5, 11.62, 0.5];
+    expect(pickPlayer(eye, [1, 0, 0], 6, players)!.player.key).toBe("near");
+    expect(pickPlayer(eye, [1, 0, 0], 1.5, players)).toBeNull();
+    // Over their heads (1.8 tall).
+    expect(pickPlayer([0.5, 12, 0.5], [1, 0, 0], 6, players)).toBeNull();
   });
 
   it("nearest station within reach", () => {

@@ -2,7 +2,8 @@
 // and runs the world view (chunk store + renderer + auto-create, world/world.ts), the player
 // (controller + move sync, player/controller.ts; needs the core wasm), the interaction
 // layer (player/interact.ts: mining, placing, attacking, eating, crafting) and the HUD
-// (hotbar, health/food, inventory + crafting panel on `E`, death screen) on the game canvas,
+// (hotbar, health/food, inventory + crafting panel on `E`, death screen, settings menu on
+// Esc / pointer-lock release: chunk auto-generation, back to worlds) on the game canvas,
 // plus other players (world/players.ts) and the live day / night clock (world/sky.ts).
 // The "entering world" overlay stays until the first chunk mesh is on screen.
 import type { PublicKey } from "@solana/web3.js";
@@ -21,7 +22,7 @@ import { startWorld } from "./world/world";
 
 export type GameHandle = { stop(): void };
 
-export function enterGame(app: App, root: HTMLElement, world: PublicKey, account: WorldAccount, onLeave: () => void): GameHandle {
+export function enterGame(app: App, root: HTMLElement, world: PublicKey, account: WorldAccount, onLeave: (notice?: string) => void): GameHandle {
   clear(root);
   app.set({ world: { pubkey: world, account }, playerState: null });
   const pstate = pstatePda(app.cfg.programId, world, app.state.player!);
@@ -40,6 +41,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
   const hud = h("div", { class: "player-hud" });
   const invPanel = h("div", { class: "inv-panel", role: "dialog", "aria-modal": "false", "aria-label": "Inventory and crafting", hidden: true });
 
+  let stopped = false;
   let latest: { s: PlayerStateAccount; inv: Uint8Array } | null = null;
   let player: PlayerSession | null = null;
   let act: Interaction | null = null;
@@ -93,22 +95,72 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
   };
   const view = startWorld(app, canvas, world, account, () => {
     overlay.hidden = true;
-    bar.append(leave);
   });
-  screen.append(bars.flash, bar, mineBar, aim, hud, view.ui, invPanel, death.el);
+  const resume = h("button", { class: "btn primary small", type: "button" }, "Resume");
+  const menuLeave = h("button", { class: "btn ghost small", type: "button" }, "Back to worlds");
+  const menu = h(
+    "div",
+    { class: "game-menu", hidden: true },
+    h(
+      "div",
+      { class: "game-menu-panel", role: "dialog", "aria-modal": "true", "aria-labelledby": "game-menu-title" },
+      h("div", { class: "panel-head" }, h("h2", { id: "game-menu-title" }, "Settings"), h("span", { class: "muted small" }, "Esc to resume")),
+      view.settings,
+      h(
+        "p",
+        { class: "muted small menu-note" },
+        "While you're in the world, other players see you and can attack you, even with this menu open. Back to worlds takes you out: nobody can see or hit you until you return.",
+      ),
+      h("div", { class: "actions" }, resume, menuLeave),
+    ),
+  );
+  screen.append(bars.flash, bar, mineBar, aim, hud, view.ui, invPanel, death.el, menu);
   // The controls hint goes to the top (the hotbar owns the bottom center).
   const help = view.ui.querySelector(".fly-help");
   if (help) screen.append(help);
+
+  /** Gameplay input is off while the inventory or the settings menu is open. */
+  const syncBlocked = () => {
+    const blocked = !invPanel.hidden || !menu.hidden;
+    if (player) player.controller.blocked = blocked;
+    if (act) act.blocked = blocked;
+  };
+
+  // ------------------------------------------------------------ settings menu (Esc)
+
+  let menuAt = 0;
+  /** Opens / closes the menu; `relock` recaptures the mouse on a user close. */
+  function setMenu(open: boolean, relock = true) {
+    if (open === !menu.hidden) return;
+    if (open) setPanel(false, false);
+    menu.hidden = !open;
+    syncBlocked();
+    if (open) {
+      menuAt = performance.now();
+      if (document.pointerLockElement) document.exitPointerLock();
+      resume.focus();
+    } else {
+      if (menu.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();
+      if (relock && !death.shown) (canvas.requestPointerLock?.() as Promise<void> | undefined)?.catch?.(() => {});
+    }
+  }
+  resume.addEventListener("click", () => setMenu(false));
+  menu.addEventListener("click", (e) => e.target === menu && setMenu(false));
+  // Esc while the mouse is captured only releases it (no keydown): open the menu then.
+  const onLockChange = () => {
+    if (document.pointerLockElement || stopped || !invPanel.hidden || death.shown) return;
+    setMenu(true);
+  };
+  document.addEventListener("pointerlockchange", onLockChange);
 
   // ------------------------------------------------------------ inventory panel (E)
 
   /** Opens / closes the panel; `relock` recaptures the mouse on a user close. */
   function setPanel(open: boolean, relock = true) {
     if (!act || !player || open === !invPanel.hidden) return;
-    if (open && death.shown) return;
+    if (open && (death.shown || !menu.hidden)) return;
     invPanel.hidden = !open;
-    player.controller.blocked = open;
-    act.blocked = open;
+    syncBlocked();
     if (open) {
       if (document.pointerLockElement) document.exitPointerLock();
       paintHud();
@@ -123,7 +175,11 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
   const onKey = (e: KeyboardEvent) => {
     if (typing(e) || e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
     if (e.code === "KeyE") setPanel(invPanel.hidden);
-    else if (e.code === "Escape" && !invPanel.hidden) setPanel(false, false);
+    else if (e.code === "Escape") {
+      if (!invPanel.hidden) setPanel(false, false);
+      // Skip the keydown that some browsers also send with the lock release.
+      else if (performance.now() - menuAt > 250) setMenu(menu.hidden);
+    }
   };
   window.addEventListener("keydown", onKey);
   // Stations come and go as the player moves: refresh the open panel.
@@ -131,7 +187,6 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
 
   // ------------------------------------------------------------ player + interaction
 
-  let stopped = false;
   loadCore().then(
     () => {
       if (stopped) return;
@@ -141,6 +196,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
           death.show(true);
         },
         onIssue: (f) => view.toast(sendResultMessage({ status: "failed", error: f }, "Move") ?? f.message, "warn"),
+        onKicked: () => kick(),
       });
       const session = player;
       act = new Interaction({
@@ -170,11 +226,12 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
       const ps = new PlayerLayer(view.renderer, { lists: () => a.presence.lists(), self: app.state.player?.toBase58() ?? null, now: () => session.clock.now() });
       others = ps;
       view.onFrame((dt) => ps.update(dt));
+      a.players = () => [...ps.tracker.players.values()].filter((t) => t.goneAt === null).map((t) => ({ key: t.key, pos: t.motion.at(performance.now(), [0, 0, 0]) }));
       a.select.onChange = () => paintHud();
       hotbar = new Hotbar(
         (i) => a.select.select(i),
         () => a.select.selected,
-        () => !death.shown && invPanel.hidden,
+        () => !death.shown && invPanel.hidden && menu.hidden,
       );
       grid = new InventoryGrid((i) => a.select.select(i));
       crafting = new CraftingPanel(async (recipe, count) => (await a.craft(recipe, count)).status === "confirmed");
@@ -184,6 +241,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
       );
       hud.append(bars.el, hotbar.el);
       view.onFrame(() => a.update());
+      syncBlocked();
       if (latest) a.select.onPlayerState(latest.s.heldSlot);
       if (lastData) session.onPlayerState(lastData);
       paintHud();
@@ -202,7 +260,9 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
           target: () => {
             const t = a.target;
             if (!t) return null;
-            return t.kind === "block" ? { kind: "block", block: t.hit.block, face: t.hit.face, id: t.hit.id, inReach: t.inReach } : { kind: MOB_NAMES[t.mob.kind], mob: t.mob, inReach: t.inReach };
+            if (t.kind === "block") return { kind: "block", block: t.hit.block, face: t.hit.face, id: t.hit.id, inReach: t.inReach };
+            if (t.kind === "player") return { kind: "player", player: t.key, chunk: [t.cx, t.cz], inReach: t.inReach };
+            return { kind: MOB_NAMES[t.mob.kind], mob: t.mob, inReach: t.inReach };
           },
           mobs: () => {
             const p = session.sync.prevState?.pos;
@@ -240,6 +300,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
       stopped = true;
       clearInterval(panelTimer);
       window.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerlockchange", onLockChange);
       hotbar?.dispose();
       act?.dispose();
       others?.dispose();
@@ -249,9 +310,31 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
       app.set({ world: null, playerState: null });
     },
   };
-  leave.addEventListener("click", () => {
+  let leaving = false;
+  /** Out of the world: stop moving, take our presence entry out (`leave_world`, so nobody
+   *  sees or hits us from now on; bounded wait, a stale entry stops counting after 5 s
+   *  anyway), then stop. Before the engine loaded there is no entry to remove. */
+  const leaveGame = async () => {
+    if (leaving) return;
+    leaving = true;
+    for (const b of [leave, menuLeave]) {
+      b.disabled = true;
+      b.textContent = "Leaving…";
+    }
+    player?.sync.stop();
+    if (act && !death.shown) await act.leaveWorld().catch(() => false);
     handle.stop();
     onLeave();
-  });
+  };
+  /** Counted out of the world onchain (no move for a minute: a frozen or sleeping tab, a
+   *  lost connection; or "Back to worlds" from another tab): out, back to the world list. */
+  const kick = () => {
+    if (leaving) return;
+    leaving = true;
+    handle.stop();
+    onLeave("You were away for over a minute and left the world. Resume to go back in.");
+  };
+  leave.addEventListener("click", () => void leaveGame());
+  menuLeave.addEventListener("click", () => void leaveGame());
   return handle;
 }

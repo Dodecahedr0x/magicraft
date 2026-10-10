@@ -7,7 +7,7 @@ import { DEFAULT_WORLD_PARAMS, WORLD_DISCRIMINATOR, WORLD_LEN } from "../chain";
 import { pickerDisabledReason } from "./region";
 import { cachedWorlds, fetchWorlds } from "./worldList";
 
-const PID = new PublicKey("4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9");
+const PID = new PublicKey("4y2JKsSfShA6tL5K9Vk3NZPPev1bq29AqqNK9iYF9euz");
 
 function worldBytes(creator: PublicKey, name: string): Buffer {
   const d = Buffer.alloc(WORLD_LEN);

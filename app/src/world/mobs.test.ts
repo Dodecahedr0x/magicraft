@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FP, MOB, type V3 } from "../chain";
-import { edgeDistance, MobTracker, Motion, angleDiff, type MobSnap } from "./mobs";
+import { edgeDistance, KNOCKBACK_MS, MobTracker, Motion, angleDiff, type MobSnap } from "./mobs";
 
 const snap = (id: number, x: number, z: number, o: Partial<MobSnap> = {}): MobSnap => ({ id, kind: MOB.PIG, hp: 10, dir: 8, burnMs: 0, pos: [x * FP, 30 * FP, z * FP] as V3, ...o });
 const near = (a: V3 | null, b: number[]) => {
@@ -96,6 +96,15 @@ describe("MobTracker", () => {
     expect(ev.map((e) => e.type)).toEqual(["hurt"]);
     expect(t.mobs.get(9)!.hurtAt).toBe(500);
     expect(t.mobs.get(9)!.burnAt).toBe(500);
+  });
+
+  it("a move that comes with a hit (knockback) slides fast; a normal step takes a tick", () => {
+    const t = new MobTracker(1000);
+    t.ingest("0,0", [snap(9, 1, 1, { hp: 10 })], 0);
+    t.ingest("0,0", [snap(9, 2, 1, { hp: 9 })], 0);
+    expect(t.pos(9, KNOCKBACK_MS)![0]).toBeCloseTo(2);
+    t.ingest("0,0", [snap(9, 3, 1, { hp: 9 })], 1000);
+    expect(t.pos(9, 1000 + KNOCKBACK_MS)![0]).toBeLessThan(2.5);
   });
 });
 

@@ -12,13 +12,16 @@ import {
 } from "@solana/web3.js";
 import { describe, expect, it } from "vitest";
 import {
+  attackPlayerIx,
   breakBlockIx,
   createAndGrowIxs,
   createWorldIx,
   freshNonce,
   joinWorldIx,
+  leaveWorldIx,
   measureUsPerSlot,
   moveIx,
+  pickupItemIx,
   placeBlockIx,
   populateChunkIx,
   requestSeedIx,
@@ -35,6 +38,7 @@ import {
   chunkBlocks,
   chunkReady,
   decodeChunkHeader,
+  decodeGroundItems,
   decodePlayerState,
   decodePresence,
   decodeWorld,
@@ -47,6 +51,7 @@ import { onboardingTx, playerStatus } from "./player";
 import { makeProgram } from "./program";
 import { ErSender, type IxSource, type SendOptions } from "./sender";
 import { createSessionTx, verifySession, type Session } from "./session";
+import { PresenceWatch } from "../player/presence";
 
 const env = process.env;
 const LIVE = !!env.LIVE;
@@ -278,13 +283,17 @@ describe.skipIf(!LIVE)("LIVE: chain layer against the local stack", { timeout: 2
     expect(home.entries.some((e) => e.player.equals(player))).toBe(false);
   });
 
-  it("breaks the block under the player and places one on the border", async () => {
+  it("breaks the block under the player, picks the drop up and places one on the border", async () => {
     const [x, y, z] = path[path.length - 1];
     const below: V3 = [x, y - 1, z];
     const [cx, cz] = [Math.floor(x / 16), Math.floor(z / 16)];
     const idx = (b: V3) => blockIndex(b[0] - Math.floor(b[0] / 16) * 16, b[1], b[2] - Math.floor(b[2] / 16) * 16);
     await ok(async () => [await breakBlockIx(program, auth, world, below, view())]);
     expect((await blocksOf(cx, cz))[idx(below)]).toBe(0);
+    // The drop lands in the hole under the feet (in pickup reach): pick it up.
+    const drops = decodeGroundItems((await account(chunkPda(pid, world, cx, cz)))!, -Infinity);
+    expect(drops.length, "a ground item").toBeGreaterThan(0);
+    await ok(async () => Promise.all(drops.map((g) => pickupItemIx(program, auth, world, cx, cz, g.idx))));
     const inv = (await state()).inventory;
     const slot = inv.findIndex((s) => s.count > 0 && s.item >= 1 && s.item <= 22);
     expect(slot, "a placeable drop").toBeGreaterThanOrEqual(0);
@@ -301,5 +310,92 @@ describe.skipIf(!LIVE)("LIVE: chain layer against the local stack", { timeout: 2
     expect(after.item === item ? after.count : 0).toBe(inv[slot].count - 1);
     expect(failures).toEqual([]);
     expect(session.kp.publicKey.equals(auth.signer)).toBe(true);
+  });
+
+  // ---------------------------------------------------------------- a second client
+
+  const walletB = Keypair.generate();
+  let playerB: PublicKey;
+  let authB: Auth;
+  let senderB: ErSender;
+  const stateOf = async (p: PublicKey) => decodePlayerState((await account(pstatePda(pid, world, p)))!);
+  async function okB(src: IxSource, opts: SendOptions = {}) {
+    const r = await senderB.send(src, { logs: true, ...opts });
+    if (r.status !== "confirmed") throw new Error(`ER tx (B) ${r.status}: ${r.status === "failed" ? `${r.error.name} ${r.error.message}` : ""}`);
+    return r.sig;
+  }
+  async function failsB(src: IxSource) {
+    const r = await senderB.send(src);
+    return r.status === "failed" ? r.error.name : r.status;
+  }
+  /** A's client view of the presence lists around it (the app's watcher). */
+  let watchA: PresenceWatch;
+
+  it("a second player onboards, joins and walks next to the first; the first one's client sees it", async () => {
+    const sig = await base.requestAirdrop(walletB.publicKey, 2 * LAMPORTS_PER_SOL);
+    await base.confirmTransaction({ signature: sig, ...(await base.getLatestBlockhash()) }, "confirmed");
+    const tx = await onboardingTx(program, cfg, base, walletB.publicKey, 0.2 * LAMPORTS_PER_SOL);
+    tx.partialSign(walletB);
+    const s2 = await base.sendRawTransaction(tx.serialize());
+    await base.confirmTransaction({ signature: s2, ...(await base.getLatestBlockhash()) }, "confirmed");
+    playerB = (
+      await until(
+        async () => {
+          const st = await playerStatus(pid, base, er, walletB.publicKey);
+          return st.state === "delegated" && st.erLamports !== null ? st : null;
+        },
+        20_000,
+        "ER clone of player B",
+      )
+    ).player;
+    const { tx: stx, session: sb } = await createSessionTx(base, pid, walletB.publicKey);
+    stx.partialSign(walletB);
+    const s3 = await base.sendRawTransaction(stx.serialize());
+    await base.confirmTransaction({ signature: s3, ...(await base.getLatestBlockhash()) }, "confirmed");
+    authB = sessionAuth(sb, playerB);
+    senderB = new ErSender(er, sb.kp, { programId: pid });
+    await okB(async () => [await joinWorldIx(program, authB, world)]);
+
+    // Along A's route, stopping 2 columns short of A (A placed a block on the last-but-one).
+    let s = await stateOf(playerB);
+    let prev = s.move.pos;
+    let lastMs = s.move.lastMs;
+    for (const [x, y, z] of path.slice(0, -2)) {
+      const pos = center(x, y, z);
+      const clientMs = await waitClientMs(er, world, lastMs, 300);
+      await okB(async () => [await moveIx(program, authB, world, { prev, pos, onGround: true, clientMs, view: view() })], { key: "move" });
+      prev = pos;
+      lastMs = clientMs;
+    }
+    // A's client: the presence watcher around A finds B fresh (B can be in 0,0 or the neighbor).
+    const a = await state();
+    watchA = new PresenceWatch(er, pid, world, 1);
+    watchA.setCenter(a.cx, a.cz);
+    const seen = await until(async () => watchA.find(playerB.toBase58(), Date.now()), 5_000, "B in A's presence view");
+    expect(seen.entry.pos).toEqual(prev);
+  });
+
+  it("PvP: B hits A; A leaves the world (pending damage applied) → B can't hit it", async () => {
+    const a = await state();
+    // A (who broke the block under its feet) drops into that hole: fresh again.
+    const down: V3 = [a.move.pos[0], a.move.pos[1] - FP, a.move.pos[2]];
+    const clientMs = await waitClientMs(er, world, a.move.lastMs, 600);
+    await ok(async () => [await moveIx(program, auth, world, { prev: a.move.pos, pos: down, onGround: true, clientMs, view: view() })], { key: "move" });
+    const pa = await state();
+    await okB(async () => [await attackPlayerIx(program, authB, world, player, pa.cx, pa.cz)]);
+    const listed = async () => decodePresence((await account(presencePda(pid, chunkPda(pid, world, pa.cx, pa.cz))))!).entries;
+    expect((await listed()).find((e) => e.player.equals(player))?.pendingDamage).toBe(1);
+
+    // A leaves (the game's "Back to worlds"): pending damage applied, entry gone.
+    const health = pa.health;
+    await ok(async () => [await leaveWorldIx(program, auth, world, pa.cx, pa.cz)]);
+    expect((await state()).health).toBe(health - 1);
+    expect((await listed()).some((e) => e.player.equals(player))).toBe(false);
+    await until(async () => watchA.find(player.toBase58(), Date.now()) === null || null, 3_000, "A gone from the watcher");
+    // B's next attack: the target left the world.
+    // B's attack cooldown, on chain time.
+    await waitClientMs(er, world, (await stateOf(playerB)).attackUntilMs, 200);
+    expect(await failsB(async () => [await attackPlayerIx(program, authB, world, player, pa.cx, pa.cz)])).toBe("NoPlayer");
+    watchA.dispose();
   });
 });

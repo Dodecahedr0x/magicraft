@@ -2,6 +2,8 @@
 // edge of the loaded area, and three meshes per chunk (opaque, cutout, water). Lighting is
 // shader uniforms shared by every material (`light`, `LIGHT_PARS`): ambient + one
 // directional light (sun / moon, set by sky.ts) and up to 16 torch point lights (torches.ts).
+// Chunk vertices carry their sky light (`dark`, mesher / skylight.ts): sun and ambient fade
+// out in caves, torches don't.
 // Water tops drift / ripple with `uTime`; torch flame pixels are emissive.
 //
 // The voxel shader samples a `DataArrayTexture` (one layer per 16×16 tile, atlas.ts) at
@@ -56,9 +58,14 @@ vec3 torchLight(vec3 p, vec3 n) {
 #endif
 }`;
 
+/** Light left where no sky light reaches (deep caves without torches). */
+const CAVE_FLOOR = 0.015;
+
 const VERT = /* glsl */ `
 attribute vec3 tuv;
 attribute vec3 shade;
+// 1 − sky light (mesher / skylight.ts). Geometry without it (models) reads 0: fully lit.
+attribute float dark;
 ${LIGHT_PARS}
 varying vec3 vTuv;
 varying vec3 vShade;
@@ -74,7 +81,8 @@ void main() {
   vShade = shade;
   vWorld = world.xyz;
   vNormal = normal;
-  vLight = sceneLight(normal);
+  // Sky light scales sun + ambient; a faint floor keeps unlit caves barely readable.
+  vLight = sceneLight(normal) * (1.0 - dark) + ${CAVE_FLOOR.toFixed(3)};
   #include <fog_vertex>
 }`;
 
@@ -205,6 +213,13 @@ export class WorldRenderer {
     );
   }
 
+  /** The voxel cutout material (atlas, alpha test, lit, both sides) for block-textured
+   *  models outside the chunks (dropped items). Geometry needs `normal`, `tuv` (u, v,
+   *  atlas layer) and `shade` (rgb). Shared: never dispose it. */
+  get blockMaterial(): THREE.ShaderMaterial {
+    return this.mats.cutout;
+  }
+
   /** Tracks a `LIGHT_PARS` material (sets its `N_TORCHES` define). */
   registerLit<M extends THREE.ShaderMaterial>(m: M): M {
     m.defines = { ...m.defines, N_TORCHES: this.torchQuality };
@@ -244,6 +259,7 @@ export class WorldRenderer {
     g.setAttribute("normal", new THREE.BufferAttribute(m.normals, 3));
     g.setAttribute("tuv", new THREE.BufferAttribute(m.uvs, 3));
     g.setAttribute("shade", new THREE.BufferAttribute(m.colors, 3, true));
+    g.setAttribute("dark", new THREE.BufferAttribute(m.dark, 1, true));
     g.setIndex(new THREE.BufferAttribute(m.indices, 1));
     g.computeBoundingSphere();
     return g;

@@ -20,6 +20,9 @@ import { ChainClock, encodeParams, MoveSync, type ChainReading } from "./sync";
 
 const SENS = 0.0025;
 const PITCH_MAX = 1.55;
+/** A snap up to this far (FP, 2 blocks: knockback) slides the camera over `SLIDE_MS`. */
+const SLIDE_MAX = 512;
+const SLIDE_MS = 180;
 
 const KEYS: Record<string, keyof Input> = {
   KeyW: "forward",
@@ -141,10 +144,18 @@ export class PlayerController {
     return inp;
   }
 
-  /** Puts the player at `pos` (FP feet) at rest (join, snap-back, respawn). */
+  /** Camera-only offset easing out after a short snap (knockback, small snap-backs). */
+  private slide: { off: number[]; t0: number } | null = null;
+
+  /** Puts the player at `pos` (FP feet) at rest (join, snap-back, respawn). A short jump
+   *  (≤ `SLIDE_MAX`, e.g. a knockback) slides the camera there instead of cutting. */
   snap(pos: readonly number[]) {
-    if (this.phys) this.phys.teleport(pos);
-    else this.phys = new PlayerPhysics(pos, this.o.params, this.o.world);
+    if (this.phys) {
+      const from = this.phys.renderPos();
+      const off = from.map((v, i) => v - pos[i]);
+      this.slide = Math.hypot(...off) <= SLIDE_MAX ? { off, t0: performance.now() } : null;
+      this.phys.teleport(pos);
+    } else this.phys = new PlayerPhysics(pos, this.o.params, this.o.world);
   }
 
   /** Advances physics by `dt` seconds and updates the camera (unless flying). Returns the
@@ -156,7 +167,15 @@ export class PlayerController {
     p.input = this.input();
     p.update(dt);
     if (!this.o.isFlying?.()) {
-      const [x, y, z] = p.renderPos();
+      let [x, y, z] = p.renderPos();
+      if (this.slide) {
+        const k = 1 - (performance.now() - this.slide.t0) / SLIDE_MS;
+        if (k <= 0) this.slide = null;
+        else {
+          const e = k * k; // ease out
+          [x, y, z] = [x + this.slide.off[0] * e, y + this.slide.off[1] * e, z + this.slide.off[2] * e];
+        }
+      }
       this.o.camera.position.set(x / FP, y / FP + EYE, z / FP);
       this.o.camera.rotation.set(this.pitch, this.yaw, 0, "YXZ");
     }
@@ -186,6 +205,8 @@ export type PlayerSession = {
 
 export type PlayerSessionOptions = {
   onDead?: () => void;
+  /** Counted out of the world (`NotInWorld`: expired after a minute of silence). */
+  onKicked?: () => void;
   onIssue?: (f: TxFailure) => void;
 };
 
@@ -221,6 +242,7 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
       opts.onDead?.();
     },
     onIssue: opts.onIssue,
+    onKicked: opts.onKicked,
     log: (msg, data) => console.info(`[move] ${msg}`, data ?? ""),
   });
 
@@ -262,6 +284,16 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
   );
   sync.onWorld(world);
   const tickTimer = setInterval(() => void sync.tick(), sync.intervalMs);
+  // Hidden page: no render frames (no physics, no frames to send) and throttled timers
+  // (down to 1/min after a few minutes). A worker's timer keeps a 1 s heartbeat of idle
+  // frames going, so the player stays present until it leaves the world.
+  const hidden = workerTicker(1000, () => {
+    if (stopped || document.visibilityState !== "hidden") return;
+    const t = clock.stamp(0);
+    if (t === null) return;
+    sync.idleFrame(t);
+    void sync.tick();
+  });
 
   // A stall longer than physics catches up (or the tab coming back into view): the local
   // body would lag chain time, so restart from the confirmed state instead.
@@ -315,6 +347,7 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
       sync.stop();
       clearInterval(calTimer);
       clearInterval(tickTimer);
+      hidden.stop();
       offFrame();
       document.removeEventListener("visibilitychange", onVisible);
       controller.dispose();
@@ -322,4 +355,20 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
       if (g.__magicraft) delete g.__magicraft.player;
     },
   };
+}
+
+/** Calls `f` every `ms` from a worker's timer (not throttled in hidden pages like the main
+ *  thread's); falls back to `setInterval` where workers are unavailable. */
+function workerTicker(ms: number, f: () => void): { stop(): void } {
+  try {
+    const src = `setInterval(() => postMessage(0), ${ms});`;
+    const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
+    const w = new Worker(url);
+    URL.revokeObjectURL(url);
+    w.onmessage = () => f();
+    return { stop: () => w.terminate() };
+  } catch {
+    const id = setInterval(f, ms);
+    return { stop: () => clearInterval(id) };
+  }
 }

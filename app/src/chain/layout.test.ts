@@ -7,8 +7,10 @@ import {
   accountKind,
   blockIndex,
   blockOfIndex,
+  CHUNK_BLOCKS_END,
   CHUNK_BLOCKS_OFFSET,
   CHUNK_DISCRIMINATOR,
+  CHUNK_GROUND_OFFSET,
   CHUNK_FULL_LEN,
   CHUNK_INITIAL_LEN,
   CHUNK_TOTAL_RENT,
@@ -17,6 +19,7 @@ import {
   chunkReady,
   decodeChunkHeader,
   decodeFluidQueue,
+  decodeGroundItems,
   decodePlayer,
   decodePlayerState,
   decodePresence,
@@ -24,6 +27,7 @@ import {
   DEFAULT_WORLD_PARAMS,
   freshEntries,
   GEN_DONE,
+  inPickupReach,
   liveMobs,
   PRESENCE_DISCRIMINATOR,
   PSTATE_LEN,
@@ -206,7 +210,46 @@ describe("ChunkHeader", () => {
   });
 
   it("rent of a chunk + empty presence", () => {
-    expect(CHUNK_TOTAL_RENT).toBe((17_152 + 60) * 32 + (48 + 60) * 32);
+    expect(CHUNK_TOTAL_RENT).toBe((17_536 + 60) * 32 + (48 + 60) * 32);
+  });
+});
+
+describe("ground items (core::ground, after the blocks)", () => {
+  /** Writes slot `i`: item u16 @0, count @2, pos [i32; 3] @4, expires_ms i64 @16. */
+  const put = (d: Uint8Array, i: number, item: number, count: number, pos: [number, number, number], exp: bigint) => {
+    const w = new W(d);
+    const o = CHUNK_GROUND_OFFSET + 24 * i;
+    w.u16(o, item);
+    w.u8(o + 2, count);
+    pos.forEach((v, k) => w.i32(o + 4 + 4 * k, v));
+    w.i64(o + 16, exp);
+  };
+
+  it("decodes live slots; skips empty and expired ones; none on a legacy chunk", () => {
+    expect(CHUNK_GROUND_OFFSET).toBe(17_152);
+    expect(CHUNK_FULL_LEN).toBe(17_536);
+    const d = handBuiltChunk();
+    put(d, 0, 4, 1, [-640, 10_304, 128], 5_000n);
+    put(d, 3, 263, 2, [1, 2, 3], 9_000n);
+    put(d, 4, 2, 0, [1, 2, 3], 9_000n); // count 0: empty
+    expect(decodeGroundItems(d, 4_999)).toEqual([
+      { idx: 0, item: 4, count: 1, pos: [-640, 10_304, 128], expiresMs: 5_000 },
+      { idx: 3, item: 263, count: 2, pos: [1, 2, 3], expiresMs: 9_000 },
+    ]);
+    expect(decodeGroundItems(d, 5_000).map((g) => g.idx)).toEqual([3]);
+    // A chunk grown before ground items existed: playable, no ground region.
+    const legacy = d.slice(0, CHUNK_BLOCKS_END);
+    expect(chunkReady(legacy)).toBe(true);
+    expect(chunkBlocks(legacy)!.length).toBe(CHUNK_VOL);
+    expect(decodeGroundItems(legacy, 0)).toEqual([]);
+  });
+
+  it("pickup reach: 2 blocks from the body center (0.9 above the feet)", () => {
+    const feet: [number, number, number] = [0, 0, 0];
+    expect(inPickupReach(feet, [0, 230, 512])).toBe(true);
+    expect(inPickupReach(feet, [0, 230, 513])).toBe(false);
+    expect(inPickupReach(feet, [290, 230 - 290, 290])).toBe(true);
+    expect(inPickupReach(feet, [0, 230 + 513, 0])).toBe(false);
   });
 });
 
@@ -304,7 +347,9 @@ describe("Borsh accounts (cross-checked with the Anchor coder)", () => {
       dayTicks: 77,
       dayEpoch: 2,
       firstJoinMs: new BN("1760000001234"),
-      reserved: new Array(9).fill(0),
+      playersOnline: 7,
+      entries: 4000000000,
+      reserved: [0],
     });
     expect(data.length).toBe(WORLD_LEN);
     const w = decodeWorld(data);
@@ -329,6 +374,7 @@ describe("Borsh accounts (cross-checked with the Anchor coder)", () => {
       syncMs: 1759999995000,
     });
     expect([w.dayTicks, w.dayEpoch, w.firstJoinMs]).toEqual([77, 2, 1760000001234]);
+    expect([w.playersOnline, w.entries]).toEqual([7, 4000000000]);
     expect(worldChainMs(w, 1010)).toBe(1760000000097); // ⌊10 · 9 750 / 1 000⌋
     expect(worldChainMs({ clock: { ...w.clock, usPerSlot: 0 } }, 1010)).toBeNull();
   });
@@ -369,7 +415,8 @@ describe("Borsh accounts (cross-checked with the Anchor coder)", () => {
       attackUntilMs: new BN("1760000000700"),
       foodTickMs: new BN("1760000000800"),
       respawnMs: new BN("1760000000900"),
-      reserved: new Array(26).fill(0),
+      inWorld: 1,
+      reserved: new Array(25).fill(0),
     });
     expect(data.length).toBe(PSTATE_LEN);
     const s = decodePlayerState(data);
@@ -392,6 +439,7 @@ describe("Borsh accounts (cross-checked with the Anchor coder)", () => {
     expect([s.breakUntilMs, s.attackUntilMs, s.foodTickMs, s.respawnMs]).toEqual([
       1760000000600, 1760000000700, 1760000000800, 1760000000900,
     ]);
+    expect(s.inWorld).toBe(true);
   });
 
   it("Player", async () => {

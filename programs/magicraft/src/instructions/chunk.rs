@@ -33,8 +33,9 @@ use magicraft_core::consts::CHUNK_VOL;
 use crate::state::{
     check_chunk_identity, chunk_for, chunk_header, chunk_header_from, chunk_header_mut,
     chunk_parts_mut, ensure_sponsor_reserve, init_chunk_header, init_presence_header, presence_for,
-    presence_len, Player, PlayerState, World, CHUNK_BLOCKS_OFFSET, CHUNK_FULL_LEN,
-    CHUNK_INITIAL_LEN, CHUNK_SEED, GEN_CREATED, GEN_DONE, GEN_STAGE1, PLAYER_SEED, PRESENCE_SEED,
+    presence_len, Player, PlayerState, World, CHUNK_BLOCKS_END, CHUNK_BLOCKS_OFFSET,
+    CHUNK_FULL_LEN, CHUNK_INITIAL_LEN, CHUNK_SEED, GEN_CREATED, GEN_DONE, GEN_STAGE1, PLAYER_SEED,
+    PRESENCE_SEED,
 };
 
 /// Byte size of a fresh (empty) `ChunkPresence`.
@@ -86,7 +87,7 @@ fn check_slots(
             let len = ai.data_len();
             let h = chunk_header(ai)?;
             exists[i] = true;
-            done[i] = h.is_done() && len >= CHUNK_FULL_LEN;
+            done[i] = h.is_done() && len >= CHUNK_BLOCKS_END;
         }
     }
     Ok((exists, done))
@@ -452,10 +453,10 @@ pub fn set_spawn(ctx: Context<SetSpawn>) -> Result<()> {
     require_keys_eq!(*chunk_ai.owner, crate::ID, MagicraftError::InvalidChunk);
     check_chunk_identity(h, chunk_ai.key, &world_key, 0, 0)?;
     require!(
-        h.is_done() && len >= CHUNK_FULL_LEN,
+        h.is_done() && len >= CHUNK_BLOCKS_END,
         MagicraftError::ChunkNotReady
     );
-    let blocks: &[u8; CHUNK_VOL] = data[CHUNK_BLOCKS_OFFSET..CHUNK_FULL_LEN]
+    let blocks: &[u8; CHUNK_VOL] = data[CHUNK_BLOCKS_OFFSET..CHUNK_BLOCKS_END]
         .try_into()
         .unwrap();
     let (x, y, z) = spawn_point(blocks);
@@ -593,7 +594,10 @@ mod tests {
 
     #[test]
     fn spawn_chunk_is_not_closable() {
-        assert_eq!(check_not_spawn(0, 0).unwrap_err(), error!(MagicraftError::SpawnChunk));
+        assert_eq!(
+            check_not_spawn(0, 0).unwrap_err(),
+            error!(MagicraftError::SpawnChunk)
+        );
         for (cx, cz) in [(1, 0), (0, -1), (-1, 0), (0, 1), (5, -7)] {
             assert!(check_not_spawn(cx, cz).is_ok());
         }
@@ -641,6 +645,6 @@ mod tests {
 
     #[test]
     fn total_rent_is_full_chunk_plus_presence() {
-        assert_eq!(CHUNK_TOTAL_RENT, (17_152 + 60) * 32 + (48 + 60) * 32);
+        assert_eq!(CHUNK_TOTAL_RENT, (17_536 + 60) * 32 + (48 + 60) * 32);
     }
 }

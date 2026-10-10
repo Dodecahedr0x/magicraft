@@ -275,8 +275,14 @@ once). Validity is checked against the ER clock, max 7 days.
   apply `pending_damage`, hunger drain / regen / starvation.
 - `break_block(x,y,z)` — reach (eye → block center), cooldown model (`now ≥ break_until`, then
   `break_until = now + break_time(block, held tool)`; the client shows the progress before
-  sending), harvest tier, drop to inventory (lost if full; the block breaks anyway), durability,
-  fluid enqueue, `edited = true`. Air/water/bedrock unbreakable.
+  sending), harvest tier, durability, fluid enqueue, `edited = true`. Air/water/bedrock
+  unbreakable. The drop becomes a **ground item** in the chunk account (16 slots × 24 B after the
+  blocks; `core::ground`): it lands on the first solid block below, items resting on a broken
+  block fall with it, it lives 5 min, and a full chunk replaces its oldest item. Chunks grown
+  before ground items existed (17 152 B) still play; their drops go to the inventory.
+- `pickup_item(chunk, idx)` — a live ground item within 2 blocks (+ 0.5 slack) of the body
+  center goes into the inventory, as much as fits. The client sends it automatically when the
+  player walks near an item.
 - `place_block(x,y,z,slot)` — reach, target air/water, face-adjacent (to a solid block in a passed
   chunk), no overlap with the placer or any fresh presence entry (target chunk + required
   border-neighbour presences), fluid enqueue.
@@ -285,6 +291,21 @@ once). Validity is checked against the ER clock, max 7 days.
   position (+ its chunk) and verified (block type, within reach); furnace smelting instant with
   coal/planks fuel.
 - `attack_mob(chunk, idx)` — reach 3, cooldown, weapon damage, drops to inventory.
+- `attack_player(target)` — PvP: the target's **fresh** presence entry in the passed chunk's list
+  (else `NoPlayer`), same reach / cooldown / damage as `attack_mob`; the damage goes to the
+  entry's `pending_damage` and lands on the target's next move, like a zombie hit.
+- **Players in a world** — `World.players_online` (+ wrapping `entries`), with
+  `PlayerState.in_world`: `join_world` / `enter_world` (back into a joined world) count a player
+  in, `leave_world` counts it out; `move_player` (World read-only, no write lock between movers)
+  and every world action require `in_world` (`NotInWorld`). A crashed / closed client stays
+  counted until someone sends `expire_players` (permissionless, any PlayerState silent > 1 min;
+  the world picker and `enter_world` do it for the stale ones they find). An expired player is
+  kicked: its client, if it comes back to life, gets `NotInWorld` and returns to the world list
+  with a notice; Resume (`enter_world`) brings it back.
+- `leave_world` — the client's "Back to worlds": removes the player's presence entry (refund),
+  applying its pending damage first. Nobody sees or hits the player until its next move. In the
+  world (menu open or tab hidden included) the client keeps heartbeating, so a player is
+  visible and attackable exactly while it is in the world.
 - `eat(slot)`, `respawn` (health 0 → spawn, inventory cleared).
   Details: `programs/magicraft/src/instructions/actions.rs` (module docs).
 - `close_chunk`, `tick_chunk` (crank target), `tick_day` (crank target).

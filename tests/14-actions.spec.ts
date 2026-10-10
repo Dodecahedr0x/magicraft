@@ -13,6 +13,7 @@ import {
   chunkHeader,
   chunkPda,
   CHUNK_BLOCKS_OFFSET,
+  liveBlocks,
   createAndGrow,
   ixCus,
   populate,
@@ -36,6 +37,7 @@ import {
   Animal,
   Col,
   Hunt,
+  pickupWalk,
   Plan,
   scoutHunt,
   scoutWork,
@@ -45,6 +47,8 @@ import {
 import {
   attackIx,
   breakIx,
+  collectIxs,
+  groundItems,
   chunkMobs,
   countItem,
   craftIx,
@@ -55,6 +59,7 @@ import {
   localIndex,
   MEAT,
   placeableSlot,
+  pickupIx,
   placeIx,
   RECIPE,
   respawnIx,
@@ -111,6 +116,32 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
   async function blockAt(p: V3): Promise<number> {
     const d = (await chunkData(chunkAt(p)))!;
     return d[CHUNK_BLOCKS_OFFSET + localIndex(p)];
+  }
+
+  /** Picks up the ground items of the chunk holding `b` within reach (one tx;
+   *  none if there are none). */
+  async function collect(b: V3, p: TestPlayer = a) {
+    const d = (await chunkData(chunkAt(b)))!;
+    const feet = (await state(p)).move.pos;
+    const ixs = collectIxs(p, world, b, d, await chainMs(world), feet);
+    if (ixs.length) await act(ixs, p);
+  }
+
+  /** Walks within pickup reach of the item dropped by `b` (current blocks),
+   *  picks it up and walks back; false (nothing done) if no walk reaches it,
+   *  unless `required`. */
+  async function fetchDrops(b: V3, required = true, p: TestPlayer = a) {
+    const pos = (await state(p)).move.pos;
+    const from: Col = [Math.floor(pos[0] / FP), Math.floor(pos[2] / FP)];
+    const t = new Terrain(await liveBlocks(world, existing));
+    const w = pickupWalk(t, from, b);
+    if (required)
+      expect(w, `a column to pick up the drop of ${b}`).to.not.equal(null);
+    if (!w) return false;
+    await walk(p, w.there);
+    await collect(b, p);
+    await walk(p, w.back);
+    return true;
   }
 
   async function move(
@@ -398,7 +429,44 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
     const [l0, l1, l2] = plan.logs;
     await logCu("break_block (log, hand)", await act([breakIx(a, world, l0)]));
     expect(await blockAt(l0)).to.equal(0);
+    // The log floats where it was until picked up.
+    expect(countItem((await state()).inv, ITEM.LOG)).to.equal(0);
+    const g = groundItems(
+      (await chunkData(chunkAt(l0)))!,
+      await chainMs(world)
+    );
+    const dropped = g.find((x) => x.item === ITEM.LOG);
+    expect(dropped, JSON.stringify(g)).to.not.equal(undefined);
+    expect(dropped!.pos).to.deep.equal([
+      l0[0] * FP + 128,
+      l0[1] * FP + 64,
+      l0[2] * FP + 128,
+    ]);
+    const pos = (await state()).move.pos;
+    const from: Col = [Math.floor(pos[0] / FP), Math.floor(pos[2] / FP)];
+    const w = pickupWalk(
+      new Terrain(await liveBlocks(world, existing)),
+      from,
+      l0
+    )!;
+    if (w.there.length) {
+      // Out of pickup reach from here (reach 2 blocks; logs are mined from 5).
+      const err = await fails(
+        act([pickupIx(a, world, chunkAt(l0), dropped!.idx)])
+      );
+      expect(err?.code, String(err)).to.equal("OutOfReach");
+      await walk(a, w.there);
+    }
+    await logCu(
+      "pickup_item",
+      await act([pickupIx(a, world, chunkAt(l0), dropped!.idx)])
+    );
     expect(countItem((await state()).inv, ITEM.LOG)).to.equal(1);
+    const again = await fails(
+      act([pickupIx(a, world, chunkAt(l0), dropped!.idx)])
+    );
+    expect(again?.code, String(again)).to.equal("NoItem");
+    await walk(a, w.back);
     // 3 s bare-hand log cooldown.
     const err = await fails(act([breakIx(a, world, l1)]));
     expect(err?.code, String(err)).to.equal("Cooldown");
@@ -408,6 +476,7 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
     for (const l of [l1, l2]) {
       await waitBreak();
       await logCu("break_block (log, hand)", await act([breakIx(a, world, l)]));
+      await fetchDrops(l);
     }
     expect(countItem((await state()).inv, ITEM.LOG)).to.equal(3);
   });
@@ -419,6 +488,8 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
     expect(await blockAt(s)).to.equal(3);
     await logCu("break_block (stone, hand)", await act([breakIx(a, world, s)]));
     expect(await blockAt(s)).to.equal(0);
+    const g = groundItems((await chunkData(chunkAt(s)))!, await chainMs(world));
+    expect(g.filter((x) => x.item === ITEM.COBBLESTONE)).to.deep.equal([]);
     expect(countItem((await state()).inv, ITEM.COBBLESTONE)).to.equal(0);
   });
 
@@ -501,28 +572,42 @@ describe("actions: break, place, craft, attack, eat, respawn", () => {
       "break_block (stone, pickaxe)",
       await act([breakIx(a, world, plan.stones[0])])
     );
+    // The cobblestone may land out of walking reach (a stone inside the ground).
+    const s = plan.stones[0];
+    const onGround = (await fetchDrops(s, false))
+      ? 0
+      : groundItems((await chunkData(chunkAt(s)))!, await chainMs(world))
+          .filter((g) => g.item === ITEM.COBBLESTONE)
+          .reduce((n, g) => n + g.count, 0);
     const inv = (await state()).inv;
-    expect(await blockAt(plan.stones[0])).to.equal(0);
-    expect(countItem(inv, ITEM.COBBLESTONE)).to.equal(1);
+    expect(await blockAt(s)).to.equal(0);
+    expect(countItem(inv, ITEM.COBBLESTONE) + onGround).to.equal(1);
     expect(inv[pick].durability).to.equal(58);
   });
 
   it("gathering soft blocks with a shovel", async () => {
     const shovel = slotOf((await state()).inv, ITEM.WOOD_SHOVEL);
     await act([selectIx(a, world, shovel)]);
+    const placeable = async () =>
+      (await state()).inv
+        .filter((s) => s.item >= 1 && s.item <= 22)
+        .reduce((n, s) => n + s.count, 0);
+    const before = await placeable();
+    // Dig until the pillars have their blocks (a drop that lands out of
+    // walking reach stays on the ground).
+    let broken = 0;
     for (const p of plan.soft) {
+      if ((await placeable()) - before >= plan.softNeed) break;
       await waitBreak();
       await logCu(
         "break_block (soft, shovel)",
         await act([breakIx(a, world, p)])
       );
+      broken++;
+      await fetchDrops(p, false);
     }
-    const inv = (await state()).inv;
-    const blocks = inv
-      .filter((s) => s.item >= 1 && s.item <= 22)
-      .reduce((n, s) => n + s.count, 0);
-    expect(blocks).to.be.at.least(plan.soft.length + 2);
-    expect(inv[shovel].durability).to.equal(59 - plan.soft.length);
+    expect((await placeable()) - before).to.be.at.least(plan.softNeed);
+    expect((await state()).inv[shovel].durability).to.equal(59 - broken);
   });
 
   it("fall damage: pillar up 8 blocks and step off", async () => {

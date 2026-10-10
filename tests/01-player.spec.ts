@@ -275,7 +275,7 @@ describe("player sponsoring with chunks", () => {
       chunkPda(world, 0, 0),
       "confirmed"
     );
-    expect(chunk?.data.length).to.equal(17_152);
+    expect(chunk?.data.length).to.equal(17_536);
   });
 
   it("sponsoring stops at rent_exempt(Player) + margin (InsufficientSponsorFunds)", async () => {

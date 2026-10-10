@@ -164,7 +164,7 @@ use crate::consts::{CHUNK_H, CHUNK_W, FP};
 use crate::fluid::{BlockAccess, EAST, NORTH, SOUTH, WEST};
 use crate::hash::{mix, rand_range, splitmix_next, Seed};
 use crate::items::Item;
-use crate::physics::XZ_LIMIT;
+use crate::physics::{isqrt, XZ_LIMIT};
 use crate::populate::MobSpawn;
 
 /// Mob slots per chunk.
@@ -1067,6 +1067,40 @@ pub fn is_day(time_of_day_ms: u64, day_length_ms: u64) -> bool {
         return true;
     }
     time_of_day_ms % day_length_ms < day_length_ms.div_ceil(2)
+}
+
+/// Distance a hit pushes a mob back, FP (1.2 blocks).
+pub const KNOCKBACK: i64 = 307;
+
+/// Pushes a hit mob [`KNOCKBACK`] FP straight away from `from` (the attacker's feet, FP),
+/// horizontally, with the walking collision rules (steps up one block, stops at walls and
+/// at the border of its chunk `(cx, cz)`: the mob stays in its slot's chunk), then settles
+/// it. No push when the attacker stands on the mob's column center. Returns the distance
+/// moved.
+pub fn knockback<W: BlockAccess + ?Sized>(
+    w: &W,
+    cx: i32,
+    cz: i32,
+    mob: &mut Mob,
+    from: [i32; 3],
+) -> i64 {
+    let dx = mob.pos[0] as i64 - from[0] as i64;
+    let dz = mob.pos[2] as i64 - from[2] as i64;
+    let len = isqrt(dx * dx + dz * dz);
+    if len == 0 {
+        return 0;
+    }
+    let f = Frame {
+        cx: cx as i64,
+        cz: cz as i64,
+        enter: 0,
+    };
+    let mut p = [mob.pos[0] as i64, mob.pos[1] as i64, mob.pos[2] as i64];
+    let moved = move_axis(w, &f, &mut p, 0, dx * KNOCKBACK / len)
+        + move_axis(w, &f, &mut p, 2, dz * KNOCKBACK / len);
+    settle(w, &mut p);
+    mob.pos = [sat_i32(p[0]), sat_i32(p[1]), sat_i32(p[2])];
+    moved
 }
 
 /// Test hook: moves a mob along a heading as the wander step does.
@@ -2037,7 +2071,9 @@ mod tests {
     fn spawn_rate_gate() {
         let s = seed(9);
         for (cx, cz) in [(0, 0), (3, -7), (-100, 42)] {
-            let open = (0..30_000u64).filter(|&t| spawn_gate_open(&s, t, cx, cz)).count();
+            let open = (0..30_000u64)
+                .filter(|&t| spawn_gate_open(&s, t, cx, cz))
+                .count();
             // ≈ 1000 expected (1 in 30).
             assert!((800..1200).contains(&open), "{cx},{cz}: {open}");
         }
@@ -2047,7 +2083,10 @@ mod tests {
         let slots = [Mob::EMPTY; MOB_SLOTS];
         for t in 0..3000u64 {
             if !spawn_gate_open(&s, t, 0, 0) {
-                assert_eq!(try_spawn_zombie(&s, t, 0, 0, &w, &targets, &slots, true, 4), None);
+                assert_eq!(
+                    try_spawn_zombie(&s, t, 0, 0, &w, &targets, &slots, true, 4),
+                    None
+                );
             }
         }
     }
@@ -2344,5 +2383,75 @@ mod tests {
             ));
         }
         println!("try_spawn_zombie: {:?}/call", t.elapsed() / n as u32);
+    }
+
+    #[test]
+    fn knockback_pushes_away_from_the_attacker() {
+        let w = W::flat(10);
+        // Attacker west of the mob: pushed +x by KNOCKBACK.
+        let mut m = mob(KIND_ZOMBIE, 5, 11, 5);
+        let from = [c(3), 11 * FP, c(5)];
+        assert_eq!(knockback(&w, 0, 0, &mut m, from), KNOCKBACK);
+        assert_eq!(m.pos, [c(5) + KNOCKBACK as i32, 11 * FP, c(5)]);
+        // Diagonal: same length, split over both axes.
+        let mut m = mob(KIND_PIG, 8, 11, 8);
+        knockback(&w, 0, 0, &mut m, [c(6), 11 * FP, c(6)]);
+        assert_eq!(m.pos[0] - c(8), 217);
+        assert_eq!(m.pos[2] - c(8), 217);
+        // Attacker on the mob: no push.
+        let mut m = mob(KIND_PIG, 5, 11, 5);
+        let at = m.pos;
+        assert_eq!(knockback(&w, 0, 0, &mut m, at), 0);
+    }
+
+    #[test]
+    fn knockback_respects_walls_steps_and_the_chunk_border() {
+        // A 2-block wall at x = 6: stops at the boundary.
+        let mut w = W::flat(10);
+        for z in LO..LO + SPAN {
+            w.column(6, z, 12);
+        }
+        let mut m = mob(KIND_ZOMBIE, 5, 11, 5);
+        knockback(&w, 0, 0, &mut m, [c(4), 11 * FP, c(5)]);
+        assert_eq!(m.pos[0], 6 * FP - 1);
+        assert_free(&w, &m);
+        // A 1-block step: climbs it.
+        let mut w = W::flat(10);
+        for z in LO..LO + SPAN {
+            w.column(6, z, 11);
+        }
+        let mut m = mob(KIND_ZOMBIE, 5, 11, 5);
+        knockback(&w, 0, 0, &mut m, [c(4), 11 * FP, c(5)]);
+        assert_eq!(m.pos[1], 12 * FP);
+        assert_free(&w, &m);
+        // The chunk's east border (x = 16): stays inside the chunk.
+        let w = W::flat(10);
+        let mut m = mob(KIND_PIG, 15, 11, 5);
+        knockback(&w, 0, 0, &mut m, [c(14), 11 * FP, c(5)]);
+        assert_eq!(m.pos[0], 16 * FP - 1);
+        // Pushed off a 2-block ledge: lands below; a 4-block cliff stops it at the edge
+        // (mobs never drop more than MAX_DROP).
+        for (low, feet, x) in [
+            (8, 9 * FP, c(5) + KNOCKBACK as i32),
+            (6, 11 * FP, 6 * FP - 1),
+        ] {
+            let mut w = W::flat(low);
+            for x in LO..6 {
+                for z in LO..LO + SPAN {
+                    w.column(x, z, 10);
+                }
+            }
+            let mut m = mob(KIND_PIG, 5, 11, 5);
+            knockback(&w, 0, 0, &mut m, [c(4), 11 * FP, c(5)]);
+            assert_eq!((m.pos[1], m.pos[0]), (feet, x));
+        }
+    }
+
+    #[test]
+    fn isqrt_floors() {
+        for v in [0i64, 1, 2, 3, 4, 15, 16, 17, 99_999, 1 << 40] {
+            let r = isqrt(v);
+            assert!(r * r <= v && (r + 1) * (r + 1) > v, "{v}");
+        }
     }
 }

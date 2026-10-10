@@ -19,8 +19,13 @@
 //
 // Vertex data: positions (f32 ×3), normals (i8 ×3), uvs (f32 ×3: s, t in block units and the
 // atlas layer — the shader repeats the tile with `fract`), colors (u8 ×3 normalized: face
-// brightness × ambient occlusion), indices (u32).
+// brightness × ambient occlusion), dark (u8 normalized: 1 − sky brightness, skylight.ts;
+// the shader scales sun + ambient by 1 − dark, so models without it stay fully lit),
+// indices (u32). Opaque faces get smooth sky light per corner (mean level of the up to 4
+// open cells around the corner in front of the face, in half levels); cutout / water faces
+// one level each (the brighter of the cell and the one in front).
 import { FACE_TILES, Kind, KIND, OCCLUDES, isFluid, waterLevel, B } from "./blocks";
+import { skyBrightness, skyLight } from "./skylight";
 
 export const CW = 16;
 export const CH = 64;
@@ -33,6 +38,7 @@ export type MeshArrays = {
   normals: Int8Array;
   uvs: Float32Array;
   colors: Uint8Array;
+  dark: Uint8Array;
   indices: Uint32Array;
 };
 
@@ -42,6 +48,9 @@ export type MeshInput = {
   blocks: Uint8Array;
   /** N, S, E, W border planes (`borderOf`), null when that neighbor is not available. */
   borders: (Uint8Array | null)[];
+  /** The 8 neighbors' block arrays in `skylight.AROUND` order (null / omitted → air), for
+   *  sky light across the chunk border. */
+  around?: (Uint8Array | null)[];
 };
 
 /** Neighbor directions in `borders` order: N (−z), S (+z), E (+x), W (−x). */
@@ -105,6 +114,7 @@ class Builder {
   nrm = new Int8Array(4096 * 3);
   uv = new Float32Array(4096 * 3);
   col = new Uint8Array(4096 * 3);
+  dark = new Uint8Array(4096);
   idx = new Uint32Array(4096 * 1.5);
   nv = 0;
   ni = 0;
@@ -119,12 +129,14 @@ class Builder {
     this.nrm = g(this.nrm);
     this.uv = g(this.uv);
     this.col = g(this.col);
+    this.dark = g(this.dark);
     this.idx = g(this.idx);
   }
 
   /** One quad: 4 corners (xyz × 4), face `f`, atlas layer, 4 corner brightness (0..1),
-   *  `flip` = use the other diagonal. Corners are CCW seen from the front. */
-  quad(c: number[], f: number, layer: number, br: number[], flip: boolean) {
+   *  4 corner sky brightness (0..1), `flip` = use the other diagonal. Corners are CCW seen
+   *  from the front. */
+  quad(c: number[], f: number, layer: number, br: number[], sky: number[], flip: boolean) {
     if ((this.nv + 4) * 3 > this.pos.length || this.ni + 6 > this.idx.length) this.grow();
     const [nx, ny, nz] = NORMALS[f];
     const v0 = this.nv;
@@ -154,6 +166,7 @@ class Builder {
       this.uv[o + 2] = layer;
       const b = Math.round(br[k] * 255);
       this.col[o] = this.col[o + 1] = this.col[o + 2] = b;
+      this.dark[v0 + k] = Math.round((1 - sky[k]) * 255);
     }
     const I = this.idx;
     const i = this.ni;
@@ -174,6 +187,7 @@ class Builder {
       normals: this.nrm.slice(0, this.nv * 3),
       uvs: this.uv.slice(0, this.nv * 3),
       colors: this.col.slice(0, this.nv * 3),
+      dark: this.dark.slice(0, this.nv),
       indices: this.idx.slice(0, this.ni),
     };
   }
@@ -199,7 +213,7 @@ const U_AXIS = [1, 2, 0];
 const V_AXIS = [2, 0, 1];
 
 /** Emits face `f` of the box [min, max] (block units) as one quad. */
-function boxFace(m: Builder, f: number, min: number[], max: number[], layer: number, br: number) {
+function boxFace(m: Builder, f: number, min: number[], max: number[], layer: number, br: number, sky: number) {
   const a = f >> 1;
   const pos = (f & 1) === 0;
   const u = U_AXIS[a];
@@ -221,7 +235,7 @@ function boxFace(m: Builder, f: number, min: number[], max: number[], layer: num
     p[v] = uv[k][1];
     corners.push(p[0], p[1], p[2]);
   }
-  m.quad(corners, f, layer, [br, br, br, br], false);
+  m.quad(corners, f, layer, [br, br, br, br], [sky, sky, sky, sky], false);
 }
 
 // ---------------------------------------------------------------- meshing
@@ -237,16 +251,34 @@ export function waterHeight(b: number, above: number): number {
 
 export function meshChunk(input: MeshInput): ChunkMesh {
   const P = padded(input);
+  const S = skyLight(input.blocks, input.around);
   const opaque = new Builder();
   const cutout = new Builder();
   const water = new Builder();
-  greedyOpaque(P, opaque);
-  perBlock(P, cutout, water);
+  greedyOpaque(P, S, opaque);
+  perBlock(P, S, cutout, water);
   return { opaque: opaque.done(), cutout: cutout.done(), water: water.done() };
 }
 
-function greedyOpaque(P: Uint8Array, m: Builder) {
+/** Sky light of one face corner in half levels (0..30): the mean level of the open cells
+ *  among `q` (in front of the face), its two side cells `q ± su`, `q ± sv` and their
+ *  diagonal (skipped when both sides are opaque, as for AO). */
+function cornerSky(P: Uint8Array, S: Uint8Array, q: number, du: number, dv: number): number {
+  const a = !OCCLUDES[P[q + du]];
+  const b = !OCCLUDES[P[q + dv]];
+  let sum = S[q];
+  let n = 1;
+  if (a) (sum += S[q + du]), n++;
+  if (b) (sum += S[q + dv]), n++;
+  if ((a || b) && !OCCLUDES[P[q + du + dv]]) (sum += S[q + du + dv]), n++;
+  return Math.round((2 * sum) / n);
+}
+
+function greedyOpaque(P: Uint8Array, S: Uint8Array, m: Builder) {
   const mask = new Int32Array(CH * CW);
+  // Corner sky light (4 × 5 bits) of each mask cell; merged faces must match it too.
+  const lmask = new Int32Array(CH * CW);
+  const sky = [0, 0, 0, 0];
   const p = [0, 0, 0];
   const corners = new Array<number>(12);
   const br = [0, 0, 0, 0];
@@ -272,6 +304,7 @@ function greedyOpaque(P: Uint8Array, m: Builder) {
             const at = pidx(p[0], p[1], p[2]);
             const b = P[at];
             let key = 0;
+            let lkey = 0;
             if (KIND[b] === Kind.Opaque) {
               const q = at + sgn * sa;
               if (!OCCLUDES[P[q]]) {
@@ -286,10 +319,16 @@ function greedyOpaque(P: Uint8Array, m: Builder) {
                 const ao2 = ao(s1p, s2p, OCCLUDES[P[q + su + sv]]);
                 const ao3 = ao(s1m, s2p, OCCLUDES[P[q - su + sv]]);
                 key = (FACE_TILES[b * 6 + f] + 1) | (ao0 << 8) | (ao1 << 10) | (ao2 << 12) | (ao3 << 14);
+                lkey =
+                  cornerSky(P, S, q, -su, -sv) |
+                  (cornerSky(P, S, q, su, -sv) << 5) |
+                  (cornerSky(P, S, q, su, sv) << 10) |
+                  (cornerSky(P, S, q, -su, sv) << 15);
                 any = true;
               }
             }
             mask[cv * du + cu] = key;
+            lmask[cv * du + cu] = lkey;
           }
         if (!any) continue;
         // Greedy merge: widest run along u, then extend along v while rows match.
@@ -301,11 +340,13 @@ function greedyOpaque(P: Uint8Array, m: Builder) {
               cu++;
               continue;
             }
+            const lkey = lmask[cv * du + cu];
+            const same = (j: number) => mask[j] === key && lmask[j] === lkey;
             let w = 1;
-            while (cu + w < du && mask[cv * du + cu + w] === key) w++;
+            while (cu + w < du && same(cv * du + cu + w)) w++;
             let h = 1;
             outer: for (; cv + h < dv; h++)
-              for (let k = 0; k < w; k++) if (mask[(cv + h) * du + cu + k] !== key) break outer;
+              for (let k = 0; k < w; k++) if (!same((cv + h) * du + cu + k)) break outer;
             for (let hv = 0; hv < h; hv++) mask.fill(0, (cv + hv) * du + cu, (cv + hv) * du + cu + w);
             // Corners (u, v): (cu, cv), (cu+w, cv), (cu+w, cv+h), (cu, cv+h).
             const cs = [
@@ -326,10 +367,11 @@ function greedyOpaque(P: Uint8Array, m: Builder) {
               corners[k * 3 + 1] = q[1];
               corners[k * 3 + 2] = q[2];
               br[k] = shadeF * AO_CURVE[aos[c]];
+              sky[k] = skyBrightness(((lkey >> (5 * c)) & 31) / 2);
             }
             // Split along the diagonal with the brighter pair to avoid AO anisotropy.
-            const flip = br[0] + br[2] < br[1] + br[3];
-            m.quad(corners, f, (key & 0xff) - 1, br, flip);
+            const flip = br[0] * sky[0] + br[2] * sky[2] < br[1] * sky[1] + br[3] * sky[3];
+            m.quad(corners, f, (key & 0xff) - 1, br, sky, flip);
             cu += w;
           }
       }
@@ -339,7 +381,10 @@ function greedyOpaque(P: Uint8Array, m: Builder) {
 
 const ao = (s1: number, s2: number, c: number) => (s1 && s2 ? 0 : 3 - s1 - s2 - c);
 
-function perBlock(P: Uint8Array, cut: Builder, wat: Builder) {
+/** Sky brightness of a cutout / water face: the brighter of its cell and the one in front. */
+const faceSky = (S: Uint8Array, at: number, front: number) => skyBrightness(Math.max(S[at], S[front]));
+
+function perBlock(P: Uint8Array, S: Uint8Array, cut: Builder, wat: Builder) {
   const min = [0, 0, 0];
   const max = [0, 0, 0];
   for (let y = 0; y < CH; y++)
@@ -350,7 +395,7 @@ function perBlock(P: Uint8Array, cut: Builder, wat: Builder) {
         const k = KIND[b];
         if (k === Kind.None || k === Kind.Opaque) continue;
         if (k === Kind.Water) {
-          waterBlock(P, wat, x, y, z, at, b);
+          waterBlock(P, S, wat, x, y, z, at, b);
           continue;
         }
         for (let f = 0; f < 6; f++) {
@@ -382,21 +427,21 @@ function perBlock(P: Uint8Array, cut: Builder, wat: Builder) {
             max[2] = z + 9 / 16;
             max[1] = y + 10 / 16;
           }
-          boxFace(cut, f, min, max, FACE_TILES[b * 6 + f], FACE_SHADE[f]);
+          boxFace(cut, f, min, max, FACE_TILES[b * 6 + f], FACE_SHADE[f], faceSky(S, at, at + sgn * STRIDE[a]));
         }
       }
 }
 
-function waterBlock(P: Uint8Array, m: Builder, x: number, y: number, z: number, at: number, b: number) {
+function waterBlock(P: Uint8Array, S: Uint8Array, m: Builder, x: number, y: number, z: number, at: number, b: number) {
   const SY = STRIDE[1];
   const above = P[at + SY];
   const h = waterHeight(b, above);
   const layer = FACE_TILES[b * 6 + 2];
   const min = [x, y, z];
   const max = [x + 1, y + h, z + 1];
-  if (!isFluid(above)) boxFace(m, 2, min, max, layer, FACE_SHADE[2]);
+  if (!isFluid(above)) boxFace(m, 2, min, max, layer, FACE_SHADE[2], faceSky(S, at, at + SY));
   const below = P[at - SY];
-  if (!isFluid(below) && !OCCLUDES[below]) boxFace(m, 3, min, max, layer, FACE_SHADE[3]);
+  if (!isFluid(below) && !OCCLUDES[below]) boxFace(m, 3, min, max, layer, FACE_SHADE[3], faceSky(S, at, at - SY));
   for (const f of [0, 1, 4, 5]) {
     const a = f >> 1;
     const sgn = f & 1 ? -1 : 1;
@@ -410,7 +455,7 @@ function waterBlock(P: Uint8Array, m: Builder, x: number, y: number, z: number, 
       if (hn >= h) continue;
       y0 = y + hn;
     }
-    boxFace(m, f, [x, y0, z], max, layer, FACE_SHADE[f]);
+    boxFace(m, f, [x, y0, z], max, layer, FACE_SHADE[f], faceSky(S, at, nat));
   }
 }
 

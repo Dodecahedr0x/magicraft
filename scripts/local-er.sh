@@ -11,7 +11,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIR="$ROOT/.localnet"
-PROGRAM_ID="4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9"
+PROGRAM_ID="4y2JKsSfShA6tL5K9Vk3NZPPev1bq29AqqNK9iYF9euz"
 PROGRAM_SO="$ROOT/target/deploy/magicraft.so"
 WALLET="${ANCHOR_WALLET:-$HOME/.config/solana/id.json}"
 # Faucet/gossip/dynamic ports are moved off the solana-test-validator defaults

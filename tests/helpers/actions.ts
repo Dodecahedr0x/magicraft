@@ -84,6 +84,39 @@ export function chunkMobs(chunkData: Buffer) {
   return out;
 }
 
+export type GroundItem = {
+  idx: number;
+  item: number;
+  count: number;
+  pos: V3;
+  expiresMs: number;
+};
+
+/** Live ground items of a chunk account at chain time `now` (`core::ground`, 16 ×
+ *  24 B after the blocks: item u16, count u8, pad, pos [i32; 3], expires_ms i64). */
+export function groundItems(chunkData: Buffer, now: number): GroundItem[] {
+  const out: GroundItem[] = [];
+  for (let i = 0; i < 16; i++) {
+    const o = 768 + 16_384 + 24 * i;
+    if (o + 24 > chunkData.length) break;
+    const count = chunkData[o + 2];
+    const expiresMs = Number(chunkData.readBigInt64LE(o + 16));
+    if (count === 0 || now >= expiresMs) continue;
+    out.push({
+      idx: i,
+      item: chunkData.readUInt16LE(o),
+      count,
+      pos: [
+        chunkData.readInt32LE(o + 4),
+        chunkData.readInt32LE(o + 8),
+        chunkData.readInt32LE(o + 12),
+      ],
+      expiresMs,
+    });
+  }
+  return out;
+}
+
 export const localIndex = (b: V3) =>
   b[1] * 256 +
   (b[2] - Math.floor(b[2] / 16) * 16) * 16 +
@@ -239,6 +272,94 @@ export async function attackIx(
       world,
       playerState: pstatePda(world, p.player),
       chunk,
+    })
+    .instruction();
+}
+
+export async function pickupIx(
+  p: TestPlayer,
+  world: web3.PublicKey,
+  chunk: web3.PublicKey,
+  idx: number,
+  o: Auth = {}
+) {
+  return p.er.methods
+    .pickupItem(idx)
+    .accountsPartial({
+      ...authOf(p, o),
+      world,
+      playerState: pstatePda(world, p.player),
+      chunk,
+    })
+    .instruction();
+}
+
+/** pickup_item for every live ground item of the chunk holding block `b`
+ *  within pickup reach of `feet` (FP; 2.25 blocks from the body center, under
+ *  the onchain 2.5); empty if none. */
+export function collectIxs(
+  p: TestPlayer,
+  world: web3.PublicKey,
+  b: V3,
+  data: Buffer,
+  now: number,
+  feet: number[],
+  o: Auth = {}
+) {
+  const chunk = chunkPda(world, ...chunkOfBlock(b));
+  const r = 2.25 * 256;
+  return groundItems(data, now)
+    .filter(
+      (g) =>
+        (g.pos[0] - feet[0]) ** 2 +
+          (g.pos[1] - feet[1] - 230) ** 2 +
+          (g.pos[2] - feet[2]) ** 2 <=
+        r * r
+    )
+    .map((g) => pickupIx(p, world, chunk, g.idx, o));
+}
+
+/** attack_player: `target` = the victim's Player PDA, listed in the presence of
+ *  `chunk` (block-chunk coordinates). */
+export async function attackPlayerIx(
+  p: TestPlayer,
+  world: web3.PublicKey,
+  target: web3.PublicKey,
+  cx: number,
+  cz: number,
+  o: Auth = {}
+) {
+  const chunk = chunkPda(world, cx, cz);
+  return p.er.methods
+    .attackPlayer(target)
+    .accountsPartial({
+      ...authOf(p, o),
+      world,
+      playerState: pstatePda(world, p.player),
+      chunk,
+      presence: presencePda(chunk),
+      targetState: pstatePda(world, target),
+    })
+    .instruction();
+}
+
+/** leave_world from chunk `(cx, cz)` (the PlayerState's current chunk). */
+export async function leaveWorldIx(
+  p: TestPlayer,
+  world: web3.PublicKey,
+  cx: number,
+  cz: number,
+  o: Auth = {}
+) {
+  const chunk = chunkPda(world, cx, cz);
+  return p.er.methods
+    .leaveWorld()
+    .accountsPartial({
+      ...authOf(p, o),
+      world,
+      playerState: pstatePda(world, p.player),
+      chunk,
+      presence: presencePda(chunk),
     })
     .instruction();
 }

@@ -68,7 +68,8 @@ export class MeshPool {
       slot.busy = true;
       this.pending.set(id, { job, seq, w: slot });
       const msg: MeshRequest = { id, input };
-      slot.w.postMessage(msg, [input.blocks.buffer, ...input.borders.flatMap((b) => (b ? [b.buffer] : []))]);
+      const extra = [...input.borders, ...(input.around ?? [])].flatMap((b) => (b ? [b.buffer] : []));
+      slot.w.postMessage(msg, [input.blocks.buffer, ...extra]);
     }
   }
 

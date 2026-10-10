@@ -11,7 +11,11 @@ import { ephemeralRent } from "./world";
 export const CHUNK_INITIAL_LEN = 10_240;
 export const CHUNK_BLOCKS_OFFSET = 768;
 export const CHUNK_VOL = 16_384;
-export const CHUNK_FULL_LEN = CHUNK_BLOCKS_OFFSET + CHUNK_VOL; // 17 152
+export const CHUNK_BLOCKS_END = CHUNK_BLOCKS_OFFSET + CHUNK_VOL; // 17 152
+/** Ground items (16 × 24 B, `core::ground`) after the blocks. */
+export const CHUNK_GROUND_OFFSET = CHUNK_BLOCKS_END;
+export const GROUND_SLOTS = 16;
+export const CHUNK_FULL_LEN = CHUNK_GROUND_OFFSET + GROUND_SLOTS * 24; // 17 536
 export const PRESENCE_EMPTY_LEN = 48;
 /** Rent of one full chunk + its empty presence list. */
 export const CHUNK_TOTAL_RENT =
@@ -253,7 +257,10 @@ export async function liveBlocks(
   ks.forEach((k, i) => {
     const d = infos[i]?.data;
     if (d && d.length === CHUNK_FULL_LEN && d[82] === GEN_DONE)
-      out.set(k, Buffer.from(d.subarray(CHUNK_BLOCKS_OFFSET)));
+      out.set(
+        k,
+        Buffer.from(d.subarray(CHUNK_BLOCKS_OFFSET, CHUNK_BLOCKS_END))
+      );
   });
   return out;
 }

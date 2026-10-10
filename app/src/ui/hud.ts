@@ -262,11 +262,11 @@ export function openTopUp(app: App) {
 
 const chunkLabel = (c: SponsoredChunk) => `(${c.cx}, ${c.cz}) in ${short(c.world)}`;
 
-type CloseResult = { closed: number; failed: null | { chunk: SponsoredChunk; message: string; session: boolean } };
+export type CloseResult = { closed: number; failed: null | { chunk: SponsoredChunk; message: string; session: boolean } };
 
 /** Closes the plan's closable chunks one by one (session-signed); stops at the first
  *  failure. */
-async function closeChunks(app: App, chunks: SponsoredChunk[], progress: (i: number, msg: string) => void): Promise<CloseResult> {
+export async function closeChunks(app: App, chunks: SponsoredChunk[], progress: (i: number, msg: string) => void): Promise<CloseResult> {
   const { sender, session, player } = app.state;
   if (!sender || !session || !player) return { closed: 0, failed: { chunk: chunks[0], message: "No play session.", session: true } };
   const auth = sessionAuth(session, player);

@@ -4,7 +4,7 @@
 // the chain before each step, so it also resumes a world whose setup was interrupted.
 import type { PublicKey } from "@solana/web3.js";
 import {
-  CHUNK_FULL_LEN,
+  CHUNK_BLOCKS_END,
   CHUNK_TOTAL_RENT,
   DEFAULT_WORLD_PARAMS,
   GEN_DONE,
@@ -133,7 +133,7 @@ export async function runSetup(
       await step(3, () => send(app, async () => createAndGrowIxs(app.program, auth, world, 0, 0, viewOf(new Set())), { gen: true }));
       c = await until(readChunk, 5_000);
     } else steps.set(3, "done", "exists");
-    if (!c || c.length !== CHUNK_FULL_LEN) throw new Error("Chunk (0, 0) exists but was not generated.");
+    if (!c || c.length < CHUNK_BLOCKS_END) throw new Error("Chunk (0, 0) exists but was not generated.");
 
     if (c[82] !== GEN_DONE) await step(4, () => send(app, async () => [await populateChunkIx(app.program, world, 0, 0)], { gen: true }));
     else steps.set(4, "done", "already populated");

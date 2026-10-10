@@ -34,6 +34,7 @@ import {
   joinWorldIx,
   measureUsPerSlot,
   moveIx,
+  pickupItemIx,
   placeBlockIx,
   populateChunkIx,
   requestSeedIx,
@@ -49,6 +50,7 @@ import {
   chunkBlocks,
   chunkReady,
   decodeChunkHeader,
+  decodeGroundItems,
   decodePlayer,
   decodePlayerState,
   decodeWorld,
@@ -80,7 +82,7 @@ const cfg = loadConfig({
   VITE_BASE_RPC: env.SMOKE_BASE_RPC ?? "https://api.devnet.solana.com",
   VITE_ER_RPC: env.SMOKE_ER_RPC ?? "https://devnet-eu.magicblock.app",
   VITE_ER_VALIDATOR: env.SMOKE_ER_VALIDATOR ?? "MEUGGrYPxKk17hCr7wpT6s8dtNokZj5U2L57vjYMS8e",
-  VITE_PROGRAM_ID: env.SMOKE_PROGRAM_ID ?? "4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9",
+  VITE_PROGRAM_ID: env.SMOKE_PROGRAM_ID ?? "4y2JKsSfShA6tL5K9Vk3NZPPev1bq29AqqNK9iYF9euz",
   VITE_VRF_QUEUE: DEFAULT_EPHEMERAL_QUEUE.toBase58(),
 });
 if (!env.SMOKE_WALLET) throw new Error("set SMOKE_WALLET to a funded throwaway keypair file");
@@ -559,7 +561,7 @@ async function main() {
   }
 
   // 8. Break under the player + place on the border
-  await step("break_block under the player + place_block across the border", async () => {
+  await step("break_block under the player + pickup_item + place_block across the border", async () => {
     const [x, y, z] = path[path.length - 1];
     // Walk back to the path end first (the route ended there).
     const below: V3 = [x, y - 1, z];
@@ -567,12 +569,17 @@ async function main() {
     const idx = (b: V3) => blockIndex(b[0] - Math.floor(b[0] / 16) * 16, b[1], b[2] - Math.floor(b[2] / 16) * 16);
     const br = await ok("break_block", async () => [await breakBlockIx(program, auth, world, below, view())]);
     if ((await blocksOf(cx, cz))[idx(below)] !== 0) throw new Error("block not broken");
+    // The drop floats where the block was (under the feet: in pickup reach).
+    const now = (await chainNow(world)).ms;
+    const drops = decodeGroundItems((await account(chunkPda(pid, world, cx, cz)))!, now);
+    if (!drops.length) throw new Error("no ground item after the break");
+    const pk = await ok("pickup_item", async () => await Promise.all(drops.map((g) => pickupItemIx(program, auth, world, cx, cz, g.idx))));
     const inv = (await state()).inventory;
     const slot = inv.findIndex((s) => s.count > 0 && s.item >= 1 && s.item <= 22);
     if (slot < 0) throw new Error("no placeable drop");
     const tgt = path[path.length - 2];
     const pl = await ok("place_block", async () => [await placeBlockIx(program, auth, world, tgt, slot, view())]);
-    return { break: { ms: br.ms, cu: await cu(br.sig) }, place: { ms: pl.ms, cu: await cu(pl.sig) } };
+    return { break: { ms: br.ms, cu: await cu(br.sig) }, pickup: { ms: pk.ms, cu: await cu(pk.sig) }, place: { ms: pl.ms, cu: await cu(pl.sig) } };
   }, false);
 
   // 9. Top-up via e-SPL lamportsDelegatedTransferIx

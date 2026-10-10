@@ -16,10 +16,10 @@ import {
 import { bs58, burnerAllowed, burnerKey, burnerKeypair, chainFor, isLocalRpc, loadBurner, saveBurner } from "../wallet";
 import { chunksFor, parseSol } from "./onboarding";
 import { PARAM_FIELDS, fromForm, jumpHeight, toForm, validateForm, validateName } from "./params";
-import { decodeWorldList, visibleWorlds, worldFilters, worldStatus } from "./worldList";
+import { decodeWorldList, silentPlayers, visibleWorlds, worldClosable, worldCloseRefund, worldFilters, worldStatus } from "./worldList";
 import { CHUNK_PREFIX_LEN, parseChunkPrefix, planWithdraw, prefixMatches, withdrawPhase, type SponsoredChunk } from "./withdrawPlan";
 
-const PID = new PublicKey("4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9");
+const PID = new PublicKey("4y2JKsSfShA6tL5K9Vk3NZPPev1bq29AqqNK9iYF9euz");
 
 class MemStore implements KeyValueStore {
   m = new Map<string, string>();
@@ -185,6 +185,38 @@ function bs58Decode(s: string): Uint8Array {
   }
   return Uint8Array.from(out);
 }
+
+describe("silent players (expire_players candidates)", () => {
+  const k = () => Keypair.generate().publicKey;
+  const [w1, w2, s1, s2, s3, s4] = [k(), k(), k(), k(), k(), k()];
+  it("by world: last move older than 1 min (+1 s margin) at that world's chain time; worlds without a clock skipped", () => {
+    const now = 100_000;
+    const silent = silentPlayers(
+      [
+        { pubkey: s1, world: w1.toBase58(), lastMs: now - 61_001 },
+        { pubkey: s2, world: w1.toBase58(), lastMs: now - 61_000 }, // within the margin
+        { pubkey: s3, world: w1.toBase58(), lastMs: now - 500 },
+        { pubkey: s4, world: w2.toBase58(), lastMs: 0 }, // w2: no clock reading
+      ],
+      new Map([[w1.toBase58(), now]]),
+    );
+    expect([...silent.keys()]).toEqual([w1.toBase58()]);
+    expect(silent.get(w1.toBase58())!.map((p) => p.toBase58())).toEqual([s1.toBase58()]);
+  });
+});
+
+describe("close world", () => {
+  it("only untouched worlds: nobody joined, at most the spawn chunk", () => {
+    expect(worldClosable({ firstJoinMs: 0, chunkCount: 0 })).toBe(true);
+    expect(worldClosable({ firstJoinMs: 0, chunkCount: 1 })).toBe(true);
+    expect(worldClosable({ firstJoinMs: 0, chunkCount: 2 })).toBe(false);
+    expect(worldClosable({ firstJoinMs: 1, chunkCount: 1 })).toBe(false);
+  });
+  it("refunds the World rent, plus the spawn chunk's when it exists", () => {
+    expect(worldCloseRefund({ chunkCount: 0 })).toBe((265 + 60) * 32);
+    expect(worldCloseRefund({ chunkCount: 1 }) - worldCloseRefund({ chunkCount: 0 })).toBe(CHUNK_TOTAL_RENT);
+  });
+});
 
 describe("withdraw plan", () => {
   const player = Keypair.generate().publicKey;

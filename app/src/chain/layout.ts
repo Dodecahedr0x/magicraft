@@ -24,7 +24,18 @@ export const CHUNK_GEN_STAGE_OFFSET = 82;
 /** Offset of `ChunkHeader.payer` (Player PDA, 32 B). */
 export const CHUNK_PAYER_OFFSET = 8;
 export const CHUNK_INITIAL_LEN = 10_240;
-export const CHUNK_FULL_LEN = CHUNK_BLOCKS_OFFSET + CHUNK_VOL; // 17 152
+/** End of the blocks: a chunk at least this long is playable (one grown before ground items
+ *  existed ends here and has none: its drops go to the inventory). */
+export const CHUNK_BLOCKS_END = CHUNK_BLOCKS_OFFSET + CHUNK_VOL; // 17 152
+/** Ground items (`core::ground`: `GROUND_SLOTS` × `GROUND_ITEM_SIZE`) after the blocks. */
+export const CHUNK_GROUND_OFFSET = CHUNK_BLOCKS_END;
+export const GROUND_SLOTS = 16;
+export const GROUND_ITEM_SIZE = 24;
+export const CHUNK_FULL_LEN = CHUNK_GROUND_OFFSET + GROUND_SLOTS * GROUND_ITEM_SIZE; // 17 536
+/** `core::ground`: pickup reach from the body center (2 blocks; + 0.5 slack onchain), FP. */
+export const PICKUP_REACH_FP = 2 * 256;
+/** `core::ground::BODY_CENTER_FP` (0.9 block above the feet). */
+export const BODY_CENTER_FP = 230;
 export const PRESENCE_HEADER_SIZE = 48;
 export const PRESENCE_ENTRY_SIZE = 56;
 export const PLAYER_LEN = 105;
@@ -259,6 +270,10 @@ export type WorldAccount = {
   dayEpoch: number;
   /** Chain ms of the first `join_world` (0 = nobody joined: the clock may still step back). */
   firstJoinMs: number;
+  /** Players in the world now (`PlayerState.in_world` set; see `play.rs`). */
+  playersOnline: number;
+  /** Wrapping count of entries into the world. */
+  entries: number;
 };
 
 const utf8 = new TextDecoder();
@@ -294,6 +309,8 @@ export function decodeWorld(d: Uint8Array): WorldAccount {
     dayTicks: r.u32(243),
     dayEpoch: r.u8(247),
     firstJoinMs: r.n64(248),
+    playersOnline: r.u32(256),
+    entries: r.u32(260),
   };
 }
 
@@ -402,7 +419,17 @@ export type PlayerStateAccount = {
   attackUntilMs: number;
   foodTickMs: number;
   respawnMs: number;
+  /** In the world (counted in `World.playersOnline`); moves need it (`NotInWorld`). */
+  inWorld: boolean;
 };
+
+/** `PlayerState.in_world` offset (u8). */
+export const PSTATE_IN_WORLD_OFFSET = 406;
+/** `play::EXPIRE_MS`: a counted-in player whose last move is older than this can be counted
+ *  out by anyone (`expire_players`). */
+export const EXPIRE_MS = 60_000;
+/** `play::MAX_EXPIRE`: PlayerStates per `expire_players` / `enter_world`. */
+export const MAX_EXPIRE = 8;
 
 /** `PlayerState.move_state` offset in the account data (`MoveState`, 72 B). */
 export const PSTATE_MOVE_OFFSET = 73;
@@ -430,6 +457,7 @@ export function decodePlayerState(d: Uint8Array): PlayerStateAccount {
     attackUntilMs: r.n64(382),
     foodTickMs: r.n64(390),
     respawnMs: r.n64(398),
+    inWorld: r.u8(PSTATE_IN_WORLD_OFFSET) !== 0,
   };
 }
 
@@ -556,15 +584,43 @@ export function decodeChunkHeader(d: Uint8Array): ChunkHeader {
   };
 }
 
-/** A chunk is playable: full size and `gen_stage == DONE` (else ixs reject it). */
+/** A chunk is playable: grown (blocks present) and `gen_stage == DONE` (else ixs reject it). */
 export const chunkReady = (d: Uint8Array) =>
-  d.length === CHUNK_FULL_LEN && d[CHUNK_GEN_STAGE_OFFSET] === GEN_DONE && accountKind(d) === "chunk";
+  d.length >= CHUNK_BLOCKS_END && d[CHUNK_GEN_STAGE_OFFSET] === GEN_DONE && accountKind(d) === "chunk";
 
-/** The 16 384 block bytes of a full chunk (a view into `d`, no copy); index
- *  `y * 256 + lz * 16 + lx` ([`blockIndex`]). Null while the chunk is not full size. */
+/** The 16 384 block bytes of a grown chunk (a view into `d`, no copy); index
+ *  `y * 256 + lz * 16 + lx` ([`blockIndex`]). Null while the chunk is not grown. */
 export function chunkBlocks(d: Uint8Array): Uint8Array | null {
-  if (d.length !== CHUNK_FULL_LEN) return null;
-  return d.subarray(CHUNK_BLOCKS_OFFSET, CHUNK_FULL_LEN);
+  if (d.length < CHUNK_BLOCKS_END) return null;
+  return d.subarray(CHUNK_BLOCKS_OFFSET, CHUNK_BLOCKS_END);
+}
+
+/** `core::ground::GroundItem` of slot `idx`: `pos` is the FP bottom center of the item. */
+export type GroundItem = { idx: number; item: number; count: number; pos: V3; expiresMs: number };
+
+/** The live ground items of a chunk at chain time `now` (none for a chunk without the
+ *  ground region; empty, unknown-count and expired slots skipped). */
+export function decodeGroundItems(d: Uint8Array, now: number): GroundItem[] {
+  if (d.length < CHUNK_FULL_LEN) return [];
+  const r = new Reader(d);
+  const out: GroundItem[] = [];
+  for (let i = 0; i < GROUND_SLOTS; i++) {
+    const o = CHUNK_GROUND_OFFSET + GROUND_ITEM_SIZE * i;
+    const count = r.u8(o + 2);
+    const expiresMs = r.n64(o + 16);
+    if (count === 0 || now >= expiresMs) continue;
+    out.push({ idx: i, item: r.u16(o), count, pos: r.v3(o + 4), expiresMs });
+  }
+  return out;
+}
+
+/** `core::ground::in_pickup_reach` without the onchain slack (the client waits until the
+ *  item is clearly in reach). */
+export function inPickupReach(feet: V3, item: V3) {
+  const dx = item[0] - feet[0];
+  const dy = item[1] - (feet[1] + BODY_CENTER_FP);
+  const dz = item[2] - feet[2];
+  return dx * dx + dy * dy + dz * dz <= PICKUP_REACH_FP * PICKUP_REACH_FP;
 }
 
 /** Local block index `y * 256 + lz * 16 + lx`. */

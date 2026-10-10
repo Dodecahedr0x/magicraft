@@ -6,7 +6,7 @@ export type MeshRequest = { id: number; input: MeshInput };
 export type MeshReply = { id: number; mesh: ChunkMesh; ms: number } | { id: number; error: string };
 
 const transfers = (m: ChunkMesh): Transferable[] =>
-  [m.opaque, m.cutout, m.water].flatMap((a) => [a.positions.buffer, a.normals.buffer, a.uvs.buffer, a.colors.buffer, a.indices.buffer]);
+  [m.opaque, m.cutout, m.water].flatMap((a) => [a.positions.buffer, a.normals.buffer, a.uvs.buffer, a.colors.buffer, a.dark.buffer, a.indices.buffer]);
 
 self.onmessage = (e: MessageEvent<MeshRequest>) => {
   const { id, input } = e.data;

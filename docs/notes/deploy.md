@@ -6,12 +6,17 @@ it was fixed (`us_per_slot_hint`, µs rate, backward steps until the first join)
 upgraded in place, and the full smoke passes, moves right after world creation included
 ([Clock fix](#clock-fix-and-upgrade)).
 
+**Redeployed under a new program id 2026-10-10** ([Program reset](#program-reset)): the first
+program `4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9` was closed; every devnet world, player
+and chunk under it is gone.
+
 ## Endpoints and ids
 
 | What | Value | Source |
 |---|---|---|
-| Program (devnet) | `4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9` (`target/deploy/magicraft-keypair.json`) | deploy |
-| ProgramData | `9NDxTc8LBXrobxJ2Vm5YS7n6EkVEHkATpVe65MBmuZzu` | `solana program show` |
+| Program (devnet) | `4y2JKsSfShA6tL5K9Vk3NZPPev1bq29AqqNK9iYF9euz` (`target/deploy/magicraft-keypair.json`) | deploy |
+| ProgramData | `F1SwcQWACzraZK9hdqo3ZGcygF5yxQRiHSS4uKknADGg` | `solana program show` |
+| First program (closed) | `4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9`, keypair backed up in `~/.config/solana/magicraft-old/` | |
 | Upgrade authority | `5Hs51hUxpr9cBz8gwbsFNVcJqdtPeJR8MoUNxoUSGP8a` (default CLI keypair) | deploy |
 | Base RPC | `https://api.devnet.solana.com` | |
 | ER, EU (used) | `https://devnet-eu.magicblock.app`, validator `MEUGGrYPxKk17hCr7wpT6s8dtNokZj5U2L57vjYMS8e` | `getIdentity`, router |
@@ -253,3 +258,22 @@ world and while a player move is running.
 2. Pipelining only if players are far from their ER (latency above).
 3. Hydra: nothing to do now (Magic-program `ScheduleTask` works on ER 1.0.0; the docs still
    document it); keep `scheduler.rs` as the single swap point and re-check at mainnet time.
+
+## Program reset
+
+2026-10-10: the program gained instructions and account fields (ground items, PvP, leaving /
+entering worlds, the onchain player count, `close_world`, knockback) whose clients the old
+deployment rejected ("instruction fallback not found"). Instead of upgrading in place over
+worlds with the old layouts, the program was closed and redeployed under a new id:
+
+1. New keypair `target/deploy/magicraft-keypair.json` (old one backed up), `anchor keys sync`
+   (`declare_id!`, `Anchor.toml`), id replaced in `app/.env.devnet`, `app/.env.example`,
+   `scripts/local-er.sh`, `scripts/devnet-smoke.ts` and the app tests (the
+   `region.test.ts` delegation-record fixture keeps the old id: it is recorded data).
+2. Full localnet suite green (124 specs), then `scripts/build-release.sh` (release queue,
+   no `debug_` instructions); the app IDL stays synced from the `localnet` build (dev hooks).
+3. `solana program close 4GTy… --bypass-warning`: 4.5875 SOL reclaimed to the authority.
+4. Deploy (command above): signature
+   `52uUTQJCfqxnUo7NPzqQPw97iNjdaizj21bovCYG5RTofbV3qFX2eRsjuJ8u8r3kfyi6dvjeqfEPmRag7sRyhyNk`,
+   slot 509 545 228, 996 504 bytes, 5.0631 SOL program-data rent.
+

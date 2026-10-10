@@ -39,6 +39,20 @@
 //! 5. Store `MoveState`, current chunk `(cx, cz)`, vitals; `crank::maybe_arm_chunk` on the
 //!    new chunk (read-only; re-arms its tick crank only if stale, see `crank`).
 //!
+//! # Players in the world (`World.players_online`, `PlayerState.in_world`)
+//! `move_player` keeps the World read-only (no write lock between movers), so the count
+//! changes only on explicit transitions, each holding the World writable:
+//! - `join_world`: +1 (`in_world = 1`); `enter_world` (back into a joined world): +1 unless
+//!   already in; `leave_world` ("Back to worlds"): −1;
+//! - `expire_players` (permissionless) / the `remaining_accounts` of `enter_world`: −1 for
+//!   each PlayerState counted in whose last move is older than [`EXPIRE_MS`] (1 min): a closed
+//!   or crashed client. Clients send it for the stale ones they find, so the count of a
+//!   world nobody is playing in still comes down whenever someone looks at the world list.
+//!
+//! `move_player` and every world action require `in_world` (`NotInWorld`): a counted-out
+//! (expired) player is out of the world — its client returns to the world list — until
+//! `enter_world` counts it back in.
+//!
 //! The previous chunk is the chunk of `prev.pos` (always a required slot); `PlayerState`
 //! `cx`/`cz` is a cache of the chunk of the stored position.
 
@@ -58,8 +72,8 @@ use crate::errors::MagicraftError;
 use crate::instructions::crank::maybe_arm_chunk;
 use crate::presence::{self, Sponsor};
 use crate::state::{
-    ensure_sponsor_reserve, ready_chunk_blocks_ro, Player, PlayerState, World, MAX_HEALTH,
-    PLAYER_SEED, PSTATE_SEED,
+    chunk_header, ensure_sponsor_reserve, ready_chunk_blocks_ro, Player, PlayerState, World,
+    MAX_HEALTH, PLAYER_SEED, PSTATE_SEED,
 };
 
 /// Byte size of the `PlayerState` account.
@@ -245,6 +259,9 @@ pub fn join_world(ctx: Context<JoinWorld>) -> Result<()> {
     }
     let now = world.chain_ms_ro(&clock).ms;
     world.note_join(now);
+    // Joining enters the world (`in_world: 1` below).
+    world.players_online = world.players_online.saturating_add(1);
+    world.entries = world.entries.wrapping_add(1);
     let pos = spawn_pos(world.spawn);
     let mut s = PlayerState {
         player: player_key,
@@ -262,7 +279,8 @@ pub fn join_world(ctx: Context<JoinWorld>) -> Result<()> {
         attack_until_ms: 0,
         food_tick_ms: now,
         respawn_ms: 0,
-        _reserved: [0; 26],
+        in_world: 1,
+        _reserved: [0; 25],
     };
     s.set_move_state(&MoveState::spawn(pos, now));
     s.try_serialize(&mut &mut ps_ai.try_borrow_mut_data()?[..])?;
@@ -325,6 +343,7 @@ pub fn move_player(
 ) -> Result<()> {
     let a = &ctx.accounts;
     require!(!a.player_state.is_dead(), MagicraftError::Dead);
+    require!(a.player_state.in_world != 0, MagicraftError::NotInWorld);
     let prev = a.player_state.move_state()?;
     let world = &a.world;
     let world_key = world.key();
@@ -470,8 +489,201 @@ pub fn move_player(
     Ok(())
 }
 
+// ---------- leave_world ----------
+
+#[derive(Accounts, Session)]
+pub struct LeaveWorld<'info> {
+    pub signer: Signer<'info>,
+    /// Presence rent sponsor (the freed entry is refunded to it). `mut` ⇒ delegated.
+    #[account(mut, seeds = [PLAYER_SEED, player.authority.as_ref()], bump = player.bump)]
+    pub player: Account<'info, Player>,
+    #[session(signer = signer, authority = player.authority.key())]
+    pub session_token: Option<Account<'info, SessionTokenV2>>,
+    /// `players_online` −1.
+    #[account(mut)]
+    pub world: Account<'info, World>,
+    #[account(
+        mut,
+        constraint = player_state.player == player.key() @ MagicraftError::Unauthorized,
+        constraint = player_state.world == world.key() @ MagicraftError::Unauthorized
+    )]
+    pub player_state: Account<'info, PlayerState>,
+    /// CHECK: the chunk of the stored position (`PlayerState.cx/cz`; stored identity).
+    pub chunk: UncheckedAccount<'info>,
+    /// CHECK: its presence list (`presence_of`).
+    #[account(mut)]
+    pub presence: UncheckedAccount<'info>,
+    /// CHECK: ephemeral rent vault
+    #[account(mut, address = EPHEMERAL_VAULT_ID)]
+    pub vault: UncheckedAccount<'info>,
+    pub magic_program: Program<'info, MagicProgram>,
+}
+
+/// Leaves the world for now (the client's "exit world"): removes the player's entry from
+/// the presence list of its current chunk (refund to its Player), so zombies and other
+/// players no longer see or hit it; the next `move_player` re-adds it. Pending damage on
+/// the entry is applied first (leaving does not dodge hits already taken; it can kill).
+/// Not listed (already pruned / never moved) → no-op. Allowed while dead.
+#[session_auth_or(
+    ctx.accounts.player.authority == ctx.accounts.signer.key(),
+    MagicraftError::Unauthorized
+)]
+pub fn leave_world(ctx: Context<LeaveWorld>) -> Result<()> {
+    let a = &ctx.accounts;
+    let ps = &a.player_state;
+    {
+        let h = chunk_header(&a.chunk)?;
+        require!(
+            h.world == a.world.key() && h.cx.get() == ps.cx && h.cz.get() == ps.cz,
+            MagicraftError::InvalidChunk
+        );
+    }
+    let player_ai = a.player.to_account_info();
+    let vault_ai = a.vault.to_account_info();
+    let (authority, pbump) = (a.player.authority, [a.player.bump]);
+    let pseeds = player_seeds(&authority, &pbump);
+    let sponsor = Sponsor {
+        player: &player_ai,
+        vault: &vault_ai,
+        seeds: &pseeds,
+    };
+    let me = a.player.key();
+    let pending = presence::leave(&a.presence, a.chunk.key, &me, ps.respawn_ms, &sponsor)?;
+    let a = &mut *ctx.accounts;
+    let ps = &mut a.player_state;
+    if pending > 0 && !ps.is_dead() {
+        ps.health = ps.health.saturating_sub(pending);
+        msg!("leave: pending damage {} → health {}", pending, ps.health);
+    }
+    if ps.in_world != 0 {
+        ps.in_world = 0;
+        a.world.players_online = a.world.players_online.saturating_sub(1);
+    }
+    Ok(())
+}
+
+// ---------- enter_world / expire_players ----------
+
+/// A player counts as gone (crashed tab, lost connection) once its last accepted move is
+/// older than this, chain ms (moves come every ≤ 1 s while in the world, hidden tabs
+/// included; well above `presence::STALE_MS`).
+pub const EXPIRE_MS: i64 = 60_000;
+/// At most this many `PlayerState`s per `expire_players` / `enter_world` call (CU bound).
+pub const MAX_EXPIRE: usize = 8;
+
+#[derive(Accounts, Session)]
+pub struct EnterWorld<'info> {
+    pub signer: Signer<'info>,
+    /// Read-only; tied to `player_state`.
+    pub player: Account<'info, Player>,
+    #[session(signer = signer, authority = player.authority.key())]
+    pub session_token: Option<Account<'info, SessionTokenV2>>,
+    /// `players_online` +1.
+    #[account(mut)]
+    pub world: Account<'info, World>,
+    #[account(
+        mut,
+        constraint = player_state.player == player.key() @ MagicraftError::Unauthorized,
+        constraint = player_state.world == world.key() @ MagicraftError::Unauthorized
+    )]
+    pub player_state: Account<'info, PlayerState>,
+}
+
+/// Comes back into a joined world (the client's "Resume"): `in_world = 1` and
+/// `players_online` +1, unless already in (no-op: a reload or a second tab). The move
+/// clock is not touched: the next `move_player` carries on from the stored state.
+/// `remaining_accounts`: up to [`MAX_EXPIRE`] PlayerStates to expire (as [`expire_players`]).
+#[session_auth_or(
+    ctx.accounts.player.authority == ctx.accounts.signer.key(),
+    MagicraftError::Unauthorized
+)]
+pub fn enter_world(ctx: Context<EnterWorld>) -> Result<()> {
+    let now = ctx.accounts.world.chain_ms_ro(&Clock::get()?).ms;
+    let me = ctx.accounts.player_state.key();
+    let expired = expire_list(
+        &ctx.accounts.world.key(),
+        ctx.remaining_accounts,
+        now,
+        Some(&me),
+    )?;
+    let a = &mut *ctx.accounts;
+    a.world.players_online = a.world.players_online.saturating_sub(expired);
+    if a.player_state.in_world == 0 {
+        a.player_state.in_world = 1;
+        a.world.players_online = a.world.players_online.saturating_add(1);
+        a.world.entries = a.world.entries.wrapping_add(1);
+    }
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct ExpirePlayers<'info> {
+    /// `players_online` − the expired count.
+    #[account(mut)]
+    pub world: Account<'info, World>,
+}
+
+/// Permissionless: takes the `remaining_accounts` PlayerStates (≤ [`MAX_EXPIRE`], mut) of
+/// `world` that are counted in but silent for over [`EXPIRE_MS`] out of the count
+/// (`in_world = 0`, `players_online` −1 each). Others are skipped (not an error: the
+/// caller's view may be a little old). Their next `move_player` fails `NotInWorld` until
+/// they `enter_world` again.
+pub fn expire_players(ctx: Context<ExpirePlayers>) -> Result<()> {
+    let now = ctx.accounts.world.chain_ms_ro(&Clock::get()?).ms;
+    let n = expire_list(&ctx.accounts.world.key(), ctx.remaining_accounts, now, None)?;
+    let w = &mut ctx.accounts.world;
+    w.players_online = w.players_online.saturating_sub(n);
+    if n > 0 {
+        msg!("expired {} → {} online", n, w.players_online);
+    }
+    Ok(())
+}
+
+/// Pure: a PlayerState counted in (`in_world`) whose last move is older than [`EXPIRE_MS`].
+pub fn expirable(in_world: u8, last_ms: i64, now: i64) -> bool {
+    in_world != 0 && now.saturating_sub(last_ms) > EXPIRE_MS
+}
+
+/// Expires the PlayerStates of `world` in `accounts` (see [`expire_players`]); `skip`: the
+/// caller's own state. Returns how many were expired.
+fn expire_list<'a, 'info>(
+    world: &Pubkey,
+    accounts: &'a [AccountInfo<'info>],
+    now: i64,
+    skip: Option<&Pubkey>,
+) -> Result<u32> {
+    require!(accounts.len() <= MAX_EXPIRE, MagicraftError::InvalidTarget);
+    let mut n = 0u32;
+    for ai in accounts {
+        if skip == Some(ai.key) || !ai.is_writable {
+            continue;
+        }
+        require_keys_eq!(*ai.owner, crate::ID, MagicraftError::Unauthorized);
+        let mut data = ai.try_borrow_mut_data()?;
+        // Checks the discriminator.
+        let mut ps = PlayerState::try_deserialize(&mut &data[..])?;
+        require_keys_eq!(ps.world, *world, MagicraftError::Unauthorized);
+        if !expirable(ps.in_world, ps.move_state()?.last_ms, now) {
+            continue;
+        }
+        ps.in_world = 0;
+        ps.try_serialize(&mut &mut data[..])?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expirable_only_when_in_and_silent() {
+        use super::{expirable, EXPIRE_MS};
+        let now = 1_000_000;
+        assert!(expirable(1, now - EXPIRE_MS - 1, now));
+        assert!(!expirable(1, now - EXPIRE_MS, now));
+        assert!(!expirable(0, 0, now));
+    }
+
     use super::*;
 
     fn full() -> Vitals {

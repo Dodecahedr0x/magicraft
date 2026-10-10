@@ -16,7 +16,8 @@
 // - A chunk leaving the load radius forgets its mobs silently (no poof).
 // - Positions are interpolated: each new position starts a segment from the currently
 //   shown position to the new one over one mob tick (`mob_tick_ms`), so motion is continuous
-//   with ~1 tick of latency. Jumps over `TELEPORT_BLOCKS` snap.
+//   with ~1 tick of latency; an update that also lowers hp (a hit's knockback) slides over
+//   `KNOCKBACK_MS` instead. Jumps over `TELEPORT_BLOCKS` snap.
 // - Heading: movement direction while moving, else the passive heading `dir` (`DIRS8`),
 //   else a zombie near the player faces the player.
 // - The interaction layer picks / outlines mobs at their **shown** position (`renderPos`)
@@ -38,6 +39,8 @@ export const DIRS8: readonly (readonly [number, number])[] = [
   [1, -1],
 ];
 export const TELEPORT_BLOCKS = 4;
+/** Slide length of a position change that comes with a hit (knockback), ms. */
+export const KNOCKBACK_MS = 150;
 /** A mob that vanishes farther than this from its chunk's edge died (no crossing). */
 export const EDGE_GRACE_BLOCKS = 1.5;
 
@@ -127,7 +130,11 @@ export class MobTracker {
         m = { id: s.id, kind: s.kind, hp: s.hp, dir: s.dir, motion: new Motion(p), chunks: new Set(), missingSince: null, seenAt: now, hurtAt: -Infinity, burnAt: -Infinity };
         this.mobs.set(s.id, m);
         ev.push({ type: "spawn", id: s.id, kind: s.kind, pos: p });
-      } else if (!same(p, m.motion.to)) m.motion.retarget(p, now, Math.min(1000, Math.max(80, this.tickMs)));
+      } else if (!same(p, m.motion.to)) {
+        // A hit's knockback moves it at once: a short slide instead of a whole tick.
+        const hit = s.hp < m.hp && s.kind === m.kind;
+        m.motion.retarget(p, now, hit ? KNOCKBACK_MS : Math.min(1000, Math.max(80, this.tickMs)));
+      }
       if (s.hp < m.hp && s.kind === m.kind) {
         m.hurtAt = now;
         ev.push({ type: "hurt", id: s.id, kind: s.kind, pos: p });

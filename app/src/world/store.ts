@@ -7,9 +7,10 @@
 // - On every account change the header is re-read and the block bytes are diffed against
 //   the previous copy: header-only writes (crank ticks, mobs) don't re-mesh; changed blocks
 //   mark the chunk dirty, and changes on a border column also mark that neighbor dirty
-//   (its culled faces depend on our border). A chunk gaining or losing blocks (created,
-//   grown, closed) marks itself and its 4 neighbors. Dirty keys are flushed to `onDirty`
-//   after a short debounce (nearest first).
+//   (its culled faces depend on our border), and any change marks all 8 neighbors: sky light
+//   (skylight.ts) spreads up to 15 blocks across chunk borders. A chunk gaining or losing
+//   blocks (created, grown, closed) marks itself and its 8 neighbors. Dirty keys are
+//   flushed to `onDirty` after a short debounce (nearest first).
 // - Implements `ChunkView` (`exists` / `ready`) for the chain builders and `getBlock` for
 //   physics (Task 25).
 // - Optimistic edits (Task 26): `setLocal` writes a block byte locally (break / place sent,
@@ -18,7 +19,8 @@
 import type { AccountInfo, Connection, PublicKey } from "@solana/web3.js";
 import { accountKind, CHUNK_GEN_STAGE_OFFSET, CHUNK_HEADER_SIZE, chunkBlocks, chunkPda, chunkReady, chunkKey, GEN_DONE, type ChunkView } from "../chain";
 import { isFluid as isFluidByte } from "./blocks";
-import { borderOf, DIRS } from "./mesher";
+import { borderOf, DIRS, type MeshInput } from "./mesher";
+import { AROUND } from "./skylight";
 
 export type StoreConn = Pick<
   Connection,
@@ -162,7 +164,7 @@ export class ChunkStore implements ChunkView {
     m.set(l.i, { b, old: prev ? prev.old : old, seq });
     l.e.blocks![l.i] = b;
     this.moveCache.delete(l.e.key);
-    this.markEdit(l.e, l.lx, l.lz);
+    this.markEdit(l.e);
     return { seq, old };
   }
 
@@ -190,7 +192,7 @@ export class ChunkStore implements ChunkView {
     const { l, ed } = t;
     if (l.e.blocks![l.i] === ed.b) {
       l.e.blocks![l.i] = old;
-      this.markEdit(l.e, l.lx, l.lz);
+      this.markEdit(l.e);
     }
     void this.refresh(l.e.key);
   }
@@ -219,23 +221,26 @@ export class ChunkStore implements ChunkView {
     return copy;
   }
 
-  private markEdit(e: ChunkEntry, lx: number, lz: number) {
+  private markEdit(e: ChunkEntry) {
     this.markDirty(e.key);
-    if (lz === 0) this.markNeighbor(e.cx, e.cz - 1);
-    if (lz === 15) this.markNeighbor(e.cx, e.cz + 1);
-    if (lx === 0) this.markNeighbor(e.cx - 1, e.cz);
-    if (lx === 15) this.markNeighbor(e.cx + 1, e.cz);
+    this.markAround(e);
+  }
+
+  /** Marks the 8 neighbors (their sky light may reach into / out of `e`). */
+  private markAround(e: ChunkEntry) {
+    for (const [dx, dz] of AROUND) this.markNeighbor(e.cx + dx, e.cz + dz);
   }
 
   /** Mesher input for `key` (copies), or null when it has no blocks. */
-  meshInput(key: string): { blocks: Uint8Array; borders: (Uint8Array | null)[] } | null {
+  meshInput(key: string): MeshInput | null {
     const e = this.map.get(key);
     if (!e?.blocks) return null;
     const borders = DIRS.map(([dx, dz], d) => {
       const nb = this.get(e.cx + dx, e.cz + dz)?.blocks;
       return nb ? borderOf(nb, OPP[d]) : null;
     });
-    return { blocks: e.blocks.slice(), borders };
+    const around = AROUND.map(([dx, dz]) => this.get(e.cx + dx, e.cz + dz)?.blocks?.slice() ?? null);
+    return { blocks: e.blocks.slice(), borders, around };
   }
 
   // ------------------------------------------------------------ loading
@@ -340,25 +345,14 @@ export class ChunkStore implements ChunkView {
     this.moveCache.delete(e.key);
     if (!prev !== !next) {
       this.markDirty(e.key);
-      for (const [dx, dz] of DIRS) this.markNeighbor(e.cx + dx, e.cz + dz);
+      this.markAround(e);
     } else if (prev && next) {
       let changed = false;
-      let n = false, s = false, east = false, w = false;
-      for (let i = 0; i < next.length; i++) {
-        if (prev[i] === next[i]) continue;
-        changed = true;
-        const lx = i & 15;
-        const lz = (i >> 4) & 15;
-        if (lz === 0) n = true;
-        else if (lz === 15) s = true;
-        if (lx === 0) w = true;
-        else if (lx === 15) east = true;
+      for (let i = 0; i < next.length && !changed; i++) changed = prev[i] !== next[i];
+      if (changed) {
+        this.markDirty(e.key);
+        this.markAround(e);
       }
-      if (changed) this.markDirty(e.key);
-      if (n) this.markNeighbor(e.cx, e.cz - 1);
-      if (s) this.markNeighbor(e.cx, e.cz + 1);
-      if (east) this.markNeighbor(e.cx + 1, e.cz);
-      if (w) this.markNeighbor(e.cx - 1, e.cz);
     }
     try {
       this.opts.onChange?.(e);
