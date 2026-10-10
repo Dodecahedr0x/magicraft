@@ -191,12 +191,15 @@ port 4173 and opened in the Browser pane:
    is seeded / before anyone joined. `scripts/devnet-clock-probe.ts` prints a World's
    anchor vs the validator clock.
 2. Fixed: `waitClientMs` and the test helpers' `chainMs` now use the coarse fallback too.
-   Worlds created before the upgrade (the three "devnet smoke" worlds of the first runs) keep
-   their stored ms-based rates, now read as µs: their clocks recover via the rate check /
-   coarse fallback, but they are test leftovers, not for play.
-3. Commit cap: without a delegated fee payer an account can commit 10 times per delegation
+3. **Pre-upgrade worlds must not be used** (`4ty519uq…`, `GdgcuNra…`, `4dAJFaQg…`, all
+   "devnet smoke"): their stored ms-based rates are now read as µs, and their `first_join_ms`
+   bytes (formerly `_reserved`) decode as 0 even though players joined, so backward steps stay
+   enabled forever: every re-anchor may step the clock back under existing `PlayerState`
+   stamps, giving recurring short `TimeSkew` stalls. **Future World layout changes should add a
+   layout-version byte** so old accounts are detected instead of silently reinterpreted.
+4. Commit cap: without a delegated fee payer an account can commit 10 times per delegation
    (fee docs). The Player commits only on `withdraw` (commit + undelegate), so this is not hit.
-4. Fluid ticks and zombies were not exercised on devnet (covered locally).
+5. Fluid ticks and zombies were not exercised on devnet (covered locally).
 
 ## Playing on devnet with Phantom / Backpack / Solflare
 

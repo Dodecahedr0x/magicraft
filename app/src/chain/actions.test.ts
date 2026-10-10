@@ -312,6 +312,9 @@ describe("measureUsPerSlot", () => {
     const er = { getSlot: async () => slots.shift()! };
     // Midpoints 20 and 2 060: 2 040 ms over 204 slots = 10 000 µs per slot.
     expect(await measureUsPerSlot(er as never, 1, () => times.shift()!)).toBe(10_000);
+    const slow = [1_000, 1_001];
+    const t2 = [0, 0, 5_000, 5_000];
+    expect(await measureUsPerSlot({ getSlot: async () => slow.shift()! } as never, 1, () => t2.shift()!)).toBe(1_000_000);
     const stuck = { getSlot: async () => 7 };
     expect(await measureUsPerSlot(stuck as never, 1)).toBe(0);
     const broken = { getSlot: async () => Promise.reject(new Error("down")) };

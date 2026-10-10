@@ -373,4 +373,7 @@ Details and evidence: [`docs/notes/spikes.md`](../notes/spikes.md) (Tasks 2–6)
    Fixed: `create_world` takes a measured `us_per_slot_hint`, rates are µs per slot, the rate is
    checked against wall time from the first tick, and the clock may step back until the first
    join. Devnet smoke after the upgrade: 0 `TimeSkew` right after creation, |error| ≤ 351 ms.
-   Details: `docs/notes/deploy.md`.
+   Caveat: Worlds created before the upgrade decode `first_join_ms = 0` (old `_reserved`) and
+   ms rates as µs, so they keep stepping back under joined players (recurring short
+   `TimeSkew` stalls): do not use them. Future World layout changes should add a
+   layout-version byte. Details: `docs/notes/deploy.md`.

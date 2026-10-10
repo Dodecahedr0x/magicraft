@@ -179,7 +179,8 @@ export async function measureUsPerSlot(
     await new Promise((r) => setTimeout(r, spanMs));
     const b = await read();
     if (b.slot <= a.slot) return 0;
-    return Math.round(((b.t - a.t) * 1000) / (b.slot - a.slot));
+    // The program clamps to 1 000–1 000 000 µs; keep the hint a sane u32 either way.
+    return Math.min(1_000_000, Math.max(0, Math.round(((b.t - a.t) * 1000) / (b.slot - a.slot))));
   } catch {
     return 0;
   }
