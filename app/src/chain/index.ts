@@ -1,6 +1,8 @@
 // Chain layer: config, connections, Anchor client, PDAs, account layouts, session keys,
 // ER tx sender, Player lifecycle and gameplay ix builders.
 export * from "./config";
+export * from "./region";
+export * from "./delegation";
 export * from "./connections";
 export * from "./program";
 export * from "./pdas";

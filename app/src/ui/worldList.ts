@@ -66,7 +66,25 @@ export function visibleWorlds(entries: readonly WorldEntry[], query = ""): World
   );
 }
 
-export async function fetchWorlds(er: Connection, programId: PublicKey, me: PublicKey | null): Promise<WorldEntry[]> {
+/** Last fetched list per ER endpoint (= region) + program + viewer, so the picker can paint
+ *  at once on re-entry; keyed by endpoint, a region switch never shows another ER's worlds
+ *  (they only exist on the ER they were created on). */
+const worldCache = new Map<string, WorldEntry[]>();
+const cacheKey = (er: Pick<Connection, "rpcEndpoint">, programId: PublicKey, me: PublicKey | null) =>
+  `${er.rpcEndpoint}|${programId.toBase58()}|${me?.toBase58() ?? ""}`;
+
+/** The cached list for this ER / program / viewer (null if never fetched). */
+export const cachedWorlds = (er: Pick<Connection, "rpcEndpoint">, programId: PublicKey, me: PublicKey | null): WorldEntry[] | null =>
+  worldCache.get(cacheKey(er, programId, me)) ?? null;
+
+/** Every World on `er` (the selected region's ER), decoded and sorted; refreshes the cache. */
+export async function fetchWorlds(
+  er: Pick<Connection, "rpcEndpoint" | "getProgramAccounts">,
+  programId: PublicKey,
+  me: PublicKey | null,
+): Promise<WorldEntry[]> {
   const accs = await er.getProgramAccounts(programId, { commitment: "confirmed", filters: worldFilters() });
-  return decodeWorldList(accs, me);
+  const list = decodeWorldList(accs, me);
+  worldCache.set(cacheKey(er, programId, me), list);
+  return list;
 }

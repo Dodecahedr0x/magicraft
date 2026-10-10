@@ -1,12 +1,16 @@
-// App state: cluster handles (fixed for the page) and the session-scoped pieces the screens
-// share (wallet, Player, session + sender, selected world, PlayerState subscription).
+// App state: cluster handles (swapped as a whole when the player picks another ER region)
+// and the session-scoped pieces the screens share (wallet, Player, session + sender,
+// selected world, PlayerState subscription).
 // Plain object + change listeners; screens read `app.*` and call `set` to update.
 import type { PublicKey } from "@solana/web3.js";
 import {
   browserStorage,
   loadConfig,
+  loadRegionChoice,
   makeConnections,
   makeProgram,
+  saveRegionChoice,
+  selectRegion,
   sessionAuth,
   type Auth,
   type ClusterConfig,
@@ -31,13 +35,20 @@ export type AppState = {
   sessionStale: boolean;
   world: { pubkey: PublicKey; account: WorldAccount } | null;
   playerState: PlayerStateAccount | null;
+  /** Selected ER region id (mirrors `app.cfg.region`; set by `setRegion`). */
+  region: string;
 };
 
 export type App = {
+  /** Config of the selected region (`erRpc` / `erValidator` change with it). */
   cfg: ClusterConfig;
   conns: Connections;
   /** Ix builder / coder (bound to the ER connection). */
   program: MagicraftProgram;
+  /** Selects ER region `id`: new ER connection + program client, persisted choice; the
+   *  sender, world and PlayerState are dropped (the caller tears down subscriptions on the
+   *  old connection first and re-runs its flow). The session (base layer) is kept. */
+  setRegion(id: string): void;
   store: KeyValueStore | null;
   state: AppState;
   set(patch: Partial<AppState>): void;
@@ -48,15 +59,27 @@ export type App = {
 };
 
 export function createApp(env: Record<string, string | boolean | undefined>): App {
-  const cfg = loadConfig(env);
+  const store = browserStorage();
+  let cfg = loadConfig(env);
+  const stored = loadRegionChoice(store, cfg);
+  if (stored) cfg = selectRegion(cfg, stored);
   const conns = makeConnections(cfg);
   const listeners = new Set<(s: AppState, p: Partial<AppState>) => void>();
   const app: App = {
     cfg,
     conns,
     program: makeProgram(cfg, conns.er),
-    store: browserStorage(),
-    state: { wallet: null, player: null, session: null, sender: null, sessionStale: false, world: null, playerState: null },
+    store,
+    state: { wallet: null, player: null, session: null, sender: null, sessionStale: false, world: null, playerState: null, region: cfg.region },
+    setRegion(id) {
+      if (id === app.cfg.region) return;
+      const next = selectRegion(app.cfg, id);
+      app.cfg = next;
+      app.conns = { base: app.conns.base, er: makeConnections(next).er };
+      app.program = makeProgram(next, app.conns.er);
+      saveRegionChoice(app.store, next);
+      app.set({ region: id, sender: null, world: null, playerState: null });
+    },
     set(patch) {
       Object.assign(app.state, patch);
       for (const l of listeners) {

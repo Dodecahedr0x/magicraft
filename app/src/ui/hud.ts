@@ -2,7 +2,7 @@
 // and Withdraw. Withdraw is never blocked: it lists the sponsored chunks, offers to close
 // the reclaimable ones first, then `withdraw` (ER, wallet-signed) → base settlement →
 // `withdraw_base`.
-import { LAMPORTS_PER_SOL, SystemProgram, type PublicKey } from "@solana/web3.js";
+import { LAMPORTS_PER_SOL, SystemProgram, type Connection, type PublicKey } from "@solana/web3.js";
 import {
   CHUNK_TOTAL_RENT,
   PLAYER_LEN,
@@ -296,7 +296,7 @@ export async function withdrawBaseFlow(app: App): Promise<number> {
 }
 
 /** Waits until the Player is owned by our program on base again (commit + undelegation). */
-async function waitSettled(app: App, player: PublicKey, tick: (s: number) => void, timeoutMs = 90_000) {
+export async function waitSettled(app: App, player: PublicKey, tick: (s: number) => void, timeoutMs = 90_000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     const i = await app.conns.base.getAccountInfo(player, "confirmed");
@@ -309,10 +309,11 @@ async function waitSettled(app: App, player: PublicKey, tick: (s: number) => voi
 
 const withdrawSigKey = (player: PublicKey) => `magicraft.withdrawSig.${player.toBase58()}`;
 
-/** The current withdraw phase of the Player, from chain state (and our last `withdraw` sig). */
-export async function currentWithdrawPhase(app: App): Promise<WithdrawPhase> {
+/** The current withdraw phase of the Player, from chain state (and our last `withdraw` sig).
+ *  `er`: the ER the Player is delegated to (default: the selected region's). */
+export async function currentWithdrawPhase(app: App, er: Connection = app.conns.er): Promise<WithdrawPhase> {
   const player = app.state.player!;
-  const { base, er } = app.conns;
+  const base = app.conns.base;
   const [bi, ei] = await Promise.all([base.getAccountInfo(player, "confirmed"), er.getAccountInfo(player, "confirmed")]);
   let spendable = 0;
   if (bi?.owner.equals(app.cfg.programId)) spendable = bi.lamports - (await base.getMinimumBalanceForRentExemption(bi.data.length));
@@ -335,6 +336,47 @@ export async function currentWithdrawPhase(app: App): Promise<WithdrawPhase> {
     onEr: !!ei && ei.owner.equals(app.cfg.programId),
     withdrawLanded: landed,
   });
+}
+
+/** `withdraw` on `er` (wallet-signed ER tx: commit + undelegate the Player) unless it already
+ *  happened, then waits for the base settlement. Resumable: the phase is re-derived from the
+ *  chain. Returns the phase afterwards (`withdrawBase`, `done` or `none`). */
+export async function withdrawToBase(app: App, status: (msg: string) => void, er: Connection = app.conns.er): Promise<WithdrawPhase> {
+  const wallet = app.state.wallet!;
+  const player = app.state.player!;
+  let phase = await currentWithdrawPhase(app, er);
+  if (phase === "withdraw") {
+    status(wallet.burner ? "Withdrawing…" : `Approve the withdraw in your wallet. ${ER_SIGN_NOTE}`);
+    const tx = await walletTx(er, wallet.publicKey, [await withdrawIx(app.program, wallet.publicKey)]);
+    try {
+      await sendWithWallet(wallet, er, tx, {
+        skipPreflight: true,
+        timeoutMs: 30_000,
+        onSent: (sig) => {
+          try {
+            app.store?.setItem(withdrawSigKey(player), sig);
+          } catch {
+            /* storage unavailable: the ER state still tells */
+          }
+        },
+      });
+    } catch (e) {
+      // A timed-out withdraw may still have landed: re-derive before failing.
+      phase = await currentWithdrawPhase(app, er);
+      if (phase === "withdraw") throw e;
+    }
+    phase = "settling";
+  }
+  if (phase === "settling") {
+    await waitSettled(app, player, (s) => status(`Settling on the base layer… ${s}s (the first settlement on a fresh rollup can take ~10 s)`));
+    phase = await currentWithdrawPhase(app, er);
+  }
+  try {
+    app.store?.removeItem(withdrawSigKey(player));
+  } catch {
+    /* storage unavailable */
+  }
+  return phase;
 }
 
 function planSummary(plan: WithdrawPlan, openChunks: number | null): HTMLElement {
@@ -418,43 +460,11 @@ export function openWithdraw(app: App, openChunks: number | null, done: () => vo
         }
         status.textContent = `Closed ${r.closed} chunk${r.closed === 1 ? "" : "s"}.`;
       }
-      let phase = await currentWithdrawPhase(app);
-      if (phase === "withdraw") {
-        status.textContent = wallet.burner ? "Withdrawing…" : `Approve the withdraw in your wallet. ${ER_SIGN_NOTE}`;
-        const er = app.conns.er;
-        const tx = await walletTx(er, wallet.publicKey, [await withdrawIx(app.program, wallet.publicKey)]);
-        try {
-          await sendWithWallet(wallet, er, tx, {
-            skipPreflight: true,
-            timeoutMs: 30_000,
-            onSent: (sig) => {
-              try {
-                app.store?.setItem(withdrawSigKey(player), sig);
-              } catch {
-                /* storage unavailable: the ER state still tells */
-              }
-            },
-          });
-        } catch (e) {
-          // A timed-out withdraw may still have landed: re-derive before failing.
-          phase = await currentWithdrawPhase(app);
-          if (phase === "withdraw") throw e;
-        }
-        phase = "settling";
-      }
-      if (phase === "settling") {
-        await waitSettled(app, player, (s) => (status.textContent = `Settling on the base layer… ${s}s (the first settlement on a fresh rollup can take ~10 s)`));
-        phase = await currentWithdrawPhase(app);
-      }
+      const phase = await withdrawToBase(app, (m) => (status.textContent = m));
       let got = 0;
       if (phase === "withdrawBase") {
         status.textContent = wallet.burner ? "Transferring to your wallet…" : "Approve the transfer to your wallet…";
         got = await withdrawBaseFlow(app);
-      }
-      try {
-        app.store?.removeItem(withdrawSigKey(player));
-      } catch {
-        /* storage unavailable */
       }
       status.textContent = got ? `Done. ${sol(got, 6)} SOL is back in your wallet.` : "Done. Your player is back on the base layer.";
       announce(status.textContent);

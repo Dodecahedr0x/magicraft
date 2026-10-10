@@ -2,6 +2,7 @@
 // one (Join / Resume / Finish setup) and the create-world panel.
 import type { PublicKey } from "@solana/web3.js";
 import {
+  currentRegion,
   dayCrankStale,
   decodeWorld,
   joinWorldIx,
@@ -14,7 +15,7 @@ import type { App } from "../state";
 import { createWorldPanel, progress } from "./createWorld";
 import { busy, clear, errText, focusHeading, h, sendResultMessage, short } from "./dom";
 import { toForm } from "./params";
-import { fetchWorlds, visibleWorlds, type WorldEntry } from "./worldList";
+import { cachedWorlds, fetchWorlds, visibleWorlds, type WorldEntry } from "./worldList";
 
 const STATUS_TEXT: Record<WorldEntry["status"], string> = {
   ready: "Open",
@@ -70,9 +71,12 @@ function paramSummary(w: WorldAccount) {
 /** The world picker screen. `onEnter(world)` hands off to the game. */
 export function showWorlds(app: App, root: HTMLElement, onEnter: (world: PublicKey, account: WorldAccount) => void) {
   clear(root);
-  let entries: WorldEntry[] = [];
-  let selected: string | null = null;
   const me = app.state.wallet!.publicKey;
+  // Only the selected region's ER: worlds exist on the ER they were created on.
+  const er = app.conns.er;
+  const region = currentRegion(app.cfg);
+  let entries: WorldEntry[] = cachedWorlds(er, app.cfg.programId, me) ?? [];
+  let selected: string | null = null;
 
   const search = h("input", { id: "world-search", class: "input", type: "search", placeholder: "Search by name or creator", autocomplete: "off" });
   const refresh = h("button", { class: "btn small ghost", type: "button" }, "Refresh");
@@ -197,7 +201,9 @@ export function showWorlds(app: App, root: HTMLElement, onEnter: (world: PublicK
   const load = async () => {
     listStatus.textContent = "Loading worlds…";
     try {
-      entries = await fetchWorlds(app.conns.er, app.cfg.programId, me);
+      const fetched = await fetchWorlds(er, app.cfg.programId, me);
+      if (er !== app.conns.er) return; // region switched meanwhile
+      entries = fetched;
       renderList();
     } catch (e) {
       listStatus.textContent = `Couldn't load worlds: ${errText(e)}`;
@@ -214,7 +220,7 @@ export function showWorlds(app: App, root: HTMLElement, onEnter: (world: PublicK
       h(
         "div",
         { class: "panel list-panel" },
-        h("div", { class: "panel-head" }, h("h1", { id: "worlds-title" }, "Worlds"), refresh),
+        h("div", { class: "panel-head" }, h("h1", { id: "worlds-title" }, "Worlds ", h("span", { class: "region-tag", title: `Worlds on the ${region.label} rollup (${region.erRpc})` }, region.label)), refresh),
         h("label", { for: "world-search", class: "sr-only" }, "Search worlds"),
         search,
         listStatus,
@@ -225,6 +231,7 @@ export function showWorlds(app: App, root: HTMLElement, onEnter: (world: PublicK
   );
   renderEmptySide();
   focusHeading(root);
+  if (entries.length) renderList();
   void load();
 }
 

@@ -9,18 +9,16 @@
 //   Player is back on base, `withdraw_base(lamports)` (keeps the rent-exempt minimum).
 import { BN } from "@anchor-lang/core";
 import {
-  PublicKey,
   Transaction,
   type Connection,
+  type PublicKey,
   type TransactionInstruction,
 } from "@solana/web3.js";
 import type { ClusterConfig } from "./config";
 import { decodePlayer, PLAYER_LEN, type PlayerAccount } from "./layout";
 import type { MagicraftProgram } from "./program";
 import { playerPda } from "./pdas";
-
-/** The delegation program (owner of a delegated account on the base layer). */
-export const DELEGATION_PROGRAM = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+import { delegationRecordPda, recordValidator } from "./delegation";
 /** Lamports the e-SPL program charges per top-up on top of the amount. */
 export const TOPUP_SETUP_LAMPORTS = 300_000;
 
@@ -109,13 +107,16 @@ export type PlayerStatus =
   | {
       state: "delegated";
       player: PublicKey;
-      /** ER balance (null if the ER has not cloned it yet). */
+      /** The validator it is delegated to (base delegation record; null: unreadable). */
+      validator: PublicKey | null;
+      /** ER balance on the queried ER (null if it has not cloned it yet). */
       erLamports: number | null;
       account: PlayerAccount | null;
     };
 
-/** Where the wallet's Player is: missing, on base (undelegated) or delegated (with its
- *  ER balance and state; `open_chunks` drives the withdraw warning). */
+/** Where the wallet's Player is: missing, on base (undelegated) or delegated (with the
+ *  validator it is delegated to, its balance and state on `er`; `open_chunks` drives the
+ *  withdraw warning). `er` data is only meaningful if `validator` runs `er`. */
 export async function playerStatus(
   programId: PublicKey,
   base: Connection,
@@ -123,7 +124,7 @@ export async function playerStatus(
   authority: PublicKey,
 ): Promise<PlayerStatus> {
   const player = playerPda(programId, authority);
-  const info = await base.getAccountInfo(player, "confirmed");
+  const [info, rec] = await base.getMultipleAccountsInfo([player, delegationRecordPda(player)], "confirmed");
   if (!info) return { state: "none", player };
   if (info.owner.equals(programId))
     return { state: "base", player, lamports: info.lamports, account: decodePlayer(info.data) };
@@ -131,6 +132,7 @@ export async function playerStatus(
   return {
     state: "delegated",
     player,
+    validator: recordValidator(rec),
     erLamports: ei?.lamports ?? null,
     account: ei && ei.data.length >= PLAYER_LEN ? decodePlayer(ei.data) : null,
   };

@@ -3,6 +3,7 @@
 import { LAMPORTS_PER_SOL, Transaction } from "@solana/web3.js";
 import {
   CHUNK_TOTAL_RENT,
+  currentRegion,
   ErSender,
   clearSession,
   newSession as buildSession,
@@ -232,6 +233,7 @@ export async function showPlayerSetup(app: App, root: HTMLElement, st: PlayerSta
   clear(root);
   const wallet = app.state.wallet!;
   const fresh = st.state === "none";
+  const where = `the ${currentRegion(app.cfg).label} rollup`;
   const amount = h("input", {
     id: "deposit",
     class: "input",
@@ -272,8 +274,8 @@ export async function showPlayerSetup(app: App, root: HTMLElement, st: PlayerSta
     { class: "panel narrow", novalidate: true },
     h("h1", {}, fresh ? "Fund your player" : "Your player is parked"),
     fresh
-      ? h("p", {}, "Your player is an onchain account that holds SOL and pays the rent of the land you open. One approval creates it, funds it and moves it to the rollup.")
-      : h("p", { class: "parked" }, "Move it back to the rollup to play, optionally adding more."),
+      ? h("p", {}, `Your player is an onchain account that holds SOL and pays the rent of the land you open. One approval creates it, funds it and moves it to ${where}.`)
+      : h("p", { class: "parked" }, `Move it to ${where} to play, optionally adding more.`),
     h("label", { for: "deposit", class: "label" }, fresh ? "Deposit" : "Add (optional)"),
     h("div", { class: "input-wrap" }, amount, h("span", { class: "suffix" }, "SOL")),
     hint,
@@ -309,8 +311,8 @@ export async function showPlayerSetup(app: App, root: HTMLElement, st: PlayerSta
     parked = Math.max(0, st.lamports - minimum);
     update();
     form.querySelector(".parked")!.textContent = parked
-      ? `It holds ${sol(parked, 6)} SOL on the base layer. Move it back to the rollup to play, optionally adding more.`
-      : "It is back on the base layer and empty. Add SOL and move it to the rollup to play.";
+      ? `It holds ${sol(parked, 6)} SOL on the base layer. Move it to ${where} to play, optionally adding more.`
+      : `It is back on the base layer and empty. Add SOL and move it to ${where} to play.`;
   }
   if (st.state === "base" && parked > 0) {
     const out = h("button", { class: "btn ghost", type: "button" }, `Withdraw ${sol(parked, 6)} SOL to my wallet`);
@@ -340,8 +342,9 @@ function senderFor(app: App, s: Session): ErSender {
   });
 }
 
-/** Installs `s` as the active session (reusing the sender: only its payer changes). */
-function useSession(app: App, s: Session) {
+/** Installs `s` as the active session (reusing the sender: only its payer changes; a new
+ *  sender on the current ER after a region switch dropped it). */
+export function useSession(app: App, s: Session) {
   const sender = app.state.sender ?? senderFor(app, s);
   sender.payer = s.kp;
   app.set({ session: s, sender, sessionStale: false });

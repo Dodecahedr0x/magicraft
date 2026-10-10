@@ -307,6 +307,17 @@ stick, coal, iron ingot, diamond, raw/cooked pork/beef/mutton, leather, wool, ro
 Connect wallet → create/fund/delegate `Player` (1 tx) → create session (1 approval) → pick or create
 world → `join_world` → play (auto-create chunks within render radius ~3) → top up / withdraw.
 
+### ER regions
+
+The top bar picks the ER region (devnet: Europe / US / Asia; local stack: "Local"; list from
+`VITE_ER_REGIONS` or the built-in devnet table, choice persisted per base cluster). Worlds, chunks
+and PlayerStates exist only on the ER that created them and the `Player` is delegated to one
+validator, so the world list shows the selected region's ER only, and a `Player` delegated to
+another region's validator (read from its base delegation record) gets "Your player is in
+<region>": switch there, or move it (`withdraw` on the old ER → base settlement →
+`delegate_player(new validator)`); what it opened in the old region stays there. Session keys
+are base-layer and survive region switches.
+
 ## Errors
 
 One `#[error_code(offset = 6100)] enum MagicraftError` (Anchor 1.0 allows a single error enum per

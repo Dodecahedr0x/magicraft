@@ -206,15 +206,46 @@ port 4173 and opened in the Browser pane:
 1. Set the wallet to **devnet** and fund it (≥ ~0.06 SOL: the Player deposit + fees;
    `solana airdrop -u devnet 1 <address>` or https://faucet.solana.com).
 2. `pnpm install`, then `pnpm dev:devnet` (uses `app/.env.devnet`: base
-   devnet, EU ER + its validator, program id, `DEFAULT_EPHEMERAL_QUEUE`); open the printed
-   URL. For another region, copy `app/.env.example` to `app/.env.devnet.local` and set
-   `VITE_ER_RPC` + the matching `VITE_ER_VALIDATOR`.
+   devnet, EU ER + its validator as the default region, program id,
+   `DEFAULT_EPHEMERAL_QUEUE`); open the printed URL. Pick Europe / US / Asia in the top bar
+   ([Regions](#er-regions)).
 3. Connect → create / fund / delegate the Player (1 approval) → session (1 approval) → pick
    or create a world (creation measures the ER slot rate for ~2 s first).
 4. Withdraw from the HUD (ER commit + undelegate, then `withdraw_base`).
 
-Production build: `pnpm -C app build --mode devnet` (the build requires all `PROD_REQUIRED`
-vars; `.env.devnet` sets them).
+Production build: `pnpm -C app build --mode devnet` (the build requires the `PROD_REQUIRED`
+vars, or `VITE_ER_REGIONS` in place of `VITE_ER_RPC` + `VITE_ER_VALIDATOR`; `.env.devnet` sets
+them).
+
+## ER regions
+
+The top bar has a region picker. Region list (`app/src/chain/config.ts`): `VITE_ER_REGIONS`
+(JSON `[{"id","label","rpc","ws"?,"validator"}]`) if set; else, with the base RPC on
+`api.devnet.solana.com`, the built-in `DEVNET_REGIONS` (Europe / US / Asia, endpoints and
+validators above); else the single ER of `VITE_ER_RPC` ("Local" on the local stack). The
+default is the region `VITE_ER_RPC` names (an endpoint outside the list becomes its own region
+with `VITE_ER_VALIDATOR`), else the first. The choice is stored in `localStorage`
+(`magicraft.region.<base RPC>`; ignored if no longer listed). The picker is disabled inside a
+world and while a player move is running.
+
+- Switching rebuilds the ER connection, program client and session sender for the new ER
+  (the session key is base-layer and kept), tears down the HUD subscription and re-runs the
+  flow. The world list only queries the selected ER (its cache is keyed by ER endpoint).
+- Each region has its own worlds: on 2026-10-10 Europe listed the smoke worlds, US and Asia none.
+- **Player in another region.** The Player PDA is delegated to one validator. The client reads
+  it from the delegation record on base (`["delegation", player]` under
+  `DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh`; bytes 8..40 = validator, layout of
+  `magicblock-delegation-program-api` `DelegationRecord`). If it is not the selected region's
+  validator, the app shows "Your player is in <region>" (plus a read-only list of this region's
+  worlds) with:
+  - **Switch to <region>**: selects that region.
+  - **Move player to <here>**: `withdraw` on the old region's ER (wallet-signed, commit +
+    undelegate; same resumable phases as the HUD withdraw, incl. waiting for base settlement),
+    then the usual "parked player" screen delegates it to the selected region's validator
+    (second approval, optional extra deposit; no `withdraw_base` needed). Worlds, chunks and
+    PlayerStates in the old region stay there; the rent of chunks opened there stays locked
+    until the player plays there again (switch back first to reclaim unused chunks).
+  - A validator no configured region runs: explained, no actions.
 
 ## Next steps
 
