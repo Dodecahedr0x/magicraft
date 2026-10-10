@@ -1,0 +1,29 @@
+# Render Blueprint: the browser client as a static site (Solana devnet + MagicBlock devnet ERs).
+# Config comes from the committed `app/.env.devnet`; the IDL and core wasm are committed too, so
+# no Rust/Anchor toolchain is needed at build time.
+services:
+  - type: web
+    runtime: static
+    name: magicraft
+    buildCommand: >-
+      corepack enable &&
+      pnpm install --frozen-lockfile &&
+      pnpm -C app build --mode devnet &&
+      find app/dist -name '*.map' -delete
+    staticPublishPath: app/dist
+    pullRequestPreviewsEnabled: false
+    envVars:
+      - key: NODE_VERSION
+        value: "25"
+    headers:
+      # Vite assets are content-hashed: cache forever. index.html stays revalidated.
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
