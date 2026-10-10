@@ -112,7 +112,9 @@
 //!   through transparent blocks (glass, leaves, ice): only opaque solid blocks shade.
 //!
 //! # Spawning ([`try_spawn_zombie`])
-//! Requires a free center slot, fewer than `cap` (clamped to [`MOB_SLOTS`]) zombies in the
+//! Rate gate first: a call only proceeds on ticks where `hash(seed, cx, cz, tick) %`
+//! [`SPAWN_GATE`] `== 0` (deterministic, ≈ 1 attempt per chunk per 30 ticks = ~10 s at
+//! the default 333 ms mob tick). Then it requires a free center slot, fewer than `cap` (clamped to [`MOB_SLOTS`]) zombies in the
 //! **center** chunk's slots, and ≥ 1 target. Up to [`SPAWN_ATTEMPTS`] (4) candidates per
 //! call, each `h = hash(seed, cx, cz, tick, a)`: a column of the center chunk (rejected if
 //! a mob already stands in that block column) and a start height; scan down ≤
@@ -228,6 +230,8 @@ pub const MAX_TARGETS: usize = 32;
 /// Blocks a mob falls per tick at most (cost bound of settle).
 pub const MAX_FALL: i64 = 16;
 
+/// Spawn rate gate: one tick in this many (per chunk, by hash) may try to spawn.
+pub const SPAWN_GATE: u64 = 30;
 /// Spawn candidates per [`try_spawn_zombie`] call.
 pub const SPAWN_ATTEMPTS: u32 = 4;
 /// Blocks scanned downward per candidate.
@@ -245,6 +249,12 @@ pub const TORCH_DY_MAX: i64 = 2;
 const SALT_WANDER: u32 = 0x4D_0B_00_01;
 const SALT_SPAWN: u32 = 0x4D_0B_00_10;
 const SALT_DROPS: u32 = 0x4D_0B_00_20;
+const SALT_SPAWN_GATE: u32 = 0x4D_0B_00_30;
+
+/// The spawn rate gate of chunk `(cx, cz)` at `tick` (see [`try_spawn_zombie`]).
+pub fn spawn_gate_open(seed: &Seed, tick: u64, cx: i32, cz: i32) -> bool {
+    seed.h64(cx as i64, cz as i64, tick as i64, SALT_SPAWN_GATE) % SPAWN_GATE == 0
+}
 
 const AIR: u8 = Block::Air as u8;
 const STONE: u8 = Block::Stone as u8;
@@ -968,6 +978,9 @@ pub fn try_spawn_zombie<W: BlockAccess + ?Sized>(
     let zombies = slots.iter().filter(|m| m.kind == KIND_ZOMBIE).count();
     let free = slots.len() < MOB_SLOTS || slots.iter().any(Mob::is_empty);
     if !free || zombies >= cap.min(MOB_SLOTS as u8) as usize || targets.is_empty() {
+        return None;
+    }
+    if !spawn_gate_open(seed, tick, cx, cz) {
         return None;
     }
     let ox = cx as i64 * CW;
@@ -1987,7 +2000,8 @@ mod tests {
 
     fn spawn_with(w: &W, targets: &[Target], night: bool, slots: &[Mob], cap: u8) -> Vec<Mob> {
         let s = seed(5);
-        (0..400u64)
+        // 400 gated-open ticks' worth (≈ 1 in SPAWN_GATE ticks passes the gate).
+        (0..400 * SPAWN_GATE)
             .filter_map(|t| try_spawn_zombie(&s, t, 0, 0, w, targets, slots, night, cap))
             .collect()
     }
@@ -2016,6 +2030,25 @@ mod tests {
         let near = spawn_many(&w, &around, true, 0, 4);
         for m in &near {
             spawn_ok(&w, m, &around);
+        }
+    }
+
+    #[test]
+    fn spawn_rate_gate() {
+        let s = seed(9);
+        for (cx, cz) in [(0, 0), (3, -7), (-100, 42)] {
+            let open = (0..30_000u64).filter(|&t| spawn_gate_open(&s, t, cx, cz)).count();
+            // ≈ 1000 expected (1 in 30).
+            assert!((800..1200).contains(&open), "{cx},{cz}: {open}");
+        }
+        // Closed gate: no spawn even where every other rule allows one.
+        let w = W::flat(20);
+        let targets = [target(2, 21, 2)];
+        let slots = [Mob::EMPTY; MOB_SLOTS];
+        for t in 0..3000u64 {
+            if !spawn_gate_open(&s, t, 0, 0) {
+                assert_eq!(try_spawn_zombie(&s, t, 0, 0, &w, &targets, &slots, true, 4), None);
+            }
         }
     }
 

@@ -65,38 +65,74 @@ void main() {
   #include <fog_fragment>
 }`;
 
-/** One instanced batch of boxes, refilled every frame (`begin` → `box`… → `end`). */
+/** One instanced batch of boxes, refilled every frame (`begin` → `box`… → `end`); grows
+ *  (recreated at twice the capacity, logged once) when a frame needs more boxes. */
 export class BoxBatch {
-  readonly mesh: THREE.InstancedMesh;
-  private readonly color: THREE.InstancedBufferAttribute;
-  private readonly pattern: THREE.InstancedBufferAttribute;
+  mesh: THREE.InstancedMesh;
+  private color!: THREE.InstancedBufferAttribute;
+  private pattern!: THREE.InstancedBufferAttribute;
   private n = 0;
+  private readonly mat: THREE.ShaderMaterial;
+  private warned = false;
 
   constructor(
-    renderer: WorldRenderer,
-    readonly capacity = 4096,
-    opts: { transparent?: boolean } = {},
+    private readonly renderer: WorldRenderer,
+    public capacity = 1024,
+    opts: { transparent?: boolean; name?: string } = {},
   ) {
-    const g = new THREE.BoxGeometry(1, 1, 1);
-    this.color = new THREE.InstancedBufferAttribute(new Float32Array(capacity * 4), 4);
-    this.pattern = new THREE.InstancedBufferAttribute(new Float32Array(capacity), 1);
-    this.color.setUsage(THREE.DynamicDrawUsage);
-    this.pattern.setUsage(THREE.DynamicDrawUsage);
-    g.setAttribute("iColor", this.color);
-    g.setAttribute("iPattern", this.pattern);
-    const mat = new THREE.ShaderMaterial({
-      uniforms: { ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog), ...renderer.light },
-      vertexShader: VERT,
-      fragmentShader: FRAG,
-      fog: true,
-      transparent: !!opts.transparent,
-    });
-    this.mesh = new THREE.InstancedMesh(g, mat, capacity);
-    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    this.mesh.frustumCulled = false;
-    this.mesh.count = 0;
-    this.mesh.renderOrder = 3;
+    this.mat = renderer.registerLit(
+      new THREE.ShaderMaterial({
+        uniforms: { ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog), ...renderer.light },
+        vertexShader: VERT,
+        fragmentShader: FRAG,
+        fog: true,
+        transparent: !!opts.transparent,
+      }),
+    );
+    this.mesh = this.build(capacity);
+    this.mesh.name = opts.name ?? "boxes";
     renderer.scene.add(this.mesh);
+  }
+
+  private build(capacity: number) {
+    const g = new THREE.BoxGeometry(1, 1, 1);
+    const color = new THREE.InstancedBufferAttribute(new Float32Array(capacity * 4), 4);
+    const pattern = new THREE.InstancedBufferAttribute(new Float32Array(capacity), 1);
+    color.setUsage(THREE.DynamicDrawUsage);
+    pattern.setUsage(THREE.DynamicDrawUsage);
+    g.setAttribute("iColor", color);
+    g.setAttribute("iPattern", pattern);
+    const mesh = new THREE.InstancedMesh(g, this.mat, capacity);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.frustumCulled = false;
+    mesh.count = 0;
+    mesh.renderOrder = 3;
+    this.color = color;
+    this.pattern = pattern;
+    return mesh;
+  }
+
+  /** Overflow: a mesh with twice the capacity, the boxes so far copied over. */
+  private grow() {
+    const old = this.mesh;
+    const cap = this.capacity * 2;
+    if (!this.warned) {
+      this.warned = true;
+      console.info(`[models] ${old.name}: ${this.capacity} boxes exceeded, growing to ${cap}`);
+    }
+    const [oc, op] = [this.color, this.pattern];
+    const mesh = this.build(cap);
+    (mesh.instanceMatrix.array as Float32Array).set(old.instanceMatrix.array as Float32Array);
+    (this.color.array as Float32Array).set(oc.array as Float32Array);
+    (this.pattern.array as Float32Array).set(op.array as Float32Array);
+    mesh.name = old.name;
+    mesh.renderOrder = old.renderOrder;
+    this.renderer.scene.remove(old);
+    old.geometry.dispose();
+    old.dispose();
+    this.renderer.scene.add(mesh);
+    this.mesh = mesh;
+    this.capacity = cap;
   }
 
   begin() {
@@ -109,7 +145,7 @@ export class BoxBatch {
 
   /** Adds a box (`m` maps the unit cube centered at the origin); linear RGB + alpha. */
   box(m: THREE.Matrix4, r: number, g: number, b: number, a = 1, pattern = 0) {
-    if (this.n >= this.capacity) return;
+    if (this.n >= this.capacity) this.grow();
     const i = this.n++;
     this.mesh.setMatrixAt(i, m);
     this.color.setXYZW(i, r, g, b, a);
@@ -126,7 +162,8 @@ export class BoxBatch {
   dispose() {
     this.mesh.removeFromParent();
     this.mesh.geometry.dispose();
-    (this.mesh.material as THREE.Material).dispose();
+    this.renderer.unregisterLit(this.mat);
+    this.mat.dispose();
     this.mesh.dispose();
   }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { B } from "./blocks";
-import { nearestTorches, scanTorches, TorchIndex, type TorchPos } from "./torches";
+import { flickerPhase, nearestTorches, scanTorches, TorchIndex, type TorchPos } from "./torches";
 
 describe("torches", () => {
   it("scans torch blocks into world coords", () => {
@@ -31,6 +31,9 @@ describe("torches", () => {
       expect(nearestTorches(all, q, 16)).toEqual(want);
     }
     expect(nearestTorches(all.slice(0, 3), p, 16)).toHaveLength(3);
+    // Distance limit and quality "off".
+    expect(nearestTorches(all, p, 16, 4.5).map((t) => t[0]).sort((a, b) => a - b)).toEqual([16, 18, 20, 22, 24]);
+    expect(nearestTorches(all, p, 0)).toEqual([]);
   });
 
   it("index rescans invalidated chunks only", () => {
@@ -46,5 +49,12 @@ describe("torches", () => {
     e.blocks = null as never;
     idx.invalidate(["0,0"]);
     expect(idx.count).toBe(0);
+  });
+
+  it("flicker phase is stable per position and spread", () => {
+    expect(flickerPhase([3, 40, -7])).toBe(flickerPhase([3, 40, -7]));
+    const ph = new Set([0, 1, 2, 3, 4, 5, 6, 7].map((i) => flickerPhase([i, 30, 0]).toFixed(2)));
+    expect(ph.size).toBe(8);
+    for (const v of ph) expect(+v).toBeGreaterThanOrEqual(0);
   });
 });

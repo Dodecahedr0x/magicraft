@@ -642,13 +642,15 @@ describe("chunk tick crank", () => {
     it("night: a zombie spawns naturally near a present player and hits it (bounded by world time, fallback chunks)", async () => {
       // No debug spawns in this world yet: every zombie is a natural spawn.
       const ring = ["0,0", ...N4.map(([x, z]) => key(x, z))];
-      const end = Date.now() + 130_000; // ≤ 2 nights of the 60 s day
+      // Spawns are rate-gated (≈ 1 attempt per chunk per 10 s, `SPAWN_GATE`):
+      // ≤ 4 nights of the 60 s day, ≤ 25 s of each.
+      const end = Date.now() + 250_000;
       let r: Chase | null = null;
       let tries = 0;
       while (!r?.hurt && Date.now() < end) {
-        await untilNight(8_000);
+        await untilNight(22_000);
         // Stand in the next fallback chunk (a walk from here), then wait for
-        // a zombie at our level for ≤ 12 s of night.
+        // a zombie at our level for ≤ 25 s of night.
         const k = ring[tries++ % ring.length];
         const t = new Terrain(await liveBlocks(w2, existing));
         const tree = walkTree(t, await myCol());
@@ -658,7 +660,7 @@ describe("chunk tick crank", () => {
         if (to)
           for (const [x, y, z] of tree.path(to)!)
             await move(center(x, y, z), w2);
-        r = await chase(12_000, async () => (await tod()) < 30_000);
+        r = await chase(25_000, async () => (await tod()) < 30_000);
         console.log(
           `    (${k}): ${
             r.seenMs < 0 ? "no zombie" : `zombie after ${r.seenMs} ms`

@@ -5,6 +5,9 @@
 import type { AccountInfo, Connection, PublicKey } from "@solana/web3.js";
 import { accountKind, chunkKey, chunkPda, decodePresence, PRESENCE_STALE_MS, presencePda, type PresenceEntry } from "../chain";
 
+/** Chunks kept subscribed around the player (5×5): placement checks + other players. */
+export const PRESENCE_RADIUS = 2;
+
 /** Extra age an entry may have and still count as fresh for the overlap check, ms. */
 export const FRESH_MARGIN_MS = 250;
 

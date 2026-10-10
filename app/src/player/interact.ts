@@ -26,6 +26,7 @@ import {
   breakBlockIx,
   craftIx,
   decodeMob,
+  MOBS_OFFSET,
   eatIx,
   GEN_DONE,
   MOB_SIZE,
@@ -46,7 +47,7 @@ import type { WorldHandle } from "../world/world";
 import { itemInfo, itemName } from "../ui/items";
 import { BLOCK_NAMES } from "../world/blocks";
 import type { PlayerSession } from "./controller";
-import { placePresenceChunks, PresenceWatch } from "./presence";
+import { placePresenceChunks, PRESENCE_RADIUS, PresenceWatch } from "./presence";
 import { blockInReach, FLUID, mobBox, mobInReach, nearestStation, pickMob, placeError, raycast, SOLID, type BlockHit, type MobRef } from "./rules";
 
 /** Short player-facing messages for action failures (null = stay silent). */
@@ -178,7 +179,7 @@ export class MobIndex {
       if (!c || c.version !== e.version) {
         const mobs: LiveMob[] = [];
         for (let i = 0; i < MOB_SLOTS; i++) {
-          const m = decodeMob(e.data, 364 + MOB_SIZE * i);
+          const m = decodeMob(e.data, MOBS_OFFSET + MOB_SIZE * i);
           if (m.kind !== 0 && m.hp > 0) mobs.push({ cx: e.cx, cz: e.cz, idx: i, kind: m.kind, hp: m.hp, pos: m.pos, id: m.id });
         }
         c = { version: e.version, mobs };
@@ -300,8 +301,8 @@ export class Interaction {
   constructor(readonly d: InteractDeps) {
     const { app, world } = d;
     this.select = new SlotSelect((slot) => this.send(() => selectSlotIx(app.program, app.auth(), world, slot), { key: "select" }));
-    // Radius 2 (5×5 chunks): the same lists show other players (world/players.ts).
-    this.presence = new PresenceWatch(app.conns.er, app.cfg.programId, world, 2);
+    // The same lists show other players (world/players.ts).
+    this.presence = new PresenceWatch(app.conns.er, app.cfg.programId, world, PRESENCE_RADIUS);
     this.mobs = new MobIndex(d.view.store);
 
     const edges = (w: number, h: number) => new THREE.EdgesGeometry(new THREE.BoxGeometry(w, h, w));

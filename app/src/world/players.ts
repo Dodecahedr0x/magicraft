@@ -16,15 +16,30 @@ import type { WorldRenderer } from "./renderer";
 
 export type PresenceLike = { player: PublicKey; pos: V3; lastSeenMs: number };
 
-/** Fresh entries by player (base58), newest per player, without `self`. Unknown chain time
- *  (`nowMs` null) shows nobody. */
-export function visiblePlayers(lists: Iterable<readonly PresenceLike[]>, self: string | null, nowMs: number | null, staleMs = PRESENCE_STALE_MS): Map<string, PresenceLike> {
-  const out = new Map<string, PresenceLike>();
+/** base58 of a key, cached per `PublicKey` object (entries are re-decoded only when their
+ *  presence account changes, so this is computed once per update, not per frame). */
+const keyCache = new WeakMap<PublicKey, string>();
+export function keyOf(k: PublicKey): string {
+  let s = keyCache.get(k);
+  if (s === undefined) keyCache.set(k, (s = k.toBase58()));
+  return s;
+}
+
+/** Fresh entries by player (base58), newest per player, without `self`, into `out`
+ *  (cleared first). Unknown chain time (`nowMs` null) shows nobody. */
+export function visiblePlayers(
+  lists: Iterable<readonly PresenceLike[]>,
+  self: string | null,
+  nowMs: number | null,
+  staleMs = PRESENCE_STALE_MS,
+  out = new Map<string, PresenceLike>(),
+): Map<string, PresenceLike> {
+  out.clear();
   if (nowMs === null) return out;
   for (const list of lists)
     for (const e of list) {
       if (nowMs - e.lastSeenMs > staleMs) continue;
-      const k = e.player.toBase58();
+      const k = keyOf(e.player);
       if (k === self) continue;
       const cur = out.get(k);
       if (!cur || e.lastSeenMs > cur.lastSeenMs) out.set(k, e);
@@ -54,12 +69,12 @@ export class PlayerTracker {
 
   update(visible: Map<string, PresenceLike>, now: number) {
     for (const [k, e] of visible) {
-      const p: V3 = [e.pos[0] / FP, e.pos[1] / FP, e.pos[2] / FP];
+      const [x, y, z] = [e.pos[0] / FP, e.pos[1] / FP, e.pos[2] / FP];
       let t = this.players.get(k);
-      if (!t) this.players.set(k, (t = { key: k, motion: new Motion(p), lastSeenMs: e.lastSeenMs, bornAt: now, goneAt: null }));
+      if (!t) this.players.set(k, (t = { key: k, motion: new Motion([x, y, z]), lastSeenMs: e.lastSeenMs, bornAt: now, goneAt: null }));
       else {
         const m = t.motion;
-        if (p[0] !== m.to[0] || p[1] !== m.to[1] || p[2] !== m.to[2]) m.retarget(p, now, MOVE_LERP_MS, 16);
+        if (x !== m.to[0] || y !== m.to[1] || z !== m.to[2]) m.retarget([x, y, z], now, MOVE_LERP_MS, 16);
         if (t.goneAt !== null) {
           // Back: fade in from the current alpha.
           t.bornAt = now - FADE_IN_MS * this.alpha(t, now);
@@ -127,15 +142,19 @@ function nameTag(text: string): THREE.Sprite {
 
 export class PlayerLayer {
   readonly tracker = new PlayerTracker();
+  /** Opaque players; fading ones go to the transparent batch. */
   readonly batch: BoxBatch;
+  readonly fading: BoxBatch;
   private looks = new Map<string, Look>();
+  private visible = new Map<string, PresenceLike>();
   private readonly tmp: V3 = [0, 0, 0];
 
   constructor(
     private readonly renderer: WorldRenderer,
     readonly deps: PlayerLayerDeps,
   ) {
-    this.batch = new BoxBatch(renderer, 512, { transparent: true });
+    this.batch = new BoxBatch(renderer, 128, { name: "players" });
+    this.fading = new BoxBatch(renderer, 64, { name: "players (fading)", transparent: true });
   }
 
   get count() {
@@ -155,12 +174,18 @@ export class PlayerLayer {
   }
 
   update(dt: number, now = performance.now()) {
-    this.tracker.update(visiblePlayers(this.deps.lists(), this.deps.self, this.deps.now()), now);
-    const b = this.batch;
-    b.begin();
+    this.tracker.update(visiblePlayers(this.deps.lists(), this.deps.self, this.deps.now(), PRESENCE_STALE_MS, this.visible), now);
+    const cam = this.renderer.camera.position;
+    const far = (this.renderer.scene.fog as { far?: number } | null)?.far ?? Infinity;
+    const far2 = (far + 2) * (far + 2);
+    this.batch.begin();
+    this.fading.begin();
     for (const t of this.tracker.players.values()) {
       const l = this.look(t.key);
       const pos = t.motion.at(now, this.tmp);
+      const culled = (pos[0] - cam.x) ** 2 + (pos[1] - cam.y) ** 2 + (pos[2] - cam.z) ** 2 > far2;
+      l.tag.visible = !culled;
+      if (culled) continue;
       const dx = t.motion.to[0] - t.motion.from[0];
       const dz = t.motion.to[2] - t.motion.from[2];
       const moving = now < t.motion.t0 + t.motion.dur && Math.hypot(dx, dz) > 0.01;
@@ -169,11 +194,12 @@ export class PlayerLayer {
       l.speed += (sp - l.speed) * Math.min(1, dt * 6);
       l.phase += l.speed * dt * 3.2;
       const alpha = this.tracker.alpha(t, now);
-      drawModel(b, l.parts, { pos, yaw: l.yaw, swing: Math.sin(l.phase) * Math.min(0.8, l.speed * 0.25), alpha });
+      drawModel(alpha < 1 ? this.fading : this.batch, l.parts, { pos, yaw: l.yaw, swing: Math.sin(l.phase) * Math.min(0.8, l.speed * 0.25), alpha });
       l.tag.position.set(pos[0], pos[1] + 2.15, pos[2]);
       (l.tag.material as THREE.SpriteMaterial).opacity = alpha;
     }
-    b.end();
+    this.batch.end();
+    this.fading.end();
     for (const [k, l] of this.looks)
       if (!this.tracker.players.has(k)) {
         this.renderer.scene.remove(l.tag);
@@ -191,5 +217,6 @@ export class PlayerLayer {
     }
     this.looks.clear();
     this.batch.dispose();
+    this.fading.dispose();
   }
 }

@@ -10,7 +10,9 @@
 //   chunk shows up in that chunk's header and leaves the old one, in either order (two
 //   account notifications). The tracker keeps per-mob the set of chunks listing it; a mob
 //   listed nowhere is "missing" for `graceMs` before it counts as dead (poof), so a
-//   border crossing whose "left" notification lands first continues smoothly.
+//   border crossing whose "left" notification lands first continues smoothly — unless its
+//   last position is more than `EDGE_GRACE_BLOCKS` from that chunk's edge (a mob moves
+//   ≤ 1.2 blocks per tick, so it cannot have crossed): then it dies at once.
 // - A chunk leaving the load radius forgets its mobs silently (no poof).
 // - Positions are interpolated: each new position starts a segment from the currently
 //   shown position to the new one over one mob tick (`mob_tick_ms`), so motion is continuous
@@ -20,7 +22,7 @@
 // - The interaction layer picks / outlines mobs at their **shown** position (`renderPos`)
 //   so the hit box matches what is on screen; reach is still checked onchain-style from
 //   the account position.
-import { decodeMob, FP, GEN_DONE, MOB, MOB_SIZE, MOB_SLOTS, type V3 } from "../chain";
+import { decodeMob, FP, GEN_DONE, MOB, MOB_SIZE, MOB_SLOTS, MOBS_OFFSET, type V3 } from "../chain";
 import { BoxBatch, drawCube, drawModel, linear, MOB_MODELS } from "./models";
 import type { WorldRenderer } from "./renderer";
 
@@ -35,9 +37,17 @@ export const DIRS8: readonly (readonly [number, number])[] = [
   [0, -1],
   [1, -1],
 ];
-/** Header offset of the mob slots (`decodeChunkHeader`). */
-export const MOBS_OFFSET = 364;
 export const TELEPORT_BLOCKS = 4;
+/** A mob that vanishes farther than this from its chunk's edge died (no crossing). */
+export const EDGE_GRACE_BLOCKS = 1.5;
+
+/** Distance (blocks) from `p` to the nearest edge of chunk `key` ("cx,cz"). */
+export function edgeDistance(key: string, p: readonly number[]): number {
+  const [cx, cz] = key.split(",").map(Number);
+  const lx = p[0] - cx * 16;
+  const lz = p[2] - cz * 16;
+  return Math.min(lx, 16 - lx, lz, 16 - lz);
+}
 
 /** A position segment: `from` → `to` over `[t0, t0 + dur]` (ms, blocks). */
 export class Motion {
@@ -135,7 +145,7 @@ export class MobTracker {
         const m = this.mobs.get(id);
         if (!m) continue;
         m.chunks.delete(key);
-        if (!m.chunks.size) m.missingSince = now;
+        if (!m.chunks.size) m.missingSince = edgeDistance(key, m.motion.to) > EDGE_GRACE_BLOCKS ? -Infinity : now;
       }
     if (after.size) this.byChunk.set(key, after);
     else this.byChunk.delete(key);
@@ -219,22 +229,24 @@ export class MobLayer {
   readonly tracker: MobTracker;
   readonly batch: BoxBatch;
   private seen = new Map<string, number>();
+  private present = new Set<string>();
   private anim = new Map<number, Anim>();
   private particles: Particle[] = [];
   private fireAcc = 0;
   private readonly tmp: V3 = [0, 0, 0];
 
   constructor(
-    renderer: WorldRenderer,
+    private readonly renderer: WorldRenderer,
     readonly deps: MobLayerDeps,
   ) {
     this.tracker = new MobTracker(deps.tickMs);
-    this.batch = new BoxBatch(renderer, 4096);
+    this.batch = new BoxBatch(renderer, 1024, { name: "mobs" });
   }
 
   /** Feeds changed chunk headers to the tracker (header-only writes included). */
   poll(now: number) {
-    const present = new Set<string>();
+    const present = this.present;
+    present.clear();
     for (const e of this.deps.store.entries()) {
       if (!e.data || e.genStage !== GEN_DONE) continue;
       present.add(e.key);
@@ -282,6 +294,10 @@ export class MobLayer {
     this.poll(now);
     for (const ev of this.tracker.expire(now)) this.onEvent(ev);
     const player = this.deps.player?.() ?? null;
+    // Mobs beyond the fog are not drawn (and don't count against the batch).
+    const cam = this.renderer.camera.position;
+    const far = (this.renderer.scene.fog as { far?: number } | null)?.far ?? Infinity;
+    const far2 = (far + 2) * (far + 2);
     const b = this.batch;
     b.begin();
     this.fireAcc += dt;
@@ -291,6 +307,7 @@ export class MobLayer {
       const parts = MOB_MODELS[m.kind];
       if (!parts) continue;
       const pos = m.motion.at(now, this.tmp);
+      if ((pos[0] - cam.x) ** 2 + (pos[1] - cam.y) ** 2 + (pos[2] - cam.z) ** 2 > far2) continue;
       let a = this.anim.get(m.id);
       if (!a) this.anim.set(m.id, (a = { yaw: Math.random() * Math.PI * 2, speed: 0, phase: Math.random() * 6 }));
       // Heading.

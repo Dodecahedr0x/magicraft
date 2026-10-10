@@ -26,16 +26,29 @@ import { isFluid } from "./blocks";
 import { FlyCam } from "./flycam";
 import { MeshPool } from "./meshpool";
 import { MobLayer } from "./mobs";
-import { WorldRenderer } from "./renderer";
+import { TORCH_QUALITIES, TORCH_RADIUS, WorldRenderer, type TorchQuality } from "./renderer";
 import { Sky } from "./sky";
 import { ChunkStore } from "./store";
-import { TorchIndex } from "./torches";
+import { flickerPhase, TorchIndex } from "./torches";
 
 export const LOAD_RADIUS = 4;
 export const CREATE_RADIUS = 2;
 export const EYE = 1.62;
 const AUTO_KEY = "magicraft.autoCreate";
 const CAP_KEY = "magicraft.autoCreate.capSol";
+const TORCH_KEY = "magicraft.torchLights";
+/** Stored torch quality, else 8 (4 on touch / coarse-pointer devices). */
+function torchQuality(stored: string | null): TorchQuality {
+  const v = Number(stored);
+  if (stored !== null && (TORCH_QUALITIES as readonly number[]).includes(v)) return v as TorchQuality;
+  let coarse = false;
+  try {
+    coarse = matchMedia("(pointer: coarse)").matches;
+  } catch {
+    /* no matchMedia */
+  }
+  return coarse ? 4 : 8;
+}
 const consentKey = (world: PublicKey) => `magicraft.autoCreate.consent.${world.toBase58()}`;
 
 export type WorldHandle = {
@@ -86,7 +99,9 @@ const store_ = {
 export const isDebug = () => !import.meta.env.PROD || new URLSearchParams(location.search).has("debug");
 
 export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey, account: WorldAccount, onFirstMesh: () => void): WorldHandle {
-  const renderer = new WorldRenderer(canvas, { viewBlocks: LOAD_RADIUS * 16 + 8 });
+  const viewBlocks = LOAD_RADIUS * 16 + 8;
+  const renderer = new WorldRenderer(canvas, { viewBlocks });
+  renderer.setTorchQuality(torchQuality(store_.get(TORCH_KEY)));
   const pool = new MeshPool();
   const debugCam = isDebug();
   const cam = debugCam ? new FlyCam(renderer.camera, canvas) : null;
@@ -118,14 +133,19 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
 
   const torches = new TorchIndex(store);
   const sky = new Sky(renderer, { world: () => account, now: () => null });
+  const feet: [number, number, number] = [0, 0, 0];
   const mobs = new MobLayer(renderer, {
     store,
     tickMs: account.params.mobTickMs,
     player: () => {
       const p = renderer.camera.position;
-      return [p.x, p.y - EYE, p.z];
+      feet[0] = p.x;
+      feet[1] = p.y - EYE;
+      feet[2] = p.z;
+      return feet;
     },
   });
+  const torchBuf = Array.from({ length: 16 }, () => [0, 0, 0, 0]);
 
   // ------------------------------------------------------------ auto-create
 
@@ -177,6 +197,11 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     inputmode: "decimal",
     value: String(+(auto.capLamports / LAMPORTS_PER_SOL).toFixed(6)),
   });
+  const torchSel = h(
+    "select",
+    { id: "torch-lights", class: "input small" },
+    ...TORCH_QUALITIES.map((q) => h("option", { value: String(q), selected: q === renderer.torchQuality }, q ? `${q}` : "Off")),
+  );
   const status = h("p", { class: "chunk-status", role: "status" });
   const totals = h("p", { class: "chunk-totals" });
   const askBox = h("div", { class: "chunk-halt", hidden: true });
@@ -187,6 +212,7 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     h("label", { class: "check", for: "auto-create" }, toggle, h("span", {}, "Auto-generate nearby chunks")),
     h("p", { class: "hint" }, `≈ ${sol(CHUNK_TOTAL_RENT, 6)} SOL rent each, paid by your player. Radius ${CREATE_RADIUS}.`),
     h("label", { class: "cap", for: "auto-cap" }, h("span", {}, "Spend cap this session"), capInput, h("span", { class: "muted" }, "SOL")),
+    h("label", { class: "cap", for: "torch-lights" }, h("span", {}, "Torch lights"), torchSel),
     status,
     totals,
     askBox,
@@ -202,6 +228,11 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
   toggle.addEventListener("change", () => {
     store_.set(AUTO_KEY, toggle.checked ? "on" : "off");
     auto.setPaused(!toggle.checked);
+  });
+  torchSel.addEventListener("change", () => {
+    const q = Number(torchSel.value) as TorchQuality;
+    store_.set(TORCH_KEY, String(q));
+    renderer.setTorchQuality(q);
   });
   capInput.addEventListener("change", () => {
     const v = Number(capInput.value);
@@ -364,7 +395,17 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     sky.underwater = b !== null && isFluid(b);
     sky.update(dt);
     const t = performance.now() / 1000;
-    renderer.setTorches(torches.pick([c.x, c.y, c.z]).map((p, i) => [p[0] + 0.5, p[1] + 0.75, p[2] + 0.5, 0.9 + 0.1 * Math.sin(t * 9 + i * 1.7) * Math.sin(t * 5.3 + i)]));
+    const lit = torches.pick([c.x, c.y, c.z], renderer.torchQuality, viewBlocks + TORCH_RADIUS);
+    for (let i = 0; i < lit.length; i++) {
+      const p = lit[i];
+      const ph = flickerPhase(p);
+      const o = torchBuf[i];
+      o[0] = p[0] + 0.5;
+      o[1] = p[1] + 0.75;
+      o[2] = p[2] + 0.5;
+      o[3] = 0.9 + 0.1 * Math.sin(t * 9 + ph) * Math.sin(t * 5.3 + ph * 1.7);
+    }
+    renderer.setTorches(torchBuf, lit.length);
     mobs.update(dt);
   };
   const setFly = (on: boolean) => {

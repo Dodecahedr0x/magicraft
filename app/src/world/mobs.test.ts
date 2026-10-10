@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FP, MOB, type V3 } from "../chain";
-import { MobTracker, Motion, angleDiff, type MobSnap } from "./mobs";
+import { edgeDistance, MobTracker, Motion, angleDiff, type MobSnap } from "./mobs";
 
 const snap = (id: number, x: number, z: number, o: Partial<MobSnap> = {}): MobSnap => ({ id, kind: MOB.PIG, hp: 10, dir: 8, burnMs: 0, pos: [x * FP, 30 * FP, z * FP] as V3, ...o });
 const near = (a: V3 | null, b: number[]) => {
@@ -66,6 +66,17 @@ describe("MobTracker", () => {
     t.unload("0,0");
     expect(t.mobs.size).toBe(0);
     expect(t.expire(10_000)).toEqual([]);
+  });
+
+  it("a mob vanishing away from the chunk edges dies at once (no crossing possible)", () => {
+    const t = new MobTracker(200, 450);
+    t.ingest("0,0", [snap(1, 8, 8), snap(2, 15, 8)], 0);
+    t.ingest("0,0", [], 100);
+    expect(t.expire(100).map((e) => [e.type, e.id])).toEqual([["died", 1]]);
+    expect(t.expire(400)).toEqual([]); // the one near the edge waits
+    expect(t.expire(600).map((e) => e.id)).toEqual([2]);
+    expect(edgeDistance("-1,2", [-15.5, 30, 40])).toBeCloseTo(0.5);
+    expect(edgeDistance("-1,2", [-8, 30, 40])).toBe(8);
   });
 
   it("keeps a mob listed by another loaded chunk when one chunk unloads", () => {

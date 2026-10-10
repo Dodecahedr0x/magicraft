@@ -255,7 +255,7 @@ impl Default for WorldParams {
             fluid_tick_ms: 250,
             fall_damage: 1,
             hunger: 1,
-            zombie_cap_per_chunk: 4,
+            zombie_cap_per_chunk: 2,
             _pad: 0,
         }
     }
@@ -1019,7 +1019,7 @@ mod tests {
         assert_eq!(WorldParams::from_bytes(&b), p);
         assert_eq!(&b[0..4], &1101u32.to_le_bytes());
         assert_eq!(b[44], 1);
-        assert_eq!(b[46], 4);
+        assert_eq!(b[46], 2);
     }
 
     #[test]

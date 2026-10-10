@@ -32,6 +32,8 @@ export const WORLD_LEN = 265;
 export const PSTATE_LEN = 432;
 export const MOB_SLOTS = 8;
 export const MOB_SIZE = 32;
+/** Offset of the mob slots in a chunk header (`MOB_SLOTS` × `MOB_SIZE`). */
+export const MOBS_OFFSET = 364;
 export const FLUID_QUEUE_SIZE = 134;
 export const FLUID_QUEUE_CAP = 64;
 export const MOVE_STATE_SIZE = 72;
@@ -159,7 +161,7 @@ export const DEFAULT_WORLD_PARAMS: Readonly<WorldParams> = Object.freeze({
   fluidTickMs: 250,
   fallDamage: 1,
   hunger: 1,
-  zombieCapPerChunk: 4,
+  zombieCapPerChunk: 2,
   pad: 0,
 });
 
@@ -507,7 +509,7 @@ export function decodeChunkHeader(d: Uint8Array): ChunkHeader {
   expectKind(d, "chunk", CHUNK_HEADER_SIZE);
   const r = new Reader(d);
   const mobs: Mob[] = [];
-  for (let i = 0; i < MOB_SLOTS; i++) mobs.push(decodeMob(d, 364 + MOB_SIZE * i));
+  for (let i = 0; i < MOB_SLOTS; i++) mobs.push(decodeMob(d, MOBS_OFFSET + MOB_SIZE * i));
   return {
     payer: r.pubkey(8),
     world: r.pubkey(40),

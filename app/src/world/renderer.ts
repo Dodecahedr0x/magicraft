@@ -14,14 +14,18 @@ import type { ChunkMesh, MeshArrays } from "./mesher";
 
 export const SKY = "#9cc7ee";
 
-/** Max point lights (torches) fed to the shaders. */
+/** Max point lights (torches) fed to the shaders (uniform array size). */
 export const MAX_TORCHES = 16;
+/** Torch light quality: lights evaluated per fragment (`N_TORCHES` define; 0 = off). */
+export const TORCH_QUALITIES = [0, 4, 8, 16] as const;
+export type TorchQuality = (typeof TORCH_QUALITIES)[number];
 /** Torch light reach, blocks. */
 export const TORCH_RADIUS = 9;
 
-/** Shared lighting GLSL: uniforms + `sceneLight(world pos, normal)` (ambient + one
- *  directional light, per vertex) and `torchLight(world pos, normal)` (≤ 16 point lights,
- *  per fragment; no occlusion — light passes through blocks). */
+/** Shared lighting GLSL: uniforms + `sceneLight(normal)` (ambient + one directional light,
+ *  per vertex) and `torchLight(world pos, normal)` (≤ `N_TORCHES` point lights per
+ *  fragment, a material define set by the torch quality; no occlusion — light passes
+ *  through blocks). */
 export const LIGHT_PARS = /* glsl */ `
 uniform float uAmbient;
 uniform vec3 uAmbientColor;
@@ -35,15 +39,21 @@ vec3 sceneLight(vec3 n) {
   return uAmbient * uAmbientColor + uSun * uSunColor * max(dot(n, uSunDir), 0.0);
 }
 vec3 torchLight(vec3 p, vec3 n) {
+#if N_TORCHES > 0
   float s = 0.0;
-  for (int i = 0; i < ${MAX_TORCHES}; i++) {
+  for (int i = 0; i < N_TORCHES; i++) {
     if (i >= uTorchCount) break;
     vec3 d = uTorch[i].xyz - p;
-    float dist = length(d);
-    float a = clamp(1.0 - dist / ${TORCH_RADIUS.toFixed(1)}, 0.0, 1.0);
+    float d2 = dot(d, d);
+    if (d2 >= ${(TORCH_RADIUS * TORCH_RADIUS).toFixed(1)}) continue;
+    float dist = sqrt(d2);
+    float a = 1.0 - dist / ${TORCH_RADIUS.toFixed(1)};
     s += a * (0.35 + 0.65 * a) * (0.55 + 0.45 * max(dot(n, d / max(dist, 1e-3)), 0.0)) * uTorch[i].w;
   }
   return s * vec3(1.35, 1.0, 0.62);
+#else
+  return vec3(0.0);
+#endif
 }`;
 
 const VERT = /* glsl */ `
@@ -134,6 +144,9 @@ export class WorldRenderer {
     uTime: { value: 0 },
   };
   private chunks = new Map<string, ChunkObj>();
+  /** Materials using `LIGHT_PARS` (their `N_TORCHES` define follows `torchQuality`). */
+  private readonly lit = new Set<THREE.ShaderMaterial>();
+  torchQuality: TorchQuality = 8;
   private raf = 0;
   private last = 0;
   private avgFrame = 16.7;
@@ -179,15 +192,38 @@ export class WorldRenderer {
       uOpacity: { value: o.opacity ?? 1 },
       uWave: { value: o.wave ? 1 : 0 },
     };
-    return new THREE.ShaderMaterial({
-      uniforms,
-      vertexShader: VERT,
-      fragmentShader: FRAG,
-      fog: true,
-      transparent: !!o.transparent,
-      depthWrite: !o.transparent,
-      side: o.side ?? THREE.FrontSide,
-    });
+    return this.registerLit(
+      new THREE.ShaderMaterial({
+        uniforms,
+        vertexShader: VERT,
+        fragmentShader: FRAG,
+        fog: true,
+        transparent: !!o.transparent,
+        depthWrite: !o.transparent,
+        side: o.side ?? THREE.FrontSide,
+      }),
+    );
+  }
+
+  /** Tracks a `LIGHT_PARS` material (sets its `N_TORCHES` define). */
+  registerLit<M extends THREE.ShaderMaterial>(m: M): M {
+    m.defines = { ...m.defines, N_TORCHES: this.torchQuality };
+    this.lit.add(m);
+    return m;
+  }
+  unregisterLit(m: THREE.ShaderMaterial) {
+    this.lit.delete(m);
+  }
+
+  /** Torch lights per fragment (0 = off); recompiles the lit materials. */
+  setTorchQuality(q: TorchQuality) {
+    if (q === this.torchQuality) return;
+    this.torchQuality = q;
+    for (const m of this.lit) {
+      m.defines.N_TORCHES = q;
+      m.needsUpdate = true;
+    }
+    if (this.light.uTorchCount.value > q) this.light.uTorchCount.value = q;
   }
 
   private resize() {
@@ -286,9 +322,9 @@ export class WorldRenderer {
     u.uAmbientColor.value.set(l.ambientColor[0], l.ambientColor[1], l.ambientColor[2]);
   }
 
-  /** Sets the point lights: `[x, y, z, intensity]` (world block units), ≤ `MAX_TORCHES`. */
-  setTorches(ts: readonly (readonly number[])[]) {
-    const n = Math.min(ts.length, MAX_TORCHES);
+  /** Sets the point lights: `[x, y, z, intensity]` (world block units), ≤ the quality. */
+  setTorches(ts: readonly (readonly number[])[], count = ts.length) {
+    const n = Math.min(count, ts.length, this.torchQuality);
     for (let i = 0; i < n; i++) this.light.uTorch.value[i].set(ts[i][0], ts[i][1], ts[i][2], ts[i][3]);
     this.light.uTorchCount.value = n;
   }
