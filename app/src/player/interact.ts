@@ -426,6 +426,12 @@ export class Interaction {
     this.toast(actionMessage(f, what));
   }
 
+  /** Presses / releases a mouse button from another input (touch buttons, ui/touch.ts);
+   *  released with the mouse buttons on blur. */
+  setButton(b: "left" | "right", down: boolean) {
+    this.buttons[b] = down;
+  }
+
   /** Holds a virtual mouse button for `ms` (automation without pointer lock). */
   click(button: "left" | "right", ms = 100) {
     this.virtual[button] = performance.now() + ms;

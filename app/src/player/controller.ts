@@ -4,7 +4,8 @@
 //
 // Controls: click the canvas to capture the mouse (Esc releases; without pointer lock,
 // drag to look), WASD / arrows move, Space jump / swim up, Shift sprint (Ctrl is a browser
-// shortcut), C does nothing yet (no sneaking). Debug mode (dev build or `?debug`): F
+// shortcut), C does nothing yet (no sneaking). Touch screens: ui/touch.ts feeds `touch`
+// (joystick, jump) and `look`. Debug mode (dev build or `?debug`): F
 // toggles the free-fly camera (the player then stands still) and `__magicraft.player`
 // drives input programmatically (`input({ forward: true }, 2000)`, `look(yaw, pitch)`,
 // `stats()`), for automation where pointer lock is unavailable.
@@ -57,6 +58,8 @@ export class PlayerController {
   /** Movement input disabled while a UI panel (inventory) is open. */
   blocked = false;
   readonly keys = new Set<keyof Input>();
+  /** Touch input (ui/touch.ts: joystick, jump button), merged with the keys. */
+  touch: Partial<Input> = {};
   private override: { input: Partial<Input>; until: number } | null = null;
   private drag: { x: number; y: number } | null = null;
   private off: (() => void)[] = [];
@@ -86,7 +89,10 @@ export class PlayerController {
       const k = KEYS[e.code];
       if (k) this.keys.delete(k);
     });
-    on(window, "blur", () => this.keys.clear());
+    on(window, "blur", () => {
+      this.keys.clear();
+      this.touch = {};
+    });
     on(document, "pointerlockchange", () => {
       this.locked = document.pointerLockElement === canvas;
       // Browsers can report a huge movementX/Y in the first event after locking.
@@ -95,7 +101,8 @@ export class PlayerController {
     on(document, "visibilitychange", () => this.keys.clear());
     on(canvas, "pointerdown", (e) => {
       // No capture while a panel (inventory) has the mouse.
-      if (e.button !== 0 || o.isFlying?.() || this.blocked) return;
+      // Touch: ui/touch.ts handles look / move (no pointer lock on touch screens).
+      if (e.button !== 0 || e.pointerType === "touch" || o.isFlying?.() || this.blocked) return;
       if (!this.locked) {
         // Pointer lock may be refused (automation, iframes): drag to look instead.
         const p = canvas.requestPointerLock?.() as Promise<void> | undefined;
@@ -137,6 +144,7 @@ export class PlayerController {
     if (this.frozen || this.blocked || this.o.isFlying?.()) return { ...NO_INPUT };
     const inp: Input = { ...NO_INPUT };
     for (const k of this.keys) inp[k] = true;
+    for (const k in this.touch) if (this.touch[k as keyof Input]) inp[k as keyof Input] = true;
     if (this.override) {
       if (performance.now() < this.override.until) Object.assign(inp, this.override.input);
       else this.override = null;

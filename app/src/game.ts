@@ -16,11 +16,17 @@ import { clear, focusHeading, h, sendResultMessage } from "./ui/dom";
 import { DeathScreen, HealthBars } from "./ui/health";
 import { Hotbar } from "./ui/hotbar";
 import { InventoryGrid } from "./ui/inventory";
+import { TouchControls } from "./ui/touch";
+import type { Input } from "./player/physics";
 import { blockFlags, loadCore } from "./wasm";
 import { PlayerLayer } from "./world/players";
 import { startWorld } from "./world/world";
 
 export type GameHandle = { stop(): void };
+
+/** Phones and tablets (short or narrow screen, or a touch-only pointer): the top bar moves
+ *  into the in-game menu. */
+export const MOBILE_QUERY = "(max-height: 520px), (max-width: 640px), (pointer: coarse)";
 
 export function enterGame(app: App, root: HTMLElement, world: PublicKey, account: WorldAccount, onLeave: (notice?: string) => void): GameHandle {
   clear(root);
@@ -42,6 +48,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
   const invPanel = h("div", { class: "inv-panel", role: "dialog", "aria-modal": "false", "aria-label": "Inventory and crafting", hidden: true });
 
   let stopped = false;
+  let touch: TouchControls | null = null;
   let latest: { s: PlayerStateAccount; inv: Uint8Array } | null = null;
   let player: PlayerSession | null = null;
   let act: Interaction | null = null;
@@ -98,6 +105,9 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
   });
   const resume = h("button", { class: "btn primary small", type: "button" }, "Resume");
   const menuLeave = h("button", { class: "btn ghost small", type: "button" }, "Back to worlds");
+  // On mobile the top bar (balance, chunks, Top up, Withdraw, wallet) is hidden in game and
+  // shown inside the menu instead: the live element moves here and back (`placeTopbar`).
+  const accountBox = h("div", { class: "menu-account", hidden: true });
   const menu = h(
     "div",
     { class: "game-menu", hidden: true },
@@ -105,6 +115,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
       "div",
       { class: "game-menu-panel", role: "dialog", "aria-modal": "true", "aria-labelledby": "game-menu-title" },
       h("div", { class: "panel-head" }, h("h2", { id: "game-menu-title" }, "Settings"), h("span", { class: "muted small" }, "Esc to resume")),
+      accountBox,
       view.settings,
       h(
         "p",
@@ -115,6 +126,19 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
     ),
   );
   screen.append(bars.flash, bar, mineBar, aim, hud, view.ui, invPanel, death.el, menu);
+  const topbar = document.querySelector<HTMLElement>(".topbar");
+  const topHome = topbar ? { parent: topbar.parentElement!, next: topbar.nextSibling } : null;
+  const mobileQ = matchMedia(MOBILE_QUERY);
+  const placeTopbar = (restore = false) => {
+    if (!topbar || !topHome) return;
+    const inMenu = !restore && mobileQ.matches;
+    accountBox.hidden = !inMenu;
+    if (inMenu && topbar.parentElement !== accountBox) accountBox.append(topbar);
+    else if (!inMenu && topbar.parentElement === accountBox) topHome.parent.insertBefore(topbar, topHome.next);
+  };
+  const onMobileChange = () => placeTopbar();
+  mobileQ.addEventListener("change", onMobileChange);
+  placeTopbar();
   // The controls hint goes to the top (the hotbar owns the bottom center).
   const help = view.ui.querySelector(".fly-help");
   if (help) screen.append(help);
@@ -124,6 +148,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
     const blocked = !invPanel.hidden || !menu.hidden;
     if (player) player.controller.blocked = blocked;
     if (act) act.blocked = blocked;
+    if (blocked) touch?.reset(); // a held stick / button must not resume on close
   };
 
   // ------------------------------------------------------------ settings menu (Esc)
@@ -138,7 +163,8 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
     if (open) {
       menuAt = performance.now();
       if (document.pointerLockElement) document.exitPointerLock();
-      resume.focus();
+      resume.focus({ preventScroll: true });
+      menu.firstElementChild!.scrollTop = 0; // open at the top (account, settings)
     } else {
       if (menu.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();
       if (relock && !death.shown) (canvas.requestPointerLock?.() as Promise<void> | undefined)?.catch?.(() => {});
@@ -240,6 +266,20 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
         h("div", { class: "inv-body" }, grid.el, crafting.el),
       );
       hud.append(bars.el, hotbar.el);
+      // Touch screens: joystick, drag to look, action buttons (ui/touch.ts).
+      let stick: Partial<Input> = {};
+      let jump = false;
+      const pushTouch = () => (session.controller.touch = { ...stick, jump });
+      touch = new TouchControls(screen, {
+        move: (i) => ((stick = i), pushTouch()),
+        look: (dy, dp) => session.controller.look(session.controller.yaw + dy, session.controller.pitch + dp),
+        button: (b, down) => a.setButton(b, down),
+        jump: (down) => ((jump = down), pushTouch()),
+        inventory: () => setPanel(invPanel.hidden, false),
+        menu: () => setMenu(true, false),
+        blocked: () => death.shown || !invPanel.hidden || !menu.hidden,
+      });
+      screen.append(touch.el);
       view.onFrame(() => a.update());
       syncBlocked();
       if (latest) a.select.onPlayerState(latest.s.heldSlot);
@@ -300,8 +340,11 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
       stopped = true;
       clearInterval(panelTimer);
       window.removeEventListener("keydown", onKey);
+      mobileQ.removeEventListener("change", onMobileChange);
+      placeTopbar(true);
       document.removeEventListener("pointerlockchange", onLockChange);
       hotbar?.dispose();
+      touch?.dispose();
       act?.dispose();
       others?.dispose();
       player?.stop();

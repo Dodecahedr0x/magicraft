@@ -1100,8 +1100,10 @@ body:has(.screen.game) {
   position: absolute;
   inset: 0;
   z-index: 8;
-  display: grid;
-  place-items: center;
+  /* Flex (not grid): the panel's max-height: 100% resolves, so a tall menu scrolls. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
   padding: 1rem;
   background: rgb(8 7 6 / 0.6);
   animation: toast-in 160ms var(--ease-out);
@@ -1615,5 +1617,177 @@ body:has(.screen.game) {
   *::after {
     animation: none !important;
     transition: none !important;
+  }
+}
+
+/* ------------------------------------------------------------ touch controls (ui/touch.ts) */
+
+.screen.game {
+  /* No browser panning / zooming / text selection on the game: touches drive the game. */
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+.touch-ui[hidden],
+.stick[hidden] {
+  display: none;
+}
+.touch-ui {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+.touch-ui > *,
+.touch-actions > *,
+.touch-top > * {
+  pointer-events: auto;
+}
+.stick {
+  position: absolute;
+  width: 112px;
+  height: 112px;
+  margin: -56px 0 0 -56px;
+  border-radius: 50%;
+  background: rgb(255 255 255 / 0.1);
+  border: 2px solid rgb(255 255 255 / 0.3);
+  pointer-events: none;
+}
+.stick-knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 48px;
+  height: 48px;
+  margin: -24px 0 0 -24px;
+  border-radius: 50%;
+  background: rgb(255 255 255 / 0.45);
+}
+.touch-actions {
+  position: absolute;
+  right: max(12px, env(safe-area-inset-right));
+  bottom: calc(5.5rem + env(safe-area-inset-bottom));
+  display: grid;
+  grid-template-columns: auto auto;
+  grid-template-areas: "use mine" ". jump";
+  gap: 10px;
+  align-items: end;
+  pointer-events: none;
+}
+.touch-btn {
+  display: grid;
+  place-items: center;
+  width: 60px;
+  height: 60px;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid rgb(255 255 255 / 0.35);
+  background: rgb(19 17 15 / 0.45);
+  color: #fff;
+  font: 700 0.8rem/1 var(--font);
+  text-shadow: 0 1px 2px rgb(0 0 0 / 0.7);
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.touch-btn.on {
+  background: rgb(255 255 255 / 0.3);
+}
+.touch-btn.mine {
+  grid-area: mine;
+  width: 76px;
+  height: 76px;
+  border-color: rgb(240 122 99 / 0.7);
+}
+.touch-btn.use {
+  grid-area: use;
+}
+.touch-btn.jump {
+  grid-area: jump;
+  justify-self: center;
+}
+.touch-top {
+  position: absolute;
+  top: 0.6rem;
+  right: max(0.75rem, env(safe-area-inset-right));
+  display: flex;
+  gap: 0.5rem;
+  pointer-events: none;
+}
+.touch-btn.small {
+  width: auto;
+  height: 36px;
+  padding: 0 0.85rem;
+  border-radius: 999px;
+}
+/* Touch layout: the crosshair is the aim, so no hover hints; the toasts and prompts sit
+   above the hotbar, left of the action buttons. */
+.screen.game.touch .fly-help {
+  display: none;
+}
+.screen.game.touch .world-ui {
+  bottom: 5.5rem;
+  right: 11rem;
+}
+.screen.game.touch .game-bar {
+  right: 12rem;
+}
+@media (max-width: 520px) {
+  .screen.game.touch .slot {
+    width: 34px;
+    height: 34px;
+  }
+  .screen.game.touch .slot-icon {
+    width: 24px;
+    height: 24px;
+  }
+  .screen.game.touch .pips svg {
+    width: 14px;
+    height: 14px;
+  }
+}
+
+/* On mobile the top bar lives in the in-game menu (game.ts `placeTopbar`): the game keeps
+   its grid row when the bar leaves #app, and the bar is restyled as a menu section. */
+#app > .main {
+  grid-row: 2;
+}
+.menu-account[hidden] {
+  display: none;
+}
+.menu-account {
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+.menu-account .topbar {
+  position: static;
+  display: grid;
+  gap: 0.6rem;
+  padding: 0;
+  background: none;
+  border: 0;
+  backdrop-filter: none;
+}
+.menu-account .brand,
+.menu-account .region-picker {
+  display: none;
+}
+.menu-account .hud-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem 1rem;
+  width: 100%;
+}
+.menu-account .hud-stats .btn {
+  width: 100%;
+}
+.menu-account .wallet-chip {
+  justify-content: space-between;
+}
+/* Short screens (phones in landscape): the top bar scrolls away instead of sticking. */
+@media (max-height: 520px) {
+  .topbar {
+    position: static;
   }
 }
