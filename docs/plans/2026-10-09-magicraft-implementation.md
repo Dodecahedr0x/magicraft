@@ -444,3 +444,19 @@ snap back to the onchain `PlayerState` and drop the in-flight chain (order is pr
 single sender / same signer, but a rejected move invalidates every later one).
 
 Deploy program to devnet (build without the localnet VRF-queue feature); configure ER endpoint (devnet ER from docs) and pin its validator identity in `delegate_player`, VRF ephemeral queue, session program. Before playing, re-check the remaining risks from the design doc: Magic-program crank CPIs vs Hydra; the deployed VRF program's fee exemption for `DEFAULT_EPHEMERAL_QUEUE` (a Player-PDA payer needs it; fallback wallet payer); e-SPL global rent PDA funded (top-ups); ER fees still 0 (session keys with 0 lamports). Run the app (`pnpm -C app dev`), complete the onboarding flow with a devnet wallet, create a world, play 5 minutes; record issues. Commit `docs: devnet deploy notes`.
+
+**Done (Task 28, partially: blocked on a program clock issue):** deployed to devnet
+(`4GTybm3WD66wUnTgS8UcB9H947uAY7BAqivp8HfbSsW9`, 4.54 SOL, `pnpm build:release` guards pass) and
+smoke-tested with `pnpm smoke:devnet` (`scripts/devnet-smoke.ts`: the app chain layer via Vite's
+SSR runner, `scripts/run-smoke.mjs`) against the EU devnet ER (`MEUGG…`). Works on devnet:
+onboarding (ER clone in ~70 ms), 0-lamport session keys (ER fees 0), PDA-paid VRF on
+`DEFAULT_EPHEMERAL_QUEUE` (fee-exempt, seed < 50 ms), generation (215-242k CU), Magic-program
+cranks (day + chunk; no Hydra migration needed), break/place, e-SPL top-up (rent PDA funded),
+withdraw + `withdraw_base` (settled in ~1 s). Move confirm latency ~96 ms (EU) → ~10 Hz with one
+in flight, so **pipelining was not implemented** (needed only for far regions). **Found:** the
+World clock assumes 50 ms ER slots; devnet slots are ~10 ms, so moves fail `TimeSkew` right after a
+World is created and the clock stays in coarse mode for ~17 min (fix not implemented; see
+`docs/notes/deploy.md` Known issues). Client: `app/.env.devnet` (`pnpm -C app dev --mode devnet`),
+`app/.env.example`; the devnet build serves, offers no burner, and the devnet ER answers the
+world-list query (CORS ok). The 5-minute wallet playtest is left for a human (no wallet
+extension in the Browser pane) after the clock fix.

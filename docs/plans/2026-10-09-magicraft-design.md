@@ -344,11 +344,12 @@ Details and evidence: [`docs/notes/spikes.md`](../notes/spikes.md) (Tasks 2–6)
 
 ## Remaining risks
 
-1. **Hydra deprecation.** The SDK marks the Magic-program crank CPIs deprecated in favour of Hydra,
-   which isn't in the local stack. Re-check before devnet/mainnet.
-2. **VRF fee exemption.** The production `DEFAULT_EPHEMERAL_QUEUE` fee exemption (needed for a PDA
-   payer) is verified in source only, not against the deployed program. Re-check on devnet; fallback
-   is a wallet payer.
+1. **Hydra deprecation.** The SDK marks the Magic-program crank CPIs deprecated in favour of Hydra.
+   *Devnet (2026-10-10, ER `magicblock-core` 1.0.0):* the Magic-program `ScheduleTask` path works
+   (day crank 1 tick/s for 14 min, chunk cranks tick); Hydra is deployed but not needed yet.
+   Re-check before mainnet.
+2. **VRF fee exemption.** *Resolved on devnet:* `request_seed` with the Player PDA as payer on
+   `DEFAULT_EPHEMERAL_QUEUE` is fee-exempt (Player and queue ER deltas 0; seed in < 50 ms).
 3. **Silently dropped cranks.** ~26 s of failures, or a task-id collision, drops a crank with no
    on-chain signal. Mitigation: never-failing tick handlers, collision-free ids, `last_tick` +
    watchdog re-arm.
@@ -358,4 +359,11 @@ Details and evidence: [`docs/notes/spikes.md`](../notes/spikes.md) (Tasks 2–6)
 5. **Write contention** on hot chunks (movers + crank on same accounts).
 6. **Durability.** Ephemeral accounts live only in the ER; worlds are as durable as the ER state.
 7. **Cluster prerequisites.** e-SPL global rent PDA must be funded on the target cluster (top-ups);
-   ER fees are 0 in the current release (session keys rely on it).
+   ER fees are 0 in the current release (session keys rely on it). *Devnet:* rent PDA funded
+   (14.7 SOL), top-up credited in ~250 ms; ER fees 0 (0-lamport session key pays every gameplay
+   tx); withdraw settles in ~1 s.
+8. **ER slot time (open, found on devnet).** The World chain clock (`TimeAnchor`) starts at 50 ms
+   per slot (local ER); devnet ER slots are ~10 ms, so a new World's estimate runs ~100 s ahead
+   and takes ~17 min to slew back, during which the program reads coarse wall time and moves
+   right after `join_world` fail `TimeSkew`. Integer ms per slot is also too coarse at 10 ms.
+   Details and fix direction: `docs/notes/deploy.md`.
