@@ -6,9 +6,8 @@ services:
     runtime: static
     name: magicraft
     buildCommand: >-
-      corepack enable &&
-      pnpm install --frozen-lockfile &&
-      pnpm -C app build --mode devnet &&
+      npx -y pnpm@10.12.4 install --frozen-lockfile &&
+      npx -y pnpm@10.12.4 -C app build --mode devnet &&
       find app/dist -name '*.map' -delete
     staticPublishPath: app/dist
     pullRequestPreviewsEnabled: false
