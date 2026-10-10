@@ -178,6 +178,9 @@ describe("join + move", () => {
     // last_ms = the chain-time reading at join.
     expect(st.move.lastMs).to.be.within(t0 - 1_000, t0 + 2_000);
     expect(st.acc.foodTickMs.toNumber()).to.equal(st.move.lastMs);
+    // The first join freezes the clock's backward correction at the stamp it handed out.
+    const w = (await fetchWorld(world))!.acc;
+    expect(w.firstJoinMs.toNumber()).to.equal(st.move.lastMs);
   });
 
   it("joining twice fails", async () => {

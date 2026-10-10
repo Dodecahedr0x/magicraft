@@ -8,8 +8,9 @@
 // `fetchChunkView` asks the ER. A builder that needs a chunk that is not ready throws
 // `ChunkNotReadyError` (the sender reports it as kind `notReady`).
 import { BN } from "@anchor-lang/core";
-import type { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { SYSVAR_CLOCK_PUBKEY, type Connection, type PublicKey, type TransactionInstruction } from "@solana/web3.js";
 import {
+  chainEstimate,
   chunkReady,
   chunkOfBlock,
   chunkOfFp,
@@ -17,7 +18,6 @@ import {
   localOfBlock,
   decodeWorld,
   nextClientMs,
-  worldChainMs,
   type V3,
   type WorldParams,
 } from "./layout";
@@ -141,21 +141,48 @@ export function nameBytes(name: string): number[] {
 export const freshNonce = (): bigint =>
   BigInt(Date.now()) * 1000n + BigInt(Math.floor(Math.random() * 1000));
 
-/** `create_world(nonce, name, params)`; the World PDA is `["world", wallet, nonce]`. */
+/** `create_world(nonce, name, params, us_per_slot_hint)`; the World PDA is
+ *  `["world", wallet, nonce]`. `usPerSlotHint`: the ER slot rate (`measureUsPerSlot`),
+ *  0 = the program's 50 ms default (the local ER's rate; wrong on devnet's ~10 ms ERs). */
 export async function createWorldIx(
   program: MagicraftProgram,
   auth: Auth,
   nonce: bigint,
   name: string,
   params: WorldParams,
+  usPerSlotHint = 0,
 ) {
   return program.methods
-    .createWorld(new BN(nonce.toString()), nameBytes(name), params)
+    .createWorld(new BN(nonce.toString()), nameBytes(name), params, usPerSlotHint)
     .accountsPartial({
       ...authAccounts(auth),
       world: worldPda(program.programId, auth.authority, nonce),
     })
     .instruction();
+}
+
+/** Measures the ER slot rate in µs per slot over ~`spanMs` (two `getSlot` readings,
+ *  each placed at its request's round-trip midpoint): the `create_world` hint. 0 if the
+ *  slot did not advance or a reading failed (the program then uses its default). */
+export async function measureUsPerSlot(
+  er: Pick<Connection, "getSlot">,
+  spanMs = 2_000,
+  now: () => number = () => performance.now(),
+): Promise<number> {
+  const read = async () => {
+    const t0 = now();
+    const slot = await er.getSlot("processed");
+    return { slot, t: (t0 + now()) / 2 };
+  };
+  try {
+    const a = await read();
+    await new Promise((r) => setTimeout(r, spanMs));
+    const b = await read();
+    if (b.slot <= a.slot) return 0;
+    return Math.round(((b.t - a.t) * 1000) / (b.slot - a.slot));
+  } catch {
+    return 0;
+  }
 }
 
 /** `request_seed(client_seed)` (VRF on the configured queue; any session-authed delegated
@@ -367,8 +394,10 @@ export function requiredSlots(a: readonly number[], b: readonly number[], cx0: n
   return req;
 }
 
-/** Polls the World clock + ER slot until `nextClientMs` yields a timestamp (tests, simple
- *  callers; a game loop should compute `worldChainMs` from its own cached World + slot). */
+/** Polls the World clock, ER slot and Clock sysvar until `nextClientMs` yields a timestamp
+ *  (tests, simple callers; a game loop should use its own `ChainClock`). Uses
+ *  `chainEstimate`, so it follows the program into coarse wall time when the anchor is
+ *  stale or far off. */
 export async function waitClientMs(
   er: Connection,
   world: PublicKey,
@@ -378,9 +407,14 @@ export async function waitClientMs(
 ): Promise<number> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const [info, slot] = await Promise.all([er.getAccountInfo(world, "confirmed"), er.getSlot("processed")]);
+    const [info, slot, clk] = await Promise.all([
+      er.getAccountInfo(world, "confirmed"),
+      er.getSlot("processed"),
+      er.getAccountInfo(SYSVAR_CLOCK_PUBKEY, "processed"),
+    ]);
     if (!info) throw new Error(`world ${world.toBase58()} not found`);
-    const chain = worldChainMs(decodeWorld(info.data), slot);
+    const wall = clk && clk.data.length >= 40 ? Number(new DataView(clk.data.buffer, clk.data.byteOffset).getBigInt64(32, true)) * 1000 + 500 : null;
+    const chain = chainEstimate(decodeWorld(info.data), slot, wall);
     const ms = chain === null ? null : nextClientMs(chain, lastMs, minDt);
     if (ms !== null) return ms;
     if (Date.now() > deadline) throw new Error("chain clock unavailable or behind lastMs");

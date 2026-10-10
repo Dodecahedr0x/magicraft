@@ -52,14 +52,16 @@ pub mod magicraft {
 
     // ----- Worlds (ER) -----
 
-    /// Creates the ephemeral World (sponsored by the Player) and arms its day crank.
+    /// Creates the ephemeral World (sponsored by the Player) and arms its day crank;
+    /// `us_per_slot_hint`: the client-measured ER slot rate (0 = default 50 ms).
     pub fn create_world(
         ctx: Context<CreateWorld>,
         nonce: u64,
         name: [u8; 32],
         params: WorldParams,
+        us_per_slot_hint: u32,
     ) -> Result<()> {
-        instructions::world::create_world(ctx, nonce, name, params)
+        instructions::world::create_world(ctx, nonce, name, params, us_per_slot_hint)
     }
 
     /// Requests the world seed from the ER VRF queue (the creator's Player PDA pays).

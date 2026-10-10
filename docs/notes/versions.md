@@ -77,3 +77,11 @@ Recorded 2026-10-09 when scaffolding the workspace (Task 1). `anchor build` and
   `crates/core-wasm/build.rs` hashes `crates/core/Cargo.toml`, `crates/core/src/**` and
   `crates/core-wasm/src/**` (FNV-1a 64, sorted paths) into `core_src_hash()`;
   `app/src/wasm/hash.test.ts` recomputes it and fails with "run `pnpm -C app build:wasm`".
+- **Local stack vs devnet (Task 28, 2026-10-10).** The local stack runs
+  `@magicblock-labs/ephemeral-validator` **0.14.10** (50 ms slots); the MagicBlock devnet ERs
+  (`devnet-{eu,us,as}.magicblock.app`) report **magicblock-core 1.0.0** (git `cc32775`,
+  solana-core 4.0.0, ~10 ms slots, although the router advertises `blockTimeMs: 50`).
+  Everything the program uses (ephemeral accounts, Magic-program `ScheduleTask`/`CancelTask`,
+  VRF on `DEFAULT_EPHEMERAL_QUEUE`, commit/undelegate, e-SPL top-ups) behaved the same on both;
+  the slot time difference is why `create_world` takes a measured `us_per_slot_hint`.
+

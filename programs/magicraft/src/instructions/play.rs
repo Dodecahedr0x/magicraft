@@ -6,7 +6,9 @@
 //! block center: `(x·256 + 128, y·256, z·256 + 128)`), health and food 20,
 //! `MoveState::spawn(pos, chain_ms)`: `last_ms` = the chain-time reading at join, so the
 //! client's first update must carry `client_ms > last_ms` (it reads `last_ms` back from the
-//! account). Requires `World.spawn_set` (`SpawnNotSet`); joining twice fails (the account
+//! account). Requires `World.spawn_set` (`SpawnNotSet`); the first join of a world records
+//! `World.first_join_ms` (World writable; the clock stops stepping back, `state::TimeAnchor`);
+//! joining twice fails (the account
 //! exists). **The presence entry is not created at join**: the first `move_player` adds it
 //! (a move re-adds a missing own entry anyway, e.g. after it was pruned), which keeps join
 //! free of the presence account and its write lock.
@@ -198,8 +200,9 @@ pub struct JoinWorld<'info> {
     pub player: Account<'info, Player>,
     #[session(signer = signer, authority = player.authority.key())]
     pub session_token: Option<Account<'info, SessionTokenV2>>,
-    /// Read-only; the spawn must be set.
-    #[account(constraint = world.spawn_set @ MagicraftError::SpawnNotSet)]
+    /// The spawn must be set; mut: the first join records `first_join_ms` (freezes the
+    /// clock's backward correction).
+    #[account(mut, constraint = world.spawn_set @ MagicraftError::SpawnNotSet)]
     pub world: Account<'info, World>,
     /// CHECK: the PlayerState PDA, created here (fails if it exists).
     #[account(
@@ -234,8 +237,15 @@ pub fn join_world(ctx: Context<JoinWorld>) -> Result<()> {
         ])
         .create(PSTATE_LEN as u32)?;
 
-    let now = a.world.chain_ms_ro(&Clock::get()?).ms;
-    let pos = spawn_pos(a.world.spawn);
+    let clock = Clock::get()?;
+    let world = &mut ctx.accounts.world;
+    if world.first_join_ms == 0 && world.seed_set {
+        // Last backward-capable re-anchor before the first stamp (`state::TimeAnchor`).
+        world.tick_clock(&clock);
+    }
+    let now = world.chain_ms_ro(&clock).ms;
+    world.note_join(now);
+    let pos = spawn_pos(world.spawn);
     let mut s = PlayerState {
         player: player_key,
         world: world_key,

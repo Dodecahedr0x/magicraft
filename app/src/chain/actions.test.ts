@@ -27,6 +27,7 @@ import {
   walletAuth,
   ChunkNotReadyError,
   requiredSlots,
+  measureUsPerSlot,
 } from "./actions";
 import { DEFAULT_EPHEMERAL_QUEUE, DEFAULT_EPHEMERAL_TEST_QUEUE, loadConfig } from "./config";
 import { DEFAULT_WORLD_PARAMS, nextClientMs, type V3 } from "./layout";
@@ -301,5 +302,19 @@ describe("gameplay builders", () => {
     expect(creationChain(new Set(["0,0"]), "2,0")).toEqual(["1,0", "2,0"]);
     expect(creationChain(new Set(["0,0", "1,0"]), "1,2")).toEqual(["1,1", "1,2"]);
     expect(() => creationChain(new Set(["0,0"]), "5,0", 2)).toThrow();
+  });
+});
+
+describe("measureUsPerSlot", () => {
+  it("divides the midpoint-to-midpoint time by the slots elapsed", async () => {
+    const times = [0, 40, 2_040, 2_080]; // request start / end of both readings
+    const slots = [1_000, 1_204];
+    const er = { getSlot: async () => slots.shift()! };
+    // Midpoints 20 and 2 060: 2 040 ms over 204 slots = 10 000 µs per slot.
+    expect(await measureUsPerSlot(er as never, 1, () => times.shift()!)).toBe(10_000);
+    const stuck = { getSlot: async () => 7 };
+    expect(await measureUsPerSlot(stuck as never, 1)).toBe(0);
+    const broken = { getSlot: async () => Promise.reject(new Error("down")) };
+    expect(await measureUsPerSlot(broken as never, 1)).toBe(0);
   });
 });

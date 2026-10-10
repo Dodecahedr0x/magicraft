@@ -15,6 +15,7 @@ import {
   decodeWorld,
   ephemeralRent,
   freshNonce,
+  measureUsPerSlot,
   populateChunkIx,
   requestSeedIx,
   setSpawnIx,
@@ -91,7 +92,11 @@ export async function runSetup(
     if (!w0) {
       if (!create) throw new Error("World not found.");
       w0 = await step(0, async () => {
-        await send(app, async () => [await createWorldIx(app.program, auth, create.nonce, create.name, create.params)]);
+        // The ER's slot rate seeds the World clock (devnet ERs run ~10 ms slots, not 50).
+        steps.set(0, "active", "measuring the rollup's slot rate…");
+        const hint = await measureUsPerSlot(app.conns.er);
+        steps.set(0, "active");
+        await send(app, async () => [await createWorldIx(app.program, auth, create.nonce, create.name, create.params, hint)]);
         const x = await until(() => readWorld(app, world), 5_000);
         if (!x) throw new Error("World not visible after creation.");
         return x;

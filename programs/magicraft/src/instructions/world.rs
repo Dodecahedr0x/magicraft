@@ -57,7 +57,9 @@ pub struct CreateWorld<'info> {
 }
 
 /// Creates the World (`["world", player.authority, nonce]`), sponsored by the Player, with
-/// the seed unset and the clock anchored, and arms its day crank (World PDA = authority).
+/// the seed unset and the clock anchored at `us_per_slot_hint` µs per slot (the client's
+/// measurement of the ER slot rate; clamped to `MIN/MAX_US_PER_SLOT`, 0 = the 50 ms default),
+/// and arms its day crank (World PDA = authority).
 /// Next steps for the client: `request_seed`, then chunk (0,0) once the seed is set.
 #[session_auth_or(
     ctx.accounts.player.authority == ctx.accounts.signer.key(),
@@ -68,6 +70,7 @@ pub fn create_world(
     nonce: u64,
     name: [u8; 32],
     params: WorldParams,
+    us_per_slot_hint: u32,
 ) -> Result<()> {
     params.validate()?;
     let a = &ctx.accounts;
@@ -98,10 +101,11 @@ pub fn create_world(
         day_task_id: 0,
         last_tick_ms: 0,
         chunk_count: 0,
-        clock: TimeAnchor::new(clock.slot, clock.unix_timestamp),
+        clock: TimeAnchor::new(clock.slot, clock.unix_timestamp, us_per_slot_hint),
         day_ticks: 0,
         day_epoch: 0,
-        _reserved: [0; 17],
+        first_join_ms: 0,
+        _reserved: [0; 9],
     };
     world.day_task_id = arm_day_crank(&world_ai, &world)?;
     world.try_serialize(&mut &mut world_ai.try_borrow_mut_data()?[..])?;

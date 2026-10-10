@@ -46,10 +46,11 @@
 //! | 183 | `day_task_id` | i64 (0 = not scheduled) |
 //! | 191 | `last_tick_ms` | i64 (chain ms of the last `tick_day`) |
 //! | 199 | `chunk_count` | u32 |
-//! | 203 | `clock` | [`TimeAnchor`]: `anchor_slot` u64 @203, `anchor_ms` i64 @211, `ms_per_slot` u32 @219, `base_ms_per_slot` u32 @223, `sync_slot` u64 @227, `sync_ms` i64 @235 |
+//! | 203 | `clock` | [`TimeAnchor`]: `anchor_slot` u64 @203, `anchor_ms` i64 @211, `us_per_slot` u32 @219, `base_us_per_slot` u32 @223 (µs per slot), `sync_slot` u64 @227, `sync_ms` i64 @235 |
 //! | 243 | `day_ticks` | u32 (wrapping count of `tick_day` executions; diagnostics) |
 //! | 247 | `day_epoch` | u8 (day-crank task id epoch, bumped by a stale re-arm) |
-//! | 248 | `_reserved` | [u8; 17] |
+//! | 248 | `first_join_ms` | i64 (chain ms of the first `join_world`; 0 = none: the clock may still step back) |
+//! | 256 | `_reserved` | [u8; 9] |
 //!
 //! # `PlayerState` (ephemeral), PDA `["pstate", world, player]`, 432 bytes
 //! | off | field | type |
@@ -254,8 +255,12 @@ impl WorldParams {
     }
 }
 
-/// Default slot duration used until the first rate measurement, ms.
-pub const DEFAULT_MS_PER_SLOT: u32 = 50;
+/// Default slot duration (µs) when `create_world` gets no hint (`us_per_slot_hint == 0`):
+/// the local ER's 50 ms. Devnet ERs run ~10 ms slots, so clients pass a measured hint.
+pub const DEFAULT_US_PER_SLOT: u32 = 50_000;
+/// Bounds of every stored slot rate (hint, measurement, slewed rate), µs per slot.
+pub const MIN_US_PER_SLOT: u32 = 1_000;
+pub const MAX_US_PER_SLOT: u32 = 1_000_000;
 /// [`TimeAnchor::reanchor`] jumps forward when the estimate lags wall time by more than
 /// this, ms (< 1 s; wall time is `unix_timestamp · 1000 + 500`, the midpoint of its second).
 pub const REANCHOR_DRIFT_MS: i64 = 750;
@@ -267,6 +272,11 @@ pub const RATE_SPAN_MS: i64 = 30_000;
 /// [`TimeAnchor::read`] falls back to coarse wall time when the anchor is older than this
 /// (the writer stopped re-anchoring) or the estimate is this far off wall time, ms.
 pub const STALE_MS: i64 = 10_000;
+
+/// Clamps a slot rate to [`MIN_US_PER_SLOT`]`..=`[`MAX_US_PER_SLOT`].
+pub fn clamp_us_per_slot(us: u64) -> u32 {
+    us.clamp(MIN_US_PER_SLOT as u64, MAX_US_PER_SLOT as u64) as u32
+}
 
 /// A chain-time reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,30 +290,41 @@ pub struct ChainTime {
 }
 
 /// Chain time with ms resolution (`Clock::unix_timestamp` has 1 s): `chain_ms = anchor_ms +
-/// (slot − anchor_slot) · ms_per_slot`.
+/// ⌊(slot − anchor_slot) · us_per_slot / 1000⌋`.
 ///
 /// - **Readers** (gameplay ixs) call [`Self::read`] on a read-only World: never writes.
-/// - **The writer** is `tick_day` (every ~1 s) plus the initial anchor in `create_world`;
-///   only it calls [`Self::reanchor`]. A re-anchor is **monotonic**: the new anchor is never
-///   below the estimate readers saw at that slot, so fine readings never go backwards.
-///   - Rate: `base_ms_per_slot` is measured from wall time over ≥ [`RATE_SPAN_MS`]
-///     (sync point `sync_slot` / `sync_ms`).
-///   - Offset: lagging by > [`REANCHOR_DRIFT_MS`] → jump forward to wall time; lagging
+/// - **The writer** is `tick_day` (every ~1 s) plus the initial anchor in `create_world`
+///   (rate = the client's measured hint, clamped, or [`DEFAULT_US_PER_SLOT`]); only it calls
+///   [`Self::reanchor`].
+///   - Rate: `base_us_per_slot` is measured from wall time since the sync point
+///     (`sync_slot` / `sync_ms`). Before [`RATE_SPAN_MS`] every re-anchor checks the current
+///     rate against the observed span (known to ±1 000 ms: `unix_timestamp` has 1 s
+///     resolution) and replaces it by the measurement only when they are inconsistent, so
+///     a good client hint is kept and a wrong one is replaced within a tick or two. Over
+///     every [`RATE_SPAN_MS`] the measurement is adopted and the sync point moves.
+///   - Offset, **after the first join** (`allow_back == false`): monotonic — the new anchor
+///     is never below the estimate readers saw at that slot, so fine readings never go
+///     backwards. Lagging by > [`REANCHOR_DRIFT_MS`] → jump forward to wall time; lagging
 ///     by more than [`RATE_DEADBAND_MS`] → run 1/8 fast; ahead by more than the deadband →
 ///     hold continuity and run 1/8 slow until wall time catches up (slew, never back).
-///     `ms_per_slot` is the effective (slewed) rate readers use.
+///   - Offset, **before the first join** (`allow_back == true`, `World.first_join_ms == 0`:
+///     no `PlayerState` holds a stamp from this clock yet): off by more than the deadband
+///     in either direction → step to wall time, so a wrong initial rate is repaired within
+///     a tick instead of slewing for minutes. The first `join_world` re-anchors this way
+///     once more right before it stamps the new `PlayerState`.
+///   - `us_per_slot` is the effective (slewed) rate readers use.
 ///
-/// All-zero (`ms_per_slot == 0`) = not anchored yet.
+/// All-zero (`us_per_slot == 0`) = not anchored yet.
 #[derive(
     AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, Debug, Default, PartialEq, Eq,
 )]
 pub struct TimeAnchor {
     pub anchor_slot: u64,
     pub anchor_ms: i64,
-    /// Effective rate (base ± slew), ms per slot.
-    pub ms_per_slot: u32,
-    /// Measured rate, ms per slot.
-    pub base_ms_per_slot: u32,
+    /// Effective rate (base ± slew), µs per slot.
+    pub us_per_slot: u32,
+    /// Measured rate, µs per slot.
+    pub base_us_per_slot: u32,
     /// Start of the current rate measurement: slot and wall ms.
     pub sync_slot: u64,
     pub sync_ms: i64,
@@ -314,13 +335,19 @@ fn wall_ms(unix_timestamp: i64) -> i64 {
 }
 
 impl TimeAnchor {
-    /// First anchor (`create_world`).
-    pub fn new(slot: u64, unix_timestamp: i64) -> Self {
+    /// First anchor (`create_world`), rate from the client's hint (µs per slot, clamped;
+    /// 0 = [`DEFAULT_US_PER_SLOT`]).
+    pub fn new(slot: u64, unix_timestamp: i64, us_per_slot_hint: u32) -> Self {
+        let us = if us_per_slot_hint == 0 {
+            DEFAULT_US_PER_SLOT
+        } else {
+            clamp_us_per_slot(us_per_slot_hint as u64)
+        };
         TimeAnchor {
             anchor_slot: slot,
             anchor_ms: wall_ms(unix_timestamp).saturating_add(500),
-            ms_per_slot: DEFAULT_MS_PER_SLOT,
-            base_ms_per_slot: DEFAULT_MS_PER_SLOT,
+            us_per_slot: us,
+            base_us_per_slot: us,
             sync_slot: slot,
             sync_ms: wall_ms(unix_timestamp),
         }
@@ -328,9 +355,9 @@ impl TimeAnchor {
 
     /// Slot-based estimate (`anchor_ms` for slots before the anchor).
     pub fn estimate(&self, slot: u64) -> i64 {
-        let dslot = slot.saturating_sub(self.anchor_slot).min(i64::MAX as u64) as i64;
-        self.anchor_ms
-            .saturating_add(dslot.saturating_mul(self.ms_per_slot as i64))
+        let dslot = slot.saturating_sub(self.anchor_slot) as i128;
+        let d_ms = (dslot * self.us_per_slot as i128 / 1000).min(i64::MAX as i128) as i64;
+        self.anchor_ms.saturating_add(d_ms)
     }
 
     /// Read-only chain time: the estimate, or coarse wall time if the anchor is unset or
@@ -341,7 +368,7 @@ impl TimeAnchor {
             ms: wall,
             coarse: true,
         };
-        if self.ms_per_slot == 0 {
+        if self.us_per_slot == 0 {
             return coarse;
         }
         let est = self.estimate(slot);
@@ -355,21 +382,32 @@ impl TimeAnchor {
         }
     }
 
-    /// Writer only: re-anchors at `slot` (monotonic, see the type docs) and returns the
-    /// new chain time.
-    pub fn reanchor(&mut self, slot: u64, unix_timestamp: i64) -> i64 {
-        if self.ms_per_slot == 0 {
-            *self = Self::new(slot, unix_timestamp);
+    /// Writer only: re-anchors at `slot` and returns the new chain time. Monotonic unless
+    /// `allow_back` (no reader has stamped a `PlayerState` yet; see the type docs).
+    pub fn reanchor(&mut self, slot: u64, unix_timestamp: i64, allow_back: bool) -> i64 {
+        if self.us_per_slot == 0 {
+            *self = Self::new(slot, unix_timestamp, 0);
             return self.anchor_ms;
         }
         let wall = wall_ms(unix_timestamp);
-        let mut base = self.base_ms_per_slot.clamp(1, 1_000);
+        let mut base = clamp_us_per_slot(self.base_us_per_slot as u64);
         let dslot = slot.saturating_sub(self.sync_slot);
         let dms = wall.saturating_sub(self.sync_ms);
-        if dms >= RATE_SPAN_MS && dslot > 0 {
-            base = (dms as u64 / dslot).clamp(1, 1_000) as u32;
-            self.sync_slot = slot;
-            self.sync_ms = wall;
+        if dms >= 0 && dslot > 0 {
+            let measured = clamp_us_per_slot(
+                (dms as u128 * 1000 / dslot as u128).min(u64::MAX as u128) as u64,
+            );
+            if dms >= RATE_SPAN_MS {
+                base = measured;
+                self.sync_slot = slot;
+                self.sync_ms = wall;
+            } else {
+                // Early check: the span the current rate predicts vs the observed one (±1 s).
+                let predicted = base as i128 * dslot as i128 / 1000;
+                if (predicted - dms as i128).abs() > 1_000 {
+                    base = measured;
+                }
+            }
         } else if dms < 0 || slot < self.sync_slot {
             // Clock or slot went backwards: restart the measurement.
             self.sync_slot = slot;
@@ -378,19 +416,26 @@ impl TimeAnchor {
         let est = self.estimate(slot);
         let target = wall.saturating_add(500);
         let err = target.saturating_sub(est); // > 0: the estimate lags
+        let step_back = allow_back && err < -RATE_DEADBAND_MS;
         let slew = (base / 8).max(1);
-        let mps = if err > RATE_DEADBAND_MS {
-            base.saturating_add(slew).min(1_000)
+        let ups = if step_back {
+            base
+        } else if err > RATE_DEADBAND_MS {
+            base.saturating_add(slew).min(MAX_US_PER_SLOT)
         } else if err < -RATE_DEADBAND_MS {
-            base.saturating_sub(slew).max(1)
+            base.saturating_sub(slew).max(MIN_US_PER_SLOT)
         } else {
             base
         };
-        let ms = if err > REANCHOR_DRIFT_MS { target } else { est };
+        let ms = if err > REANCHOR_DRIFT_MS || step_back {
+            target
+        } else {
+            est
+        };
         self.anchor_slot = self.anchor_slot.max(slot);
         self.anchor_ms = ms;
-        self.ms_per_slot = mps;
-        self.base_ms_per_slot = base;
+        self.us_per_slot = ups;
+        self.base_us_per_slot = base;
         ms
     }
 }
@@ -429,7 +474,10 @@ pub struct World {
     /// Epoch mixed into the day crank's task id (`scheduler::task_id`); a stale re-arm
     /// bumps it, so a squatted id is abandoned.
     pub day_epoch: u8,
-    pub _reserved: [u8; 17],
+    /// Chain ms of the first `join_world` (0 = nobody joined yet). Until then the day crank
+    /// may step the clock backward (see [`TimeAnchor`]); afterwards it is monotonic.
+    pub first_join_ms: i64,
+    pub _reserved: [u8; 9],
 }
 
 // `create_world` creates the World in one CPI (≤ 10 240 bytes).
@@ -439,7 +487,16 @@ impl World {
     /// Writer path (`tick_day`, which holds the World mutably): monotonic re-anchor,
     /// returns chain ms.
     pub fn tick_clock(&mut self, clock: &Clock) -> i64 {
-        self.clock.reanchor(clock.slot, clock.unix_timestamp)
+        let allow_back = self.first_join_ms == 0;
+        self.clock
+            .reanchor(clock.slot, clock.unix_timestamp, allow_back)
+    }
+
+    /// `join_world`: records the first join (from then on the clock never steps back).
+    pub fn note_join(&mut self, now_ms: i64) {
+        if self.first_join_ms == 0 {
+            self.first_join_ms = now_ms.max(1);
+        }
     }
 
     /// `callback_seed`: stores the VRF output once (`SeedAlreadySet` afterwards, so a
@@ -1192,14 +1249,15 @@ mod tests {
             clock: TimeAnchor {
                 anchor_slot: 10,
                 anchor_ms: 11,
-                ms_per_slot: 12,
-                base_ms_per_slot: 13,
+                us_per_slot: 12,
+                base_us_per_slot: 13,
                 sync_slot: 14,
                 sync_ms: 15,
             },
             day_ticks: 16,
             day_epoch: 0,
-            _reserved: [0; 17],
+            first_join_ms: 17,
+            _reserved: [0; 9],
         };
         let mut b = World::DISCRIMINATOR.to_vec();
         b.extend(borsh(&w));
@@ -1221,6 +1279,7 @@ mod tests {
         assert_eq!(&b[227..235], &14u64.to_le_bytes());
         assert_eq!(&b[235..243], &15i64.to_le_bytes());
         assert_eq!(&b[243..247], &16u32.to_le_bytes());
+        assert_eq!(&b[248..256], &17i64.to_le_bytes());
     }
 
     #[test]
@@ -1434,7 +1493,8 @@ mod tests {
             clock: TimeAnchor::default(),
             day_ticks: 0,
             day_epoch: 0,
-            _reserved: [0; 17],
+            first_join_ms: 0,
+            _reserved: [0; 9],
         }
     }
 
@@ -1453,7 +1513,7 @@ mod tests {
     #[test]
     fn day_crank_staleness() {
         let mut w = test_world();
-        w.clock = TimeAnchor::new(0, 1_000); // anchor_ms = 1_000_500
+        w.clock = TimeAnchor::new(0, 1_000, 0); // anchor_ms = 1_000_500
         assert!(!w.day_crank_stale(1_000_500 + CRANK_STALE_MS));
         assert!(w.day_crank_stale(1_000_501 + CRANK_STALE_MS));
         w.last_tick_ms = 2_000_000;
@@ -1465,7 +1525,7 @@ mod tests {
     #[test]
     fn unseeded_tick_is_liveness_only() {
         let mut w = test_world();
-        w.clock = TimeAnchor::new(100, 1_000);
+        w.clock = TimeAnchor::new(100, 1_000, 0);
         let before = w.clock;
         let clock = Clock {
             slot: 120,
@@ -1523,9 +1583,19 @@ mod tests {
                 coarse: true
             }
         );
-        assert_eq!(t.reanchor(100, 1_700_000_000), 1_700_000_000_500);
-        assert_eq!((t.anchor_slot, t.ms_per_slot), (100, DEFAULT_MS_PER_SLOT));
-        assert_eq!(t, TimeAnchor::new(100, 1_700_000_000));
+        assert_eq!(t.reanchor(100, 1_700_000_000, false), 1_700_000_000_500);
+        assert_eq!((t.anchor_slot, t.us_per_slot), (100, DEFAULT_US_PER_SLOT));
+        assert_eq!(t, TimeAnchor::new(100, 1_700_000_000, 0));
+    }
+
+    #[test]
+    fn time_anchor_hint_is_clamped() {
+        let us = |h| TimeAnchor::new(0, 1_000, h).us_per_slot;
+        assert_eq!(us(0), DEFAULT_US_PER_SLOT);
+        assert_eq!(us(9_800), 9_800);
+        assert_eq!(us(1), MIN_US_PER_SLOT);
+        assert_eq!(us(u32::MAX), MAX_US_PER_SLOT);
+        assert_eq!(TimeAnchor::new(0, 1_000, 9_800).base_us_per_slot, 9_800);
     }
 
     #[test]
@@ -1533,13 +1603,13 @@ mod tests {
         let t = TimeAnchor {
             anchor_slot: 100,
             anchor_ms: 1_000_000,
-            ms_per_slot: 50,
+            us_per_slot: 9_750,
             ..Default::default()
         };
         assert_eq!(
             t.read(107, 1_000),
             ChainTime {
-                ms: 1_000_350,
+                ms: 1_000_068, // ⌊7 · 9 750 / 1 000⌋
                 coarse: false
             }
         );
@@ -1550,7 +1620,7 @@ mod tests {
         let t = TimeAnchor {
             anchor_slot: 0,
             anchor_ms: 1_000_000,
-            ms_per_slot: 50,
+            us_per_slot: 50_000,
             ..Default::default()
         };
         // 10 s after the anchor: still fine.
@@ -1567,53 +1637,111 @@ mod tests {
         assert!(t.read(10, 1_020).coarse);
     }
 
-    /// Simulates a validator whose real slot length differs from the assumed one, with
-    /// `tick_day` re-anchoring every 20 slots and a reader at every slot.
-    fn simulate(real_ms_per_slot: i64, start_mps: u32) -> (i64, u32) {
+    /// Simulates a validator with `real_us` µs slots: `create_world` at slot 0 with
+    /// `hint` (0 = default), `tick_day` re-anchoring once per wall second, a reader at every
+    /// slot, and the first join `join_ms` after creation (None = never). Checks: after the
+    /// first join no reading or re-anchor ever goes back; fine readings from `join_s`
+    /// on. Returns the worst |estimate − truth| from 10 s on and the final base rate.
+    fn simulate(real_us: i64, hint: u32, join_ms: Option<i64>) -> (i64, u32) {
         let t0: i64 = 1_700_000_000_123; // true ms at slot 0
-        let truth = |slot: u64| t0 + slot as i64 * real_ms_per_slot;
+        let truth = |slot: u64| t0 + slot as i64 * real_us / 1000;
         let unix = |slot: u64| truth(slot).div_euclid(1000);
-        let mut a = TimeAnchor::new(0, unix(0));
-        a.ms_per_slot = start_mps;
-        a.base_ms_per_slot = start_mps;
+        let mut a = TimeAnchor::new(0, unix(0), hint);
+        let per_sec = (1_000_000 / real_us) as u64; // slots per tick
+        let end = per_sec * 600; // 10 minutes
+        let mut joined = false;
         let mut last = i64::MIN;
-        let mut worst_late = 0i64;
-        for slot in 1..=20_000u64 {
-            if slot % 20 == 0 {
-                let ms = a.reanchor(slot, unix(slot));
-                assert!(ms >= last, "reanchor went back at slot {slot}");
-                last = ms;
+        let mut worst = 0i64;
+        for slot in 1..=end {
+            let secs = (truth(slot) - t0) / 1000;
+            if !joined && join_ms.is_some_and(|j| truth(slot) - t0 >= j) {
+                // join_world: a last backward-capable re-anchor, then the first stamp.
+                a.reanchor(slot, unix(slot), true);
+                joined = true;
+                last = a.read(slot, unix(slot)).ms;
+            }
+            if slot % per_sec == 0 {
+                let ms = a.reanchor(slot, unix(slot), !joined);
+                if joined {
+                    assert!(ms >= last, "reanchor went back at slot {slot}");
+                    last = ms;
+                }
             }
             let r = a.read(slot, unix(slot));
-            assert!(!r.coarse, "coarse at slot {slot}");
-            assert!(
-                r.ms >= last,
-                "read went back at slot {slot}: {} < {last}",
-                r.ms
-            );
-            last = r.ms;
-            if slot > 10_000 {
-                worst_late = worst_late.max((r.ms - truth(slot)).abs());
+            if joined {
+                assert!(!r.coarse, "coarse at slot {slot} ({secs} s)");
+                assert!(
+                    r.ms >= last,
+                    "read went back at slot {slot}: {} < {last}",
+                    r.ms
+                );
+                last = r.ms;
+            }
+            if secs >= 10 {
+                worst = worst.max((r.ms - truth(slot)).abs());
             }
         }
-        (worst_late, a.base_ms_per_slot)
+        (worst, a.base_us_per_slot)
     }
 
     #[test]
-    fn time_anchor_monotonic_when_estimate_runs_ahead() {
-        // Real slots 40 ms, assumed 50: the estimate runs ahead and must slew, not jump back.
-        let (err, mps) = simulate(40, 50);
-        assert!(err <= 1_000, "converged error {err}");
-        assert!((39..=41).contains(&mps), "mps {mps}");
+    fn time_anchor_converges_for_10_50_100_ms_slots_with_any_hint() {
+        let mut bad = vec![];
+        for real_us in [10_000i64, 9_750, 50_000, 100_000] {
+            for hint in [0u32, real_us as u32, 50_000, 10_000, 100_000, 1, u32::MAX] {
+                for join_ms in [
+                    None,
+                    Some(300),
+                    Some(900),
+                    Some(1_500),
+                    Some(6_000),
+                    Some(12_000),
+                ] {
+                    let (err, base) = simulate(real_us, hint, join_ms);
+                    let rel = (base as i64 - real_us).abs() * 100 / real_us;
+                    if err >= 1_000 || rel > 5 {
+                        bad.push(format!(
+                            "real {real_us} hint {hint} join {join_ms:?}: err {err} base {base}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     #[test]
-    fn time_anchor_monotonic_when_estimate_lags() {
-        let (err, mps) = simulate(60, 50);
-        assert!(err <= 1_000, "converged error {err}");
-        assert!((59..=61).contains(&mps), "mps {mps}");
-        let (err, _) = simulate(50, 50);
-        assert!(err <= 1_000, "steady error {err}");
+    fn time_anchor_steps_back_only_before_the_first_join() {
+        // 10 ms slots, default 50 ms rate: one second later the estimate is ~4 s ahead.
+        let mut t = TimeAnchor::new(0, 1_000, 0);
+        let est = t.estimate(100);
+        assert!(est > 1_004_000);
+        let mut joined = t;
+        // Before the first join: steps back to wall time.
+        assert_eq!(t.reanchor(100, 1_001, true), 1_001_500);
+        // After it: holds the estimate and slews.
+        assert_eq!(joined.reanchor(100, 1_001, false), est);
+        assert!(joined.us_per_slot < DEFAULT_US_PER_SLOT);
+    }
+
+    #[test]
+    fn world_first_join_freezes_backward_steps() {
+        let mut w = test_world();
+        w.seed_set = true;
+        w.clock = TimeAnchor::new(0, 1_000, 0);
+        let clock = |slot, unix_timestamp| Clock {
+            slot,
+            unix_timestamp,
+            ..Default::default()
+        };
+        w.tick(&clock(100, 1_001));
+        assert_eq!(w.clock.anchor_ms, 1_001_500); // stepped back (10 ms slots)
+        w.note_join(1_001_600);
+        w.note_join(9_999_999);
+        assert_eq!(w.first_join_ms, 1_001_600);
+        let before = w.clock.estimate(200);
+        w.tick(&clock(200, 1_002));
+        assert!(w.clock.anchor_ms >= before);
     }
 
     #[test]
@@ -1622,19 +1750,19 @@ mod tests {
             TimeAnchor {
                 anchor_slot: u64::MAX,
                 anchor_ms: i64::MAX,
-                ms_per_slot: u32::MAX,
+                us_per_slot: u32::MAX,
                 ..Default::default()
             },
             TimeAnchor {
                 anchor_slot: 0,
                 anchor_ms: i64::MIN,
-                ms_per_slot: u32::MAX,
+                us_per_slot: u32::MAX,
                 ..Default::default()
             },
             TimeAnchor {
                 anchor_slot: 5,
                 anchor_ms: 0,
-                ms_per_slot: 1,
+                us_per_slot: 1,
                 ..Default::default()
             },
         ];
@@ -1643,8 +1771,10 @@ mod tests {
                 let _ = t.read(slot, unix);
                 let mut w = t;
                 let before = w.estimate(slot);
-                let ms = w.reanchor(slot, unix);
+                let ms = w.reanchor(slot, unix, false);
                 assert!(ms >= before, "reanchor went back");
+                let mut w = t;
+                let _ = w.reanchor(slot, unix, true);
             }
         }
     }

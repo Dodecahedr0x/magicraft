@@ -590,7 +590,8 @@ export type Magicraft = {
     {
       "name": "createWorld",
       "docs": [
-        "Creates the ephemeral World (sponsored by the Player) and arms its day crank."
+        "Creates the ephemeral World (sponsored by the Player) and arms its day crank;",
+        "`us_per_slot_hint`: the client-measured ER slot rate (0 = default 50 ms)."
       ],
       "discriminator": [
         117,
@@ -699,6 +700,10 @@ export type Magicraft = {
               "name": "worldParams"
             }
           }
+        },
+        {
+          "name": "usPerSlotHint",
+          "type": "u32"
         }
       ]
     },
@@ -1248,8 +1253,10 @@ export type Magicraft = {
         {
           "name": "world",
           "docs": [
-            "Read-only; the spawn must be set."
-          ]
+            "The spawn must be set; mut: the first join records `first_join_ms` (freezes the",
+            "clock's backward correction)."
+          ],
+          "writable": true
         },
         {
           "name": "playerState",
@@ -2594,20 +2601,31 @@ export type Magicraft = {
       "name": "timeAnchor",
       "docs": [
         "Chain time with ms resolution (`Clock::unix_timestamp` has 1 s): `chain_ms = anchor_ms +",
-        "(slot − anchor_slot) · ms_per_slot`.",
+        "⌊(slot − anchor_slot) · us_per_slot / 1000⌋`.",
         "",
         "- **Readers** (gameplay ixs) call [`Self::read`] on a read-only World: never writes.",
-        "- **The writer** is `tick_day` (every ~1 s) plus the initial anchor in `create_world`;",
-        "only it calls [`Self::reanchor`]. A re-anchor is **monotonic**: the new anchor is never",
-        "below the estimate readers saw at that slot, so fine readings never go backwards.",
-        "- Rate: `base_ms_per_slot` is measured from wall time over ≥ [`RATE_SPAN_MS`]",
-        "(sync point `sync_slot` / `sync_ms`).",
-        "- Offset: lagging by > [`REANCHOR_DRIFT_MS`] → jump forward to wall time; lagging",
+        "- **The writer** is `tick_day` (every ~1 s) plus the initial anchor in `create_world`",
+        "(rate = the client's measured hint, clamped, or [`DEFAULT_US_PER_SLOT`]); only it calls",
+        "[`Self::reanchor`].",
+        "- Rate: `base_us_per_slot` is measured from wall time since the sync point",
+        "(`sync_slot` / `sync_ms`). Before [`RATE_SPAN_MS`] every re-anchor checks the current",
+        "rate against the observed span (known to ±1 000 ms: `unix_timestamp` has 1 s",
+        "resolution) and replaces it by the measurement only when they are inconsistent, so",
+        "a good client hint is kept and a wrong one is replaced within a tick or two. Over",
+        "every [`RATE_SPAN_MS`] the measurement is adopted and the sync point moves.",
+        "- Offset, **after the first join** (`allow_back == false`): monotonic — the new anchor",
+        "is never below the estimate readers saw at that slot, so fine readings never go",
+        "backwards. Lagging by > [`REANCHOR_DRIFT_MS`] → jump forward to wall time; lagging",
         "by more than [`RATE_DEADBAND_MS`] → run 1/8 fast; ahead by more than the deadband →",
         "hold continuity and run 1/8 slow until wall time catches up (slew, never back).",
-        "`ms_per_slot` is the effective (slewed) rate readers use.",
+        "- Offset, **before the first join** (`allow_back == true`, `World.first_join_ms == 0`:",
+        "no `PlayerState` holds a stamp from this clock yet): off by more than the deadband",
+        "in either direction → step to wall time, so a wrong initial rate is repaired within",
+        "a tick instead of slewing for minutes. The first `join_world` re-anchors this way",
+        "once more right before it stamps the new `PlayerState`.",
+        "- `us_per_slot` is the effective (slewed) rate readers use.",
         "",
-        "All-zero (`ms_per_slot == 0`) = not anchored yet."
+        "All-zero (`us_per_slot == 0`) = not anchored yet."
       ],
       "type": {
         "kind": "struct",
@@ -2621,16 +2639,16 @@ export type Magicraft = {
             "type": "i64"
           },
           {
-            "name": "msPerSlot",
+            "name": "usPerSlot",
             "docs": [
-              "Effective rate (base ± slew), ms per slot."
+              "Effective rate (base ± slew), µs per slot."
             ],
             "type": "u32"
           },
           {
-            "name": "baseMsPerSlot",
+            "name": "baseUsPerSlot",
             "docs": [
-              "Measured rate, ms per slot."
+              "Measured rate, µs per slot."
             ],
             "type": "u32"
           },
@@ -2759,11 +2777,19 @@ export type Magicraft = {
             "type": "u8"
           },
           {
+            "name": "firstJoinMs",
+            "docs": [
+              "Chain ms of the first `join_world` (0 = nobody joined yet). Until then the day crank",
+              "may step the clock backward (see [`TimeAnchor`]); afterwards it is monotonic."
+            ],
+            "type": "i64"
+          },
+          {
             "name": "reserved",
             "type": {
               "array": [
                 "u8",
-                17
+                9
               ]
             }
           }

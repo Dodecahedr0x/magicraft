@@ -95,6 +95,27 @@ export const fails = (p: Promise<unknown>) =>
 let nonceCounter = Date.now();
 export const freshNonce = () => new BN(nonceCounter++);
 
+let measured: Promise<number> | null = null;
+/** The ER slot rate in µs per slot, measured once per process over ~2 s (two `getSlot`
+ *  readings at their round-trip midpoints): the `create_world` hint, like the app's
+ *  `measureUsPerSlot`. 0 if the slot did not advance. */
+export function erUsPerSlot(): Promise<number> {
+  measured ??= (async () => {
+    const read = async () => {
+      const t0 = performance.now();
+      const slot = await erConn.getSlot("processed");
+      return { slot, t: (t0 + performance.now()) / 2 };
+    };
+    const a = await read();
+    await new Promise((r) => setTimeout(r, 2_000));
+    const b = await read();
+    return b.slot > a.slot
+      ? Math.round(((b.t - a.t) * 1000) / (b.slot - a.slot))
+      : 0;
+  })();
+  return measured;
+}
+
 export async function createWorldIx(
   p: TestPlayer,
   o: {
@@ -102,10 +123,13 @@ export async function createWorldIx(
     params?: WorldParamsArg;
     signer?: web3.PublicKey;
     sessionToken?: web3.PublicKey | null;
+    /** µs per slot (default: the measured ER rate, `erUsPerSlot`). */
+    usPerSlotHint?: number;
   }
 ) {
+  const hint = o.usPerSlotHint ?? (await erUsPerSlot());
   return p.er.methods
-    .createWorld(o.nonce, nameBytes("test world"), o.params ?? params())
+    .createWorld(o.nonce, nameBytes("test world"), o.params ?? params(), hint)
     .accountsPartial({
       signer: o.signer ?? p.authority.publicKey,
       player: p.player,

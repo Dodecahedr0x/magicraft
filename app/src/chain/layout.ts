@@ -230,8 +230,9 @@ export function decodePlayer(d: Uint8Array): PlayerAccount {
 export type TimeAnchor = {
   anchorSlot: number;
   anchorMs: number;
-  msPerSlot: number;
-  baseMsPerSlot: number;
+  /** Effective slot rate, µs per slot (0 = not anchored). */
+  usPerSlot: number;
+  baseUsPerSlot: number;
   syncSlot: number;
   syncMs: number;
 };
@@ -256,6 +257,8 @@ export type WorldAccount = {
   clock: TimeAnchor;
   dayTicks: number;
   dayEpoch: number;
+  /** Chain ms of the first `join_world` (0 = nobody joined: the clock may still step back). */
+  firstJoinMs: number;
 };
 
 const utf8 = new TextDecoder();
@@ -283,24 +286,43 @@ export function decodeWorld(d: Uint8Array): WorldAccount {
     clock: {
       anchorSlot: Number(r.u64(203)),
       anchorMs: r.n64(211),
-      msPerSlot: r.u32(219),
-      baseMsPerSlot: r.u32(223),
+      usPerSlot: r.u32(219),
+      baseUsPerSlot: r.u32(223),
       syncSlot: Number(r.u64(227)),
       syncMs: r.n64(235),
     },
     dayTicks: r.u32(243),
     dayEpoch: r.u8(247),
+    firstJoinMs: r.n64(248),
   };
 }
 
-/** The program's fine chain-time estimate at `slot` (`TimeAnchor::read`):
- *  `anchor_ms + (slot − anchor_slot) · ms_per_slot`; null while the World is not anchored
- *  (`ms_per_slot == 0`). The program falls back to coarse wall time when the anchor is
- *  older than 10 s; callers compare with `Date.now()` if they care. */
+/** The program's fine chain-time estimate at `slot` (`TimeAnchor::estimate`):
+ *  `anchor_ms + ⌊(slot − anchor_slot) · us_per_slot / 1000⌋`; null while the World is not
+ *  anchored (`us_per_slot == 0`). The program falls back to coarse wall time when the anchor
+ *  is stale (`chainEstimate` mirrors that). */
 export function worldChainMs(w: Pick<WorldAccount, "clock">, slot: number): number | null {
   const c = w.clock;
-  if (c.msPerSlot === 0) return null;
-  return c.anchorMs + Math.max(0, slot - c.anchorSlot) * c.msPerSlot;
+  if (c.usPerSlot === 0) return null;
+  return c.anchorMs + Math.floor((Math.max(0, slot - c.anchorSlot) * c.usPerSlot) / 1000);
+}
+
+/** The program falls back to coarse wall time when its anchor is older than this, or the
+ *  estimate is this far from the validator's wall time, ms (`state::STALE_MS`). */
+export const ANCHOR_STALE_MS = 10_000;
+
+/** Chain-time estimate the program would compute: the World anchor at `slot`
+ *  (`worldChainMs`), or — when the program reads coarse wall time (anchor unset, older than
+ *  10 s, or 10 s off the validator's wall time) — the validator's wall time `wallMs` minus
+ *  300 ms (the coarse window accepts `[floor_s − 1250, floor_s + 1000]`). `wallMs` must be
+ *  the **validator's** wall time (`unix_timestamp · 1000 + 500` from its Clock sysvar),
+ *  never the local `Date.now()`; null = unknown (then the fine estimate is trusted if it
+ *  exists). */
+export function chainEstimate(w: Pick<WorldAccount, "clock">, slot: number, wallMs: number | null): number | null {
+  const est = worldChainMs(w, slot);
+  if (wallMs === null) return est;
+  if (est === null || est - w.clock.anchorMs > ANCHOR_STALE_MS || Math.abs(est - wallMs) > ANCHOR_STALE_MS) return wallMs - 300;
+  return est;
 }
 
 /** `physics::LEAD_MS`: how far a move's `client_ms` may run ahead of chain time (fine

@@ -962,7 +962,8 @@ mod tests {
             clock: TimeAnchor::default(),
             day_ticks: 0,
             day_epoch: 0,
-            _reserved: [0; 17],
+            first_join_ms: 0,
+            _reserved: [0; 9],
         };
         let mut data = World::DISCRIMINATOR.to_vec();
         w.serialize(&mut data).unwrap();

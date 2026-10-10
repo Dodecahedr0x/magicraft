@@ -102,17 +102,31 @@ export async function erLamports(pk: web3.PublicKey): Promise<number> {
   return (await erConn.getAccountInfo(pk, "confirmed"))?.lamports ?? 0;
 }
 
-/** The program's chain-time estimate (`TimeAnchor::read`, fine path):
- *  `anchor_ms + (slot − anchor_slot) · ms_per_slot`. */
+/** The program's chain-time reading (`TimeAnchor::read`): the fine estimate
+ *  `anchor_ms + ⌊(slot − anchor_slot) · us_per_slot / 1000⌋`, or — when the anchor is
+ *  older than 10 s or 10 s off the validator's wall time (Clock sysvar) — that wall time
+ *  − 300 ms (the coarse window; mirrors the app's `chainEstimate`). */
 export async function chainMs(world: web3.PublicKey): Promise<number> {
-  const [w, slot] = await Promise.all([
+  const [w, slot, clk] = await Promise.all([
     fetchWorld(world),
     erConn.getSlot("processed"),
+    erConn.getAccountInfo(web3.SYSVAR_CLOCK_PUBKEY, "processed"),
   ]);
   const c = w!.acc.clock;
   const anchorSlot = (c.anchorSlot as BN).toNumber();
   const anchorMs = (c.anchorMs as BN).toNumber();
-  return anchorMs + Math.max(0, slot - anchorSlot) * c.msPerSlot;
+  const est =
+    anchorMs +
+    Math.floor((Math.max(0, slot - anchorSlot) * c.usPerSlot) / 1000);
+  const wall = clk ? Number(clk.data.readBigInt64LE(32)) * 1000 + 500 : null;
+  if (
+    wall !== null &&
+    (c.usPerSlot === 0 ||
+      est - anchorMs > 10_000 ||
+      Math.abs(est - wall) > 10_000)
+  )
+    return wall - 300;
+  return est;
 }
 
 /** Waits until a client timestamp ≥ `lastMs + minDt` is within the chain's

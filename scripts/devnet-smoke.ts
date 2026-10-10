@@ -31,6 +31,7 @@ import {
   createWorldIx,
   freshNonce,
   joinWorldIx,
+  measureUsPerSlot,
   moveIx,
   placeBlockIx,
   populateChunkIx,
@@ -52,6 +53,7 @@ import {
   decodeWorld,
   DEFAULT_WORLD_PARAMS,
   FP,
+  chainEstimate,
   liveMobs,
   nextClientMs,
   worldChainMs,
@@ -180,22 +182,31 @@ const erLamports = async (pk: PublicKey) => (await er.getAccountInfo(pk, "confir
 
 // ---------------------------------------------------------------- chain clock
 
-/** The program's chain-time reading, as the game client computes it
- *  (`app/src/player/sync.ts` `chainEstimate`, copied: that module pulls in the wasm core):
- *  the World anchor estimate, or — when the program falls back to coarse wall time (anchor
- *  older than 10 s or 10 s off the validator's wall time) — the validator's wall time
- *  (Clock sysvar) − 300 ms. `fine` reports which one the program uses. */
+/** The program's chain-time reading, as the game client computes it (`chainEstimate`):
+ *  the World anchor estimate, or — when the program falls back to coarse wall time —
+ *  the validator's wall time (Clock sysvar) − 300 ms. `fine` reports which one applies;
+ *  `errVsLocalMs` = estimate − local wall clock at the request midpoint. */
 async function chainNow(world: PublicKey) {
+  const t0 = Date.now();
   const [info, slot, clk] = await Promise.all([
     er.getAccountInfo(world, "confirmed"),
     er.getSlot("processed"),
     er.getAccountInfo(SYSVAR_CLOCK_PUBKEY, "processed"),
   ]);
+  const local = (t0 + Date.now()) / 2;
   const w = decodeWorld(info!.data);
   const wall = Number(Buffer.from(clk!.data).readBigInt64LE(32)) * 1000 + 500;
   const est = worldChainMs(w, slot);
-  const fine = est !== null && est - w.clock.anchorMs <= 10_000 && Math.abs(est - wall) <= 10_000;
-  return { ms: fine ? est! : wall - 300, fine, estMinusWall: est === null ? null : est - wall, msPerSlot: w.clock.msPerSlot, slot };
+  const ms = chainEstimate(w, slot, wall)!;
+  return {
+    ms,
+    fine: est !== null && ms === est,
+    estMinusWall: est === null ? null : est - wall,
+    errVsLocalMs: est === null ? null : Math.round(est - local),
+    usPerSlot: w.clock.usPerSlot,
+    firstJoinMs: w.firstJoinMs,
+    slot,
+  };
 }
 /** Next `client_ms` (strictly after `lastMs` + `minDt`) the program accepts; waits while
  *  `lastMs` is ahead of chain time (e.g. stamped by a fine reading before a coarse one). */
@@ -323,9 +334,15 @@ async function main() {
   const params = { ...DEFAULT_WORLD_PARAMS, zombieCapPerChunk: 0, dayLengthSecs: 120 };
   const nonce = freshNonce();
   const world = worldPda(pid, wallet.publicKey, nonce);
+  let hint = 0;
+  await step("measure the ER slot rate (create_world hint)", async () => {
+    hint = await measureUsPerSlot(er);
+    if (!hint) throw new Error("slot did not advance");
+    return { usPerSlot: hint };
+  });
   await step("create_world (session-signed, 0-lamport fee payer)", async () => {
     const before = await erLamports(player);
-    const r = await ok("create_world", async () => [await createWorldIx(program, auth, nonce, "devnet smoke", params)]);
+    const r = await ok("create_world", async () => [await createWorldIx(program, auth, nonce, "devnet smoke", params, hint)]);
     return {
       sig: r.sig,
       confirmMs: r.ms,
@@ -458,6 +475,20 @@ async function main() {
   }, false);
   await step("moves: walk to the neighbor and back (fresh world, one in flight at a time)", () => walk("move"), false);
 
+  await step("world clock: estimate vs local wall clock over 60 s (|error| < 1 s)", async () => {
+    const samples: { t: number; err: number | null; fine: boolean; usPerSlot: number }[] = [];
+    const t0 = Date.now();
+    while (Date.now() - t0 < 60_000) {
+      const c = await chainNow(world);
+      samples.push({ t: Math.round((Date.now() - t0) / 1000), err: c.errVsLocalMs, fine: c.fine, usPerSlot: c.usPerSlot });
+      await sleep(2_000);
+    }
+    const worst = Math.max(...samples.map((x) => Math.abs(x.err ?? Infinity)));
+    const r = { worstAbsErrMs: worst, allFine: samples.every((x) => x.fine), first: samples[0], last: samples[samples.length - 1] };
+    if (worst >= 1_000 || !r.allFine) throw new Error(`clock off: ${JSON.stringify(r)}`);
+    return r;
+  }, false);
+
   // 6. Day crank
   await step("day crank: World.day_ticks / last_tick_ms advance (Magic-program ScheduleTask)", async () => {
     const w0 = decodeWorld((await account(world))!);
@@ -547,8 +578,14 @@ async function main() {
   // 10. Close an unedited chunk nobody stands in (refund on the ER)
   await step("close_chunk: an unedited neighbor (rent refund)", async () => {
     const t = target!;
-    const cand = [...existing].filter((k) => k !== "0,0" && k !== chunkKey(...t));
-    if (!cand.length) return { skipped: "no unedited neighbor besides the walk target" };
+    let cand = [...existing].filter((k) => k !== "0,0" && k !== chunkKey(...t));
+    if (!cand.length) {
+      // Generate a fresh neighbor of (0,0) nobody stands in, then reclaim it.
+      const free = ["0,1", "0,-1", "-1,0", "1,0"].find((k) => !existing.has(k))!;
+      const [fx, fz] = free.split(",").map(Number);
+      await generate(fx, fz);
+      cand = [free];
+    }
     const [cx, cz] = cand[0].split(",").map(Number);
     const before = await erLamports(player);
     const r = await ok("close_chunk", async () => [await closeChunkIx(program, auth, world, cx, cz, view())]);

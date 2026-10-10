@@ -66,15 +66,21 @@ mob_tick_ms, fluid_tick_ms`. Client physics reads the same values.
 ### Chain time (`World.clock`, `state::TimeAnchor`)
 
 `Clock::unix_timestamp` has 1 s resolution; movement validation needs ms. The World stores an
-anchor (`anchor_slot`, `anchor_ms`, effective `ms_per_slot`, measured `base_ms_per_slot`, rate
-sync point). **Readers** (all gameplay ixs, World read-only, so no write contention) use
-`chain_ms_ro` = `anchor_ms + (slot − anchor_slot) · ms_per_slot`; if the anchor is unset or
-stale (older than 10 s, or > 10 s from wall time) they get a **coarse** reading (wall seconds,
-`coarse = true`) and widen tolerance (move lead 1000 ms instead of 250). **The only writer** is
-`tick_day` (~1 s; `create_world` sets the first anchor). Re-anchoring is **monotonic**: lagging
-wall time (`unix·1000 + 500`) by > 750 ms jumps forward; lagging/ahead by > 500 ms runs the
-clock 1/8 fast/slow (slew, never backwards); the slot rate is re-measured from wall time over
-≥ 30 s spans.
+anchor (`anchor_slot`, `anchor_ms`, effective `us_per_slot`, measured `base_us_per_slot` — µs
+per slot, bounds 1 000–1 000 000 — and a rate sync point). **Readers** (gameplay ixs, World
+read-only, so no write contention) use `chain_ms_ro` = `anchor_ms + ⌊(slot − anchor_slot) ·
+us_per_slot / 1000⌋`; if the anchor is unset or stale (older than 10 s, or > 10 s from wall
+time) they get a **coarse** reading (wall seconds, `coarse = true`) and widen tolerance (move
+lead 1000 ms instead of 250). **Writers**: `create_world` sets the first anchor at the client's
+measured slot rate (`us_per_slot_hint`, ~2 s of `getSlot`; 0 = 50 ms default), `tick_day`
+(~1 s) re-anchors, and the first `join_world` re-anchors once more before stamping. Rate:
+before 30 s every re-anchor checks the current rate against the observed span (±1 s) and
+replaces it by the measurement only if inconsistent; then re-measured over ≥ 30 s spans.
+Offset: **until the first join** (`World.first_join_ms == 0`) the clock steps to wall time
+(`unix·1000 + 500`) whenever it is > 500 ms off, in either direction; **after it**, re-anchoring
+is monotonic: lagging by > 750 ms jumps forward; lagging/ahead by > 500 ms runs the clock 1/8
+fast/slow (slew, never backwards; 1/8 stays inside the 5/4 move speed tolerance). Devnet ERs run
+~10 ms slots (the local ER 50 ms), which is why the rate is not assumed (Task 28).
 
 ### Presence economics
 

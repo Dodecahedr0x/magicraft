@@ -296,14 +296,15 @@ describe("Borsh accounts (cross-checked with the Anchor coder)", () => {
       clock: {
         anchorSlot: new BN(1000),
         anchorMs: new BN("1760000000000"),
-        msPerSlot: 50,
-        baseMsPerSlot: 49,
+        usPerSlot: 9_750,
+        baseUsPerSlot: 9_800,
         syncSlot: new BN(900),
         syncMs: new BN("1759999995000"),
       },
       dayTicks: 77,
       dayEpoch: 2,
-      reserved: new Array(17).fill(0),
+      firstJoinMs: new BN("1760000001234"),
+      reserved: new Array(9).fill(0),
     });
     expect(data.length).toBe(WORLD_LEN);
     const w = decodeWorld(data);
@@ -322,14 +323,14 @@ describe("Borsh accounts (cross-checked with the Anchor coder)", () => {
     expect(w.clock).toEqual({
       anchorSlot: 1000,
       anchorMs: 1760000000000,
-      msPerSlot: 50,
-      baseMsPerSlot: 49,
+      usPerSlot: 9_750,
+      baseUsPerSlot: 9_800,
       syncSlot: 900,
       syncMs: 1759999995000,
     });
-    expect([w.dayTicks, w.dayEpoch]).toEqual([77, 2]);
-    expect(worldChainMs(w, 1010)).toBe(1760000000500);
-    expect(worldChainMs({ clock: { ...w.clock, msPerSlot: 0 } }, 1010)).toBeNull();
+    expect([w.dayTicks, w.dayEpoch, w.firstJoinMs]).toEqual([77, 2, 1760000001234]);
+    expect(worldChainMs(w, 1010)).toBe(1760000000097); // ⌊10 · 9 750 / 1 000⌋
+    expect(worldChainMs({ clock: { ...w.clock, usPerSlot: 0 } }, 1010)).toBeNull();
   });
 
   it("PlayerState (+ MoveState, Inventory)", async () => {

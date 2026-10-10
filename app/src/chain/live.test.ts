@@ -17,6 +17,7 @@ import {
   createWorldIx,
   freshNonce,
   joinWorldIx,
+  measureUsPerSlot,
   moveIx,
   placeBlockIx,
   populateChunkIx,
@@ -176,6 +177,7 @@ describe.skipIf(!LIVE)("LIVE: chain layer against the local stack", { timeout: 2
   });
 
   let world: PublicKey;
+  let hint: number | undefined;
   let spawn: V3;
   const existing = new Set<string>();
   const view = () => viewOf(existing);
@@ -195,7 +197,8 @@ describe.skipIf(!LIVE)("LIVE: chain layer against the local stack", { timeout: 2
       const nonce = freshNonce();
       world = worldPda(pid, wallet.publicKey, nonce);
       const params = { ...DEFAULT_WORLD_PARAMS, zombieCapPerChunk: 0, mobTickMs: 60_000, dayLengthSecs: 600 };
-      await ok(async () => [await createWorldIx(program, auth, nonce, "live test", params)]);
+      hint ??= await measureUsPerSlot(er);
+      await ok(async () => [await createWorldIx(program, auth, nonce, "live test", params, hint)]);
       await ok(async () => [await requestSeedIx(program, auth, world)]);
       const w = await until(
         async () => {

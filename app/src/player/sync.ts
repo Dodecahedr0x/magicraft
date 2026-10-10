@@ -36,7 +36,7 @@ import {
   MOVE_STATE_SIZE,
   PSTATE_HEALTH_OFFSET,
   PSTATE_MOVE_OFFSET,
-  worldChainMs,
+  chainEstimate,
   type MoveState,
   type V3,
   type WorldAccount,
@@ -64,9 +64,6 @@ export function encodeParams(p: WorldParams): Uint8Array {
 
 // ---------------------------------------------------------------- chain clock
 
-/** The program falls back to coarse wall time when its anchor is older than this, or the
- *  estimate is this far from the validator's wall time, ms (`state::STALE_MS`). */
-const ANCHOR_STALE_MS = 10_000;
 /** Frames are stamped this far behind the chain-time estimate (headroom under the
  *  program's `LEAD_MS` = 250 for estimate noise), ms. */
 export const STAMP_BEHIND_MS = 75;
@@ -77,18 +74,7 @@ const SLEW_BACK_MS = 25;
 /** Differences larger than this are taken at once (mode switch fine ↔ coarse), ms. */
 const JUMP_MS = 2_000;
 
-/** Chain-time estimate the program would compute: the World anchor at `slot`
- *  (`worldChainMs`), or — when the program reads coarse wall time (anchor unset, older than
- *  10 s, or 10 s off the validator's wall time) — the validator's wall time `wallMs` minus
- *  300 ms (the coarse window accepts `[floor_s − 1250, floor_s + 1000]`). `wallMs` must be
- *  the **validator's** wall time (`ChainClock` learns it from its Clock sysvar), never the
- *  local `Date.now()`; null = unknown (then the fine estimate is trusted if it exists). */
-export function chainEstimate(w: Pick<WorldAccount, "clock">, slot: number, wallMs: number | null): number | null {
-  const est = worldChainMs(w, slot);
-  if (wallMs === null) return est;
-  if (est === null || est - w.clock.anchorMs > ANCHOR_STALE_MS || Math.abs(est - wallMs) > ANCHOR_STALE_MS) return wallMs - 300;
-  return est;
-}
+export { chainEstimate };
 
 /** One ER reading: `slot` and the Clock sysvar's `unix_timestamp` (s; null if unavailable),
  *  requested at local time `t0` and answered at `t1` (perfNow clock). */

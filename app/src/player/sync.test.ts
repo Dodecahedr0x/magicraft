@@ -314,7 +314,7 @@ describe("MoveSync", () => {
 });
 
 describe("chain clock", () => {
-  const W = (anchorMs: number, anchorSlot = 0) => ({ clock: { anchorSlot, anchorMs, msPerSlot: 50, baseMsPerSlot: 50, syncSlot: 0, syncMs: 0 } });
+  const W = (anchorMs: number, anchorSlot = 0) => ({ clock: { anchorSlot, anchorMs, usPerSlot: 50_000, baseUsPerSlot: 50_000, syncSlot: 0, syncMs: 0 } });
 
   it("steps forward, slews backward, drops slow readings once calibrated", () => {
     let t = 1_000;
@@ -337,7 +337,7 @@ describe("chain clock", () => {
     const w = W(1_000_000, 100);
     expect(chainEstimate(w, 120, 1_001_000)).toBe(1_001_000);
     expect(chainEstimate(w, 1_000, 1_045_000)).toBe(1_045_000 - 300); // anchor 45 s old
-    expect(chainEstimate({ clock: { ...w.clock, msPerSlot: 0 } }, 120, 7_000)).toBe(6_700);
+    expect(chainEstimate({ clock: { ...w.clock, usPerSlot: 0 } }, 120, 7_000)).toBe(6_700);
     expect(chainEstimate(w, 120, null)).toBe(1_001_000);
     // A local clock 60 s off never enters: the wall offset comes from unix_timestamp.
     let t = 5_000;
@@ -369,7 +369,7 @@ function chainModel(coarse: boolean, T0: number) {
   let anchor = { anchorSlot: slotAt(T0 - 60_000), anchorMs: T0 - 60_000 };
   return {
     slotAt,
-    world: () => ({ clock: { ...anchor, msPerSlot: 50, baseMsPerSlot: 50, syncSlot: 0, syncMs: 0 } }),
+    world: () => ({ clock: { ...anchor, usPerSlot: 50_000, baseUsPerSlot: 50_000, syncSlot: 0, syncMs: 0 } }),
     tick(T: number) {
       if (!coarse) anchor = { anchorSlot: slotAt(T), anchorMs: T0 + (slotAt(T) - 1_000) * 50 };
     },

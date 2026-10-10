@@ -17,6 +17,7 @@ import {
   cu,
   dayTaskId,
   ephemeralRent,
+  erUsPerSlot,
   fails,
   fetchWorld,
   freshNonce,
@@ -105,8 +106,35 @@ describe("world", () => {
     expect(acc.seedSet).to.equal(false);
     expect(acc.seed.every((b: number) => b === 0)).to.equal(true);
     expect(BigInt(acc.dayTaskId.toString())).to.equal(dayTaskId(world));
-    expect(acc.clock.msPerSlot).to.equal(50);
+    // The hint (measured ER rate, clamped) seeds both rates; nobody joined yet.
+    const hint = await erUsPerSlot();
+    expect(acc.clock.usPerSlot).to.equal(
+      hint === 0 ? 50_000 : Math.min(Math.max(hint, 1_000), 1_000_000)
+    );
+    expect(acc.clock.baseUsPerSlot).to.equal(acc.clock.usPerSlot);
+    expect(acc.firstJoinMs.toNumber()).to.equal(0);
     expect(acc.clock.anchorMs.toNumber()).to.be.greaterThan(0);
+  });
+
+  it("clamps the slot-rate hint (0 = 50 ms default)", async () => {
+    for (const [hint, want] of [
+      [0, 50_000],
+      [1, 1_000],
+      [4_000_000_000, 1_000_000],
+      [9_750, 9_750],
+    ]) {
+      const nonce = freshNonce();
+      await sendEr(
+        [await createWorldIx({ nonce, usPerSlotHint: hint })],
+        [p.authority]
+      );
+      const acc = (await fetchWorld(worldPda(p.authority.publicKey, nonce)))!
+        .acc;
+      expect([acc.clock.usPerSlot, acc.clock.baseUsPerSlot]).to.deep.equal([
+        want,
+        want,
+      ]);
+    }
   });
 
   it("a second create_world with the same nonce fails", async () => {

@@ -22,11 +22,13 @@
 //!
 //! `chain_ms` source (implemented by the program, `state::TimeAnchor`):
 //! `Clock::unix_timestamp` has 1 s resolution, so the `World` account stores an anchor
-//! (`anchor_slot`, `anchor_ms`, `ms_per_slot`) and readers estimate
-//! `chain_ms = anchor_ms + (slot − anchor_slot) · ms_per_slot` without writing. Only the
-//! day crank re-anchors (monotonic: forward jumps when lagging > 750 ms, slew when ahead,
-//! slot rate measured from wall time). A stale/unset anchor gives a *coarse* reading
-//! (wall seconds) and the caller widens its lead tolerance.
+//! (`anchor_slot`, `anchor_ms`, `us_per_slot`) and readers estimate
+//! `chain_ms = anchor_ms + ⌊(slot − anchor_slot) · us_per_slot / 1000⌋` without writing.
+//! Only the day crank (and the first `join_world`) re-anchors: free to step back to wall
+//! time until the first join, monotonic afterwards (forward jumps when lagging > 750 ms,
+//! slew when ahead); the slot rate starts at the client's measured hint and is checked
+//! against wall time. A stale/unset anchor gives a *coarse* reading (wall seconds) and the
+//! caller widens its lead tolerance.
 //!
 //! # Rules (in check order) and tolerances
 //! 0. Params must [`WorldParams::validate`]; `prev`/new coordinates must be within
