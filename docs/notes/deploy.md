@@ -1,8 +1,10 @@
 # Devnet deployment (Task 28)
 
-Deployed and smoke-tested 2026-10-10. **Status: deployed; every platform prerequisite works on
-devnet; one program issue found (World chain clock assumes 50 ms ER slots, devnet ER slots are
-~10 ms), not fixed yet: see [Known issues](#known-issues).**
+Deployed and smoke-tested 2026-10-10. **Status: deployed and passing.** The first deploy found
+one program issue (the World chain clock assumed 50 ms ER slots; devnet ER slots are ~10 ms);
+it was fixed (`us_per_slot_hint`, µs rate, backward steps until the first join), the program
+upgraded in place, and the full smoke passes, moves right after world creation included
+([Clock fix](#clock-fix-and-upgrade)).
 
 ## Endpoints and ids
 
@@ -59,12 +61,45 @@ solana program deploy -u devnet --keypair ~/.config/solana/id.json \
   `--use-rpc` failed ("Data writes to account failed: Max retries exceeded"); its buffer was closed
   (`solana program close <buffer>`, rent refunded). The default TPU path then worked.
 - Upgrades: same command (the program id keypair is only needed for the first deploy). The IDL
-  was not uploaded onchain (the client bundles it).
+  was not uploaded onchain (the client bundles it). **The ER picks an upgrade up with a delay**
+  (observed ~1-2 min): a world created right after the upgrade still ran the old binary.
 - `pnpm build:release` leaves the release IDL in `target/`; `pnpm test` rebuilds with
   `localnet`. The client IDL in `app/src/idl` is not cluster-specific (`idlFor` rewrites the
   program id and VRF queue from the config), so it was not re-synced.
 
-## Smoke test (`scripts/devnet-smoke.ts`)
+## Clock fix and upgrade
+
+Fix (commit `fix(program,app): World clock rate from a measured µs-per-slot hint, …`):
+`TimeAnchor` stores `us_per_slot` / `base_us_per_slot` (µs, 1 000–1 000 000; same offsets);
+`create_world(…, us_per_slot_hint)` takes the client's measurement (`measureUsPerSlot`: two
+`getSlot` readings ~2 s apart; 0 = 50 ms default); every re-anchor before 30 s checks the rate
+against the observed span (±1 s) and replaces it only if inconsistent; until the first
+`join_world` (`World.first_join_ms`, @248) the clock steps to wall time in either direction,
+and the first join re-anchors once more before it stamps; afterwards monotonic as before.
+`waitClientMs` / test helpers got the coarse fallback (`chainEstimate`, now in `layout.ts`).
+Unit sims: 10 / 9.75 / 50 / 100 ms slots × hints {0, exact, 50 ms, 10 ms, 100 ms, 1, u32::MAX}
+× first join {never, 0.3, 0.9, 1.5, 6, 12 s}: error < 1 s from 10 s on, never back after the
+join, base rate within 5 %. Local suite green (109 Anchor specs, app 222 + live 6).
+
+Upgrade: `pnpm build:release` (900 208 bytes, sha256
+`2279ac140f3dd6d5c9d6a9cd70236997ba9add73a000d4bf83977348b4e24da3`, byte-identical onchain),
+same deploy command, signature
+`4iLypcYYujt7Uhnoj9GWXuBygnsNAVb85tEgANC363p2Anp3W2cCDW7E41UoxDRQ9X7Q5WXSK8NXX3umRnPRKcbR`,
+slot 509 441 716, cost **0.0568 SOL** (ProgramData extended to 902 880 bytes + fees). No failed
+buffer this time. (Two older buffers owned by the same key, `BBfDYjxC…` 3.41 SOL and
+`CmDaZa7N…` 3.56 SOL, predate this task and were left alone.)
+
+Smoke after the upgrade (new throwaway wallet, 0.2 SOL, returned): **all 20 steps pass.**
+Hint measured 10 023 µs/slot; at join the anchor was 0.3 s off the local clock; **30 moves
+right after creation, 0 `TimeSkew`**, all fine-mode, confirm min 93 / median 98 / p90 102 /
+max 128 ms (first move waited 0.7 s for `last_ms`); clock probe over 60 s: worst |estimate −
+local clock| **351 ms**, always fine, rate 10 000-10 023 µs; chunk cranks ticked (+19 each in
+6 s while the player's presence was fresh, then idle-cancelled as designed); day crank +6 in
+6 s; break/place 13.7k/15.9k CU; top-up credited 242 ms after base confirm; **`close_chunk`
+refunded the full 554 240 lamports** (29.9k CU); withdraw back on base in 1.26 s;
+`withdraw_base` ok. World `AhLPxi9f6E9Jw6w1BkLtvM271ReBnuRjSbisySr8ZYRt`.
+
+## Smoke test, first deploy (`scripts/devnet-smoke.ts`)
 
 `SMOKE_WALLET=<throwaway keypair> pnpm smoke:devnet` runs the app chain layer (`app/src/chain`)
 against devnet through Vite's SSR module runner (`scripts/run-smoke.mjs`; no extra deps). The
@@ -129,8 +164,8 @@ port 4173 and opened in the Browser pane:
 
 ## Known issues
 
-1. **World chain clock on ~10 ms ER slots (program; blocks play for ~15-20 min after a
-   world is created).** `TimeAnchor::new` starts at `DEFAULT_MS_PER_SLOT = 50`
+1. **Fixed (see [Clock fix](#clock-fix-and-upgrade)); kept for the record.** World chain clock
+   on ~10 ms ER slots (blocked play for ~15-20 min after a world was created). `TimeAnchor::new` starts at `DEFAULT_MS_PER_SLOT = 50`
    (`programs/magicraft/src/state.rs`), the local ER's slot time. Devnet ER slots are ~10 ms, so
    the estimate runs ~4.4× fast until the first rate measurement (`RATE_SPAN_MS` = 30 s) and
    ends ~100 s ahead of the validator's wall clock. `reanchor` is monotonic (slew only, 1/8 of
@@ -155,12 +190,13 @@ port 4173 and opened in the Browser pane:
    a fixed-point) for 10 ms slots, and allow a one-time backward re-anchor before the world
    is seeded / before anyone joined. `scripts/devnet-clock-probe.ts` prints a World's
    anchor vs the validator clock.
-2. `waitClientMs` (`app/src/chain/actions.ts`, used by tests/scripts) only uses the fine
-   estimate; the game loop's `ChainClock` / `chainEstimate` mirrors the program's coarse
-   fallback. Fine locally, wrong while a devnet World is in coarse mode.
+2. Fixed: `waitClientMs` and the test helpers' `chainMs` now use the coarse fallback too.
+   Worlds created before the upgrade (the three "devnet smoke" worlds of the first runs) keep
+   their stored ms-based rates, now read as µs: their clocks recover via the rate check /
+   coarse fallback, but they are test leftovers, not for play.
 3. Commit cap: without a delegated fee payer an account can commit 10 times per delegation
    (fee docs). The Player commits only on `withdraw` (commit + undelegate), so this is not hit.
-4. `close_chunk`, fluid ticks and zombies were not exercised on devnet (covered locally).
+4. Fluid ticks and zombies were not exercised on devnet (covered locally).
 
 ## Playing on devnet with Phantom / Backpack / Solflare
 
@@ -171,8 +207,7 @@ port 4173 and opened in the Browser pane:
    URL. For another region, copy `app/.env.example` to `app/.env.devnet.local` and set
    `VITE_ER_RPC` + the matching `VITE_ER_VALIDATOR`.
 3. Connect → create / fund / delegate the Player (1 approval) → session (1 approval) → pick
-   or create a world. **After creating a new world, expect move rejections / stalls for the
-   first ~15-20 minutes** (Known issue 1); the two smoke worlds are already converged.
+   or create a world (creation measures the ER slot rate for ~2 s first).
 4. Withdraw from the HUD (ER commit + undelegate, then `withdraw_base`).
 
 Production build: `pnpm -C app build --mode devnet` (the build requires all `PROD_REQUIRED`
@@ -180,10 +215,7 @@ vars; `.env.devnet` sets them).
 
 ## Next steps
 
-1. Fix the World clock for ~10 ms ER slots (Known issue 1), redeploy (`pnpm build:release` +
-   the deploy command above, same program id), re-run `pnpm smoke:devnet` (moves must pass
-   right after creation).
-2. Then a full human playtest (5 min) with a browser wallet on devnet.
-3. Pipelining only if players are far from their ER (latency above).
-4. Hydra: nothing to do now (Magic-program `ScheduleTask` works on ER 1.0.0; the docs still
+1. A full human playtest (5 min) with a browser wallet on devnet.
+2. Pipelining only if players are far from their ER (latency above).
+3. Hydra: nothing to do now (Magic-program `ScheduleTask` works on ER 1.0.0; the docs still
    document it); keep `scheduler.rs` as the single swap point and re-check at mainnet time.

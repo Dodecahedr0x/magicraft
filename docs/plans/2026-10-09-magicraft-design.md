@@ -368,8 +368,9 @@ Details and evidence: [`docs/notes/spikes.md`](../notes/spikes.md) (Tasks 2–6)
    ER fees are 0 in the current release (session keys rely on it). *Devnet:* rent PDA funded
    (14.7 SOL), top-up credited in ~250 ms; ER fees 0 (0-lamport session key pays every gameplay
    tx); withdraw settles in ~1 s.
-8. **ER slot time (open, found on devnet).** The World chain clock (`TimeAnchor`) starts at 50 ms
-   per slot (local ER); devnet ER slots are ~10 ms, so a new World's estimate runs ~100 s ahead
-   and takes ~17 min to slew back, during which the program reads coarse wall time and moves
-   right after `join_world` fail `TimeSkew`. Integer ms per slot is also too coarse at 10 ms.
-   Details and fix direction: `docs/notes/deploy.md`.
+8. **ER slot time (found on devnet, fixed).** The World clock assumed 50 ms slots (local ER);
+   devnet ER slots are ~10 ms, so new Worlds ran ~100 s ahead and moves failed `TimeSkew`.
+   Fixed: `create_world` takes a measured `us_per_slot_hint`, rates are µs per slot, the rate is
+   checked against wall time from the first tick, and the clock may step back until the first
+   join. Devnet smoke after the upgrade: 0 `TimeSkew` right after creation, |error| ≤ 351 ms.
+   Details: `docs/notes/deploy.md`.
