@@ -5,6 +5,8 @@
   "scripts": {
     "test": "scripts/test.sh",
     "test:e2e": "TEST_SPEC=tests/99-e2e.spec.ts scripts/test.sh",
+    "dev": "pnpm -C app dev",
+    "dev:devnet": "pnpm -C app dev --mode devnet",
     "build:release": "scripts/build-release.sh",
     "smoke:devnet": "node scripts/run-smoke.mjs",
     "lint": "prettier \"tests/**/*.ts\" --check",

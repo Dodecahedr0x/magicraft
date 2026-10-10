@@ -205,7 +205,7 @@ port 4173 and opened in the Browser pane:
 
 1. Set the wallet to **devnet** and fund it (≥ ~0.06 SOL: the Player deposit + fees;
    `solana airdrop -u devnet 1 <address>` or https://faucet.solana.com).
-2. `pnpm install`, then `pnpm -C app dev --mode devnet` (uses `app/.env.devnet`: base
+2. `pnpm install`, then `pnpm dev:devnet` (uses `app/.env.devnet`: base
    devnet, EU ER + its validator, program id, `DEFAULT_EPHEMERAL_QUEUE`); open the printed
    URL. For another region, copy `app/.env.example` to `app/.env.devnet.local` and set
    `VITE_ER_RPC` + the matching `VITE_ER_VALIDATOR`.
