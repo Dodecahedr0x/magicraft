@@ -2,7 +2,8 @@
 // and runs the world view (chunk store + renderer + auto-create, world/world.ts), the player
 // (controller + move sync, player/controller.ts; needs the core wasm), the interaction
 // layer (player/interact.ts: mining, placing, attacking, eating, crafting) and the HUD
-// (hotbar, health/food, inventory + crafting panel on `E`, death screen) on the game canvas.
+// (hotbar, health/food, inventory + crafting panel on `E`, death screen) on the game canvas,
+// plus other players (world/players.ts) and the live day / night clock (world/sky.ts).
 // The "entering world" overlay stays until the first chunk mesh is on screen.
 import type { PublicKey } from "@solana/web3.js";
 import { decodePlayerState, FP, INVENTORY_SIZE, PSTATE_INVENTORY_OFFSET, pstatePda, type PlayerStateAccount, type V3, type WorldAccount } from "./chain";
@@ -15,6 +16,7 @@ import { DeathScreen, HealthBars } from "./ui/health";
 import { Hotbar } from "./ui/hotbar";
 import { InventoryGrid } from "./ui/inventory";
 import { blockFlags, loadCore } from "./wasm";
+import { PlayerLayer } from "./world/players";
 import { startWorld } from "./world/world";
 
 export type GameHandle = { stop(): void };
@@ -44,6 +46,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
   let hotbar: Hotbar | null = null;
   let grid: InventoryGrid | null = null;
   let crafting: CraftingPanel | null = null;
+  let others: PlayerLayer | null = null;
   const bars = new HealthBars();
   const death = new DeathScreen(async () => {
     if (!act) return false;
@@ -162,6 +165,11 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
         },
       });
       const a = act;
+      // Day / night from the live World + chain clock; other players from the presence lists.
+      view.sky.source = { world: () => session.world(), now: () => session.clock.now() };
+      const ps = new PlayerLayer(view.renderer, { lists: () => a.presence.lists(), self: app.state.player?.toBase58() ?? null, now: () => session.clock.now() });
+      others = ps;
+      view.onFrame((dt) => ps.update(dt));
       a.select.onChange = () => paintHud();
       hotbar = new Hotbar(
         (i) => a.select.select(i),
@@ -210,6 +218,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
             session.controller.look(Math.atan2(-dx, -dz), Math.atan2(dy, Math.hypot(dx, dz)));
           },
           stations: () => a.stations(),
+          others: () => [...ps.tracker.players.values()].map((t) => ({ key: t.key, at: t.motion.to, alpha: +ps.tracker.alpha(t, performance.now()).toFixed(2) })),
           held: () => ({ selected: a.select.selected, chainHeld: a.select.chainHeld }),
           stats2: () => ({ ...a.stats, localEdits: view.store.localEdits, move: session.sync.summary() }),
           feetBlock: (): V3 | null => {
@@ -233,6 +242,7 @@ export function enterGame(app: App, root: HTMLElement, world: PublicKey, account
       window.removeEventListener("keydown", onKey);
       hotbar?.dispose();
       act?.dispose();
+      others?.dispose();
       player?.stop();
       view.stop();
       void app.conns.er.removeAccountChangeListener(sub).catch(() => {});

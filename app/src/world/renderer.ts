@@ -1,32 +1,70 @@
 // Three.js world renderer: one scene, a perspective camera, sky-colored fog that hides the
-// edge of the loaded area, ambient + one directional light (fed into the voxel shader;
-// day/night arrives in Task 27), and three meshes per chunk (opaque, cutout, water).
+// edge of the loaded area, and three meshes per chunk (opaque, cutout, water). Lighting is
+// shader uniforms shared by every material (`light`, `LIGHT_PARS`): ambient + one
+// directional light (sun / moon, set by sky.ts) and up to 16 torch point lights (torches.ts).
+// Water tops drift / ripple with `uTime`; torch flame pixels are emissive.
 //
 // The voxel shader samples a `DataArrayTexture` (one layer per 16×16 tile, atlas.ts) at
 // `fract(uv)` so greedy quads repeat their tile; `textureGrad` with the unwrapped uv keeps
 // mip selection continuous across block seams.
 import * as THREE from "three";
 import { buildAtlas } from "./atlas";
+import { T } from "./blocks";
 import type { ChunkMesh, MeshArrays } from "./mesher";
 
 export const SKY = "#9cc7ee";
 
+/** Max point lights (torches) fed to the shaders. */
+export const MAX_TORCHES = 16;
+/** Torch light reach, blocks. */
+export const TORCH_RADIUS = 9;
+
+/** Shared lighting GLSL: uniforms + `sceneLight(world pos, normal)` (ambient + one
+ *  directional light, per vertex) and `torchLight(world pos, normal)` (≤ 16 point lights,
+ *  per fragment; no occlusion — light passes through blocks). */
+export const LIGHT_PARS = /* glsl */ `
+uniform float uAmbient;
+uniform vec3 uAmbientColor;
+uniform float uSun;
+uniform vec3 uSunColor;
+uniform vec3 uSunDir;
+uniform vec4 uTorch[${MAX_TORCHES}];
+uniform int uTorchCount;
+uniform float uTime;
+vec3 sceneLight(vec3 n) {
+  return uAmbient * uAmbientColor + uSun * uSunColor * max(dot(n, uSunDir), 0.0);
+}
+vec3 torchLight(vec3 p, vec3 n) {
+  float s = 0.0;
+  for (int i = 0; i < ${MAX_TORCHES}; i++) {
+    if (i >= uTorchCount) break;
+    vec3 d = uTorch[i].xyz - p;
+    float dist = length(d);
+    float a = clamp(1.0 - dist / ${TORCH_RADIUS.toFixed(1)}, 0.0, 1.0);
+    s += a * (0.35 + 0.65 * a) * (0.55 + 0.45 * max(dot(n, d / max(dist, 1e-3)), 0.0)) * uTorch[i].w;
+  }
+  return s * vec3(1.35, 1.0, 0.62);
+}`;
+
 const VERT = /* glsl */ `
 attribute vec3 tuv;
 attribute vec3 shade;
-uniform float uAmbient;
-uniform float uSun;
-uniform vec3 uSunDir;
+${LIGHT_PARS}
 varying vec3 vTuv;
 varying vec3 vShade;
-varying float vLight;
+varying vec3 vLight;
+varying vec3 vWorld;
+varying vec3 vNormal;
 #include <fog_pars_vertex>
 void main() {
-  vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+  vec4 world = modelMatrix * vec4(position, 1.0);
+  vec4 mvPosition = viewMatrix * world;
   gl_Position = projectionMatrix * mvPosition;
   vTuv = tuv;
   vShade = shade;
-  vLight = uAmbient + uSun * max(dot(normal, uSunDir), 0.0);
+  vWorld = world.xyz;
+  vNormal = normal;
+  vLight = sceneLight(normal);
   #include <fog_vertex>
 }`;
 
@@ -35,14 +73,29 @@ precision highp sampler2DArray;
 uniform sampler2DArray uAtlas;
 uniform float uAlphaTest;
 uniform float uOpacity;
+uniform float uWave;
+${LIGHT_PARS}
 varying vec3 vTuv;
 varying vec3 vShade;
-varying float vLight;
+varying vec3 vLight;
+varying vec3 vWorld;
+varying vec3 vNormal;
 #include <fog_pars_fragment>
 void main() {
-  vec4 t = textureGrad(uAtlas, vec3(fract(vTuv.xy), vTuv.z), dFdx(vTuv.xy), dFdy(vTuv.xy));
+  vec2 uv = vTuv.xy;
+  float ripple = 1.0;
+  bool surface = uWave > 0.5 && vNormal.y > 0.5;
+  if (surface) {
+    // Water surface: drifting, gently wobbling texture + a soft moving brightness ripple.
+    uv += vec2(uTime * 0.04 + 0.05 * sin(uTime * 0.7 + vWorld.z * 0.4), uTime * 0.025 + 0.05 * cos(uTime * 0.6 + vWorld.x * 0.35));
+    ripple = 1.0 + 0.07 * sin(uTime * 1.6 + vWorld.x * 1.3 + vWorld.z * 0.7) * sin(uTime * 1.1 - vWorld.z * 1.2);
+  }
+  vec4 t = textureGrad(uAtlas, vec3(fract(uv), vTuv.z), dFdx(vTuv.xy), dFdy(vTuv.xy));
   if (t.a < uAlphaTest) discard;
-  gl_FragColor = vec4(t.rgb * vShade * vLight, uOpacity);
+  vec3 light = min(vLight + torchLight(vWorld, vNormal), vec3(1.35));
+  // Torch flame pixels (torch side / top tiles, bright orange) are emissive.
+  if (vTuv.z > ${T.TORCH - 0.5} && vTuv.z < ${T.TORCH_TOP + 0.5} && t.r > 0.85) light = vec3(1.2);
+  gl_FragColor = vec4(t.rgb * vShade * light * ripple, uOpacity);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
   #include <fog_fragment>
@@ -67,11 +120,19 @@ export class WorldRenderer {
   readonly renderer: THREE.WebGLRenderer;
   readonly scene = new THREE.Scene();
   readonly camera: THREE.PerspectiveCamera;
-  readonly sun = new THREE.DirectionalLight(0xffffff, 0.55);
-  readonly ambient = new THREE.AmbientLight(0xffffff, 0.6);
   private readonly atlas: THREE.DataArrayTexture;
   private readonly mats: { opaque: THREE.ShaderMaterial; cutout: THREE.ShaderMaterial; water: THREE.ShaderMaterial };
-  private readonly light = { uAmbient: { value: 0.6 }, uSun: { value: 0.55 }, uSunDir: { value: new THREE.Vector3() } };
+  /** Lighting uniforms shared by every voxel / model material (`LIGHT_PARS`). */
+  readonly light = {
+    uAmbient: { value: 0.6 },
+    uAmbientColor: { value: new THREE.Vector3(1, 1, 1) },
+    uSun: { value: 0.55 },
+    uSunColor: { value: new THREE.Vector3(1, 1, 1) },
+    uSunDir: { value: new THREE.Vector3(0.45, 1, 0.3).normalize() },
+    uTorch: { value: Array.from({ length: MAX_TORCHES }, () => new THREE.Vector4()) },
+    uTorchCount: { value: 0 },
+    uTime: { value: 0 },
+  };
   private chunks = new Map<string, ChunkObj>();
   private raf = 0;
   private last = 0;
@@ -87,8 +148,6 @@ export class WorldRenderer {
     this.scene.background = new THREE.Color(SKY);
     this.scene.fog = new THREE.Fog(SKY, view * 0.6, view);
     this.camera = new THREE.PerspectiveCamera(70, 1, 0.1, view * 2);
-    this.sun.position.set(0.45, 1, 0.3);
-    this.scene.add(this.sun, this.ambient);
 
     const { data, size, layers } = buildAtlas();
     const tex = new THREE.DataArrayTexture(data, size, size, layers);
@@ -103,7 +162,7 @@ export class WorldRenderer {
     this.mats = {
       opaque: this.material({ alphaTest: 0 }),
       cutout: this.material({ alphaTest: 0.5, side: THREE.DoubleSide }),
-      water: this.material({ opacity: 0.72, transparent: true, side: THREE.DoubleSide }),
+      water: this.material({ opacity: 0.72, transparent: true, side: THREE.DoubleSide, wave: true }),
     };
 
     this.ro = new ResizeObserver(() => this.resize());
@@ -111,13 +170,14 @@ export class WorldRenderer {
     this.resize();
   }
 
-  private material(o: { alphaTest?: number; opacity?: number; transparent?: boolean; side?: THREE.Side }) {
+  private material(o: { alphaTest?: number; opacity?: number; transparent?: boolean; side?: THREE.Side; wave?: boolean }) {
     const uniforms = {
       ...THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
       ...this.light,
       uAtlas: { value: this.atlas },
       uAlphaTest: { value: o.alphaTest ?? 0 },
       uOpacity: { value: o.opacity ?? 1 },
+      uWave: { value: o.wave ? 1 : 0 },
     };
     return new THREE.ShaderMaterial({
       uniforms,
@@ -216,10 +276,25 @@ export class WorldRenderer {
     this.raf = 0;
   }
 
+  /** Sets the directional + ambient light (sky.ts; colors linear). */
+  setLight(l: { dir: readonly number[]; intensity: number; color: readonly number[]; ambient: number; ambientColor: readonly number[] }) {
+    const u = this.light;
+    u.uSunDir.value.set(l.dir[0], l.dir[1], l.dir[2]).normalize();
+    u.uSun.value = l.intensity;
+    u.uSunColor.value.set(l.color[0], l.color[1], l.color[2]);
+    u.uAmbient.value = l.ambient;
+    u.uAmbientColor.value.set(l.ambientColor[0], l.ambientColor[1], l.ambientColor[2]);
+  }
+
+  /** Sets the point lights: `[x, y, z, intensity]` (world block units), ≤ `MAX_TORCHES`. */
+  setTorches(ts: readonly (readonly number[])[]) {
+    const n = Math.min(ts.length, MAX_TORCHES);
+    for (let i = 0; i < n; i++) this.light.uTorch.value[i].set(ts[i][0], ts[i][1], ts[i][2], ts[i][3]);
+    this.light.uTorchCount.value = n;
+  }
+
   render() {
-    this.light.uAmbient.value = this.ambient.intensity;
-    this.light.uSun.value = this.sun.intensity;
-    this.light.uSunDir.value.copy(this.sun.position).normalize();
+    this.light.uTime.value = (performance.now() / 1000) % 3600;
     this.renderer.render(this.scene, this.camera);
   }
 

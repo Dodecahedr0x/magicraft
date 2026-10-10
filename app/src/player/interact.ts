@@ -300,7 +300,8 @@ export class Interaction {
   constructor(readonly d: InteractDeps) {
     const { app, world } = d;
     this.select = new SlotSelect((slot) => this.send(() => selectSlotIx(app.program, app.auth(), world, slot), { key: "select" }));
-    this.presence = new PresenceWatch(app.conns.er, app.cfg.programId, world);
+    // Radius 2 (5×5 chunks): the same lists show other players (world/players.ts).
+    this.presence = new PresenceWatch(app.conns.er, app.cfg.programId, world, 2);
     this.mobs = new MobIndex(d.view.store);
 
     const edges = (w: number, h: number) => new THREE.EdgesGeometry(new THREE.BoxGeometry(w, h, w));
@@ -421,8 +422,11 @@ export class Interaction {
     const store = this.d.view.store;
     const flags = this.d.flags;
     const hit = raycast(origin, d, maxDist, (x, y, z) => store.getBlock(x, y, z), (id) => id !== 0 && !(flags[id] & FLUID));
-    const mob = pickMob(origin, d, Math.min(maxDist, hit?.dist ?? Infinity), this.mobs.all());
-    if (mob) return { kind: "mob", mob: mob.mob, dist: mob.dist, inReach: mobInReach(pos, mob.mob.pos) };
+    // Pick against the boxes where the mobs are drawn (interpolated, world/mobs.ts); the
+    // reach check uses the account position, as the program does.
+    const shown = this.mobs.all().map((m) => ({ m, pos: this.d.view.mobs.renderPos(m.id) ?? m.pos }));
+    const mob = pickMob(origin, d, Math.min(maxDist, hit?.dist ?? Infinity), shown.map((s) => ({ ...s.m, pos: s.pos, src: s.m })));
+    if (mob) return { kind: "mob", mob: mob.mob.src, dist: mob.dist, inReach: mobInReach(pos, mob.mob.src.pos) };
     if (hit) return { kind: "block", hit, inReach: blockInReach(pos, hit.block, reach) };
     return null;
   }
@@ -439,7 +443,8 @@ export class Interaction {
     } else if (show?.kind === "mob") {
       const { halfW, height } = mobBox(show.mob.kind);
       this.mobOutline.scale.set(halfW * 2, height, halfW * 2);
-      this.mobOutline.position.set(show.mob.pos[0] / 256, show.mob.pos[1] / 256 + height / 2, show.mob.pos[2] / 256);
+      const p = this.d.view.mobs.renderPos(show.mob.id) ?? show.mob.pos;
+      this.mobOutline.position.set(p[0] / 256, p[1] / 256 + height / 2, p[2] / 256);
       this.d.ui.target(`${MOB_NAMES[show.mob.kind] ?? "Mob"} · ${show.mob.hp} HP`);
     } else this.d.ui.target(null);
   }

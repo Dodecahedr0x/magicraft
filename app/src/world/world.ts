@@ -1,4 +1,5 @@
-// World session glue: chunk store → mesher workers → renderer, the chunk auto-creator, the
+// World session glue: chunk store → mesher workers → renderer, the chunk auto-creator, sky /
+// day-night (sky.ts), torch lights (torches.ts), mobs (mobs.ts), the
 // debug fly camera (toggled with F in debug mode; the player controller drives the camera
 // and the focus otherwise), and the in-game chunk panel (auto-create toggle, cost, toasts).
 import { LAMPORTS_PER_SOL, type PublicKey } from "@solana/web3.js";
@@ -21,10 +22,14 @@ import { h, sendResultMessage, sol } from "../ui/dom";
 import { openTopUp } from "../ui/hud";
 import { atlasCanvas } from "./atlas";
 import { AutoCreator, DEFAULT_CAP_LAMPORTS, type AutoEvent } from "./autocreate";
+import { isFluid } from "./blocks";
 import { FlyCam } from "./flycam";
 import { MeshPool } from "./meshpool";
+import { MobLayer } from "./mobs";
 import { WorldRenderer } from "./renderer";
+import { Sky } from "./sky";
 import { ChunkStore } from "./store";
+import { TorchIndex } from "./torches";
 
 export const LOAD_RADIUS = 4;
 export const CREATE_RADIUS = 2;
@@ -37,6 +42,10 @@ export type WorldHandle = {
   store: ChunkStore;
   renderer: WorldRenderer;
   auto: AutoCreator;
+  /** Day / night (its `source` is switched to the live World + chain clock by the game). */
+  sky: Sky;
+  mobs: MobLayer;
+  torches: TorchIndex;
   /** The free-fly debug camera exists (debug mode: dev build or `?debug`). */
   readonly debugCam: boolean;
   /** The debug camera is active (it then drives the camera and the focus). */
@@ -92,6 +101,7 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     world,
     radius: LOAD_RADIUS,
     onDirty: (keys) => {
+      torches.invalidate(keys);
       for (const key of keys)
         pool.request(key, () => store.meshInput(key), (mesh) => {
           const e = store.entry(key);
@@ -104,6 +114,17 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
         });
     },
     onChange: () => queueTick(),
+  });
+
+  const torches = new TorchIndex(store);
+  const sky = new Sky(renderer, { world: () => account, now: () => null });
+  const mobs = new MobLayer(renderer, {
+    store,
+    tickMs: account.params.mobTickMs,
+    player: () => {
+      const p = renderer.camera.position;
+      return [p.x, p.y - EYE, p.z];
+    },
   });
 
   // ------------------------------------------------------------ auto-create
@@ -337,6 +358,14 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
       setFocus(p.x, p.y - EYE, p.z);
     }
     for (const cb of frameCbs) cb(dt);
+    // After the camera moved: sky (sun / moon follow the camera), torches, mobs.
+    const c = renderer.camera.position;
+    const b = store.getBlock(Math.floor(c.x), Math.floor(c.y), Math.floor(c.z));
+    sky.underwater = b !== null && isFluid(b);
+    sky.update(dt);
+    const t = performance.now() / 1000;
+    renderer.setTorches(torches.pick([c.x, c.y, c.z]).map((p, i) => [p[0] + 0.5, p[1] + 0.75, p[2] + 0.5, 0.9 + 0.1 * Math.sin(t * 9 + i * 1.7) * Math.sin(t * 5.3 + i)]));
+    mobs.update(dt);
   };
   const setFly = (on: boolean) => {
     if (!cam) return false;
@@ -368,7 +397,18 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     renderer,
     auto,
     pool,
-    stats: () => ({ ...renderer.stats(), meshMsAvg: avg(pool.times), meshMsMax: Math.max(0, ...pool.times), meshes: pool.times.length, backlog: pool.backlog, loaded: store.size, heapMB: heapMB() }),
+    sky,
+    mobs,
+    torches,
+    /** Localnet builds only: `debug_spawn_mob` (kind 1 pig, 2 cow, 3 sheep, 4 zombie; 0
+     *  clears the chunk) at block (x, y, z) — feet at the block's bottom center. */
+    spawnMob: (kind: number, x: number, y: number, z: number) =>
+      sendEdit(() => {
+        const [cx, cz] = [Math.floor(x / 16), Math.floor(z / 16)];
+        const pos: [number, number, number] = [Math.round((x + 0.5) * FP), Math.round(y * FP), Math.round((z + 0.5) * FP)];
+        return app.program.methods.debugSpawnMob(kind, pos).accountsPartial({ world, chunk: store.get(cx, cz)!.pda }).instruction();
+      }),
+    stats: () => ({ ...renderer.stats(), mobs: mobs.count, boxes: mobs.batch.size, torchesLit: renderer.light.uTorchCount.value, torches: torches.count, timeOfDay: sky.shown === null ? null : Math.round(sky.shown), day: sky.state.day, meshMsAvg: avg(pool.times), meshMsMax: Math.max(0, ...pool.times), meshes: pool.times.length, backlog: pool.backlog, loaded: store.size, heapMB: heapMB() }),
     atlas: () => {
       const c = atlasCanvas(4);
       Object.assign(c.style, { position: "fixed", right: "8px", top: "8px", zIndex: "99", border: "2px solid #000", imageRendering: "pixelated" });
@@ -400,6 +440,9 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
     store,
     renderer,
     auto,
+    sky,
+    mobs,
+    torches,
     ui,
     debugCam,
     get flying() {
@@ -426,6 +469,8 @@ export function startWorld(app: App, canvas: HTMLCanvasElement, world: PublicKey
       store.dispose();
       pool.dispose();
       cam?.dispose();
+      mobs.dispose();
+      sky.dispose();
       renderer.dispose();
       if (g.__magicraft) delete g.__magicraft.world;
     },

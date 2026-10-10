@@ -177,6 +177,8 @@ export type PlayerSession = {
   sync: MoveSync;
   /** Chain-time estimate (cooldowns, presence freshness). */
   clock: ChainClock;
+  /** The latest World account (subscription). */
+  world(): WorldAccount;
   /** PlayerState account data (initial fetch + notifications). */
   onPlayerState(data: Uint8Array): void;
   stop(): void;
@@ -306,6 +308,7 @@ export function startPlayer(app: App, view: WorldHandle, worldPk: PublicKey, acc
     controller,
     sync,
     clock,
+    world: () => world,
     onPlayerState: (data) => sync.onPlayerState(data),
     stop() {
       stopped = true;

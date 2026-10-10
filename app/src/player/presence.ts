@@ -1,7 +1,7 @@
 // Presence lists near the player (Task 26: `place_block` must not overlap any fresh
-// presence entry). Subscribes to the `ChunkPresence` accounts of the 3×3 chunks around the
-// player's chunk; lists outside that ring are fetched on demand. Task 27 (other players)
-// can read the same cache.
+// presence entry; Task 27: other players are drawn from them). Subscribes to the
+// `ChunkPresence` accounts of the (2r+1)² chunks around the player's chunk (r = `radius`,
+// default 1); lists outside that square are fetched on demand.
 import type { AccountInfo, Connection, PublicKey } from "@solana/web3.js";
 import { accountKind, chunkKey, chunkPda, decodePresence, PRESENCE_STALE_MS, presencePda, type PresenceEntry } from "../chain";
 
@@ -21,6 +21,7 @@ export class PresenceWatch {
     readonly conn: PresenceConn,
     readonly programId: PublicKey,
     readonly world: PublicKey,
+    readonly radius = 1,
   ) {}
 
   private pda(cx: number, cz: number) {
@@ -36,13 +37,14 @@ export class PresenceWatch {
     }
   }
 
-  /** Keeps the 3×3 chunks around `(cx, cz)` subscribed. */
+  /** Keeps the (2r+1)² chunks around `(cx, cz)` subscribed. */
   setCenter(cx: number, cz: number) {
     const k = chunkKey(cx, cz);
     if (this.disposed || k === this.center) return;
     this.center = k;
     const want = new Set<string>();
-    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) want.add(chunkKey(cx + dx, cz + dz));
+    const r = this.radius;
+    for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++) want.add(chunkKey(cx + dx, cz + dz));
     for (const [key, s] of this.slots)
       if (!want.has(key)) {
         if (s.sub !== null) void Promise.resolve(this.conn.removeAccountChangeListener(s.sub)).catch(() => {});
@@ -91,6 +93,11 @@ export class PresenceWatch {
     }
     if (missing.length) for (const e of (await this.fetch(missing)).values()) out.push(...e);
     return nowMs === null ? out : out.filter((e) => nowMs - e.lastSeenMs <= PRESENCE_STALE_MS + FRESH_MARGIN_MS);
+  }
+
+  /** The cached lists of the subscribed chunks (unfiltered). */
+  *lists(): IterableIterator<PresenceEntry[]> {
+    for (const s of this.slots.values()) if (s.entries) yield s.entries;
   }
 
   dispose() {
