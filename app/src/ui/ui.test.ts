@@ -13,7 +13,7 @@ import {
   decodeWorld,
   type KeyValueStore,
 } from "../chain";
-import { bs58, burnerAllowed, burnerKey, burnerKeypair, chainFor, isLocalRpc, loadBurner, saveBurner } from "../wallet";
+import { bs58, burnerAllowed, burnerKey, burnerKeypair, chainFor, isLocalRpc, loadBurner, networkLabel, saveBurner } from "../wallet";
 import { chunksFor, parseSol } from "./onboarding";
 import { PARAM_FIELDS, fromForm, jumpHeight, toForm, validateForm, validateName } from "./params";
 import { decodeWorldList, silentPlayers, visibleWorlds, worldClosable, worldCloseRefund, worldFilters, worldStatus } from "./worldList";
@@ -316,6 +316,16 @@ describe("burner wallet", () => {
     expect(loadBurner(t, "k")).toBeNull();
     expect(saveBurner(t, "k", Keypair.generate())).toBe(false);
     expect(burnerKeypair(t, "x")).toBeInstanceOf(Keypair); // in-memory fallback
+  });
+});
+
+describe("network label", () => {
+  it("names devnet / testnet / localnet, nothing on mainnet", () => {
+    expect(networkLabel("https://api.devnet.solana.com")).toBe("Devnet");
+    expect(networkLabel("https://api.testnet.solana.com")).toBe("Testnet");
+    expect(networkLabel("http://127.0.0.1:8799")).toBe("Localnet");
+    expect(networkLabel("https://api.mainnet-beta.solana.com")).toBeNull();
+    expect(networkLabel("https://rpc.example.com", "solana:devnet")).toBe("Devnet");
   });
 });
 

@@ -13,6 +13,7 @@ import { showConnect, showPlayerSetup, showSession, tryAutoConnect, useSession }
 import { regionPicker, showRegionMismatch } from "./ui/region";
 import { fetchWorlds } from "./ui/worldList";
 import { showWorlds } from "./ui/worlds";
+import { networkLabel } from "./wallet";
 
 const root = document.getElementById("app")!;
 const screen = h("main", { id: "screen", class: "main" });
@@ -26,6 +27,8 @@ function fatal(e: unknown) {
 
 async function main() {
   const app = createApp(import.meta.env);
+  const net = networkLabel(app.cfg.baseRpc, import.meta.env.VITE_WALLET_CHAIN);
+  if (net) document.title = `Magicraft (${net})`;
   let game: GameHandle | null = null;
   /** Shown once on the next world list (why the game ended, e.g. counted out). */
   let notice: string | null = null;

@@ -28,6 +28,7 @@ import {
   burnerWallet,
   chainFor,
   connectStandard,
+  networkLabel,
   fundBurner,
   onWalletsChanged,
   sendWithWallet,
@@ -193,6 +194,7 @@ export function showConnect(app: App, root: HTMLElement, next: () => void) {
     }
   });
 
+  const net = networkLabel(app.cfg.baseRpc, import.meta.env.VITE_WALLET_CHAIN);
   root.append(
     h(
       "section",
@@ -203,6 +205,7 @@ export function showConnect(app: App, root: HTMLElement, next: () => void) {
         grassBlock(),
         h("h1", { id: "connect-title" }, "Magicraft"),
         h("p", { class: "lede" }, "A survival sandbox where every block, mob and drop of water lives onchain."),
+        net ? h("p", { class: "net-note" }, h("span", { class: "net-badge" }, net), ` Runs on Solana ${net}: SOL here is test SOL with no real value.`) : null,
         h(
           "ul",
           { class: "facts" },

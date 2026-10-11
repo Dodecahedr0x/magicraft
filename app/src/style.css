@@ -145,6 +145,26 @@ code {
   font-weight: 700;
   margin-right: auto;
 }
+.net-badge {
+  font-family: var(--font);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.125rem 0.45rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--gold);
+  color: var(--gold);
+  line-height: 1.4;
+}
+.net-note {
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+.net-note .net-badge {
+  margin-right: 0.35rem;
+  vertical-align: 0.1em;
+}
 .brand-mark {
   width: 18px;
   height: 18px;

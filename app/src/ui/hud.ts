@@ -20,7 +20,7 @@ import {
   withdrawIx,
 } from "../chain";
 import type { App } from "../state";
-import { isLocalRpc, sendWithWallet } from "../wallet";
+import { isLocalRpc, networkLabel, sendWithWallet } from "../wallet";
 import { announce, busy, clear, errText, h, sendResultMessage, short, sleep, sol } from "./dom";
 import { parseSol, chunksFor, renewSession, forgetWallet, releaseWallet } from "./onboarding";
 import { fetchWithdrawPlan, withdrawPhase, type SponsoredChunk, type WithdrawPhase, type WithdrawPlan } from "./withdrawPlan";
@@ -60,10 +60,17 @@ export function createHud(app: App, ev: HudEvents): Hud {
     topUpBtn,
     withdrawBtn,
   );
+  const net = networkLabel(app.cfg.baseRpc, import.meta.env.VITE_WALLET_CHAIN);
   const el = h(
     "header",
     { class: "topbar" },
-    h("div", { class: "brand" }, h("span", { class: "brand-mark", "aria-hidden": "true" }), "Magicraft"),
+    h(
+      "div",
+      { class: "brand" },
+      h("span", { class: "brand-mark", "aria-hidden": "true" }),
+      "Magicraft",
+      net ? h("span", { class: "net-badge", title: `Running on Solana ${net}: test SOL, no real value` }, net) : null,
+    ),
     stats,
     h("div", { class: "wallet-chip", hidden: true }, walletEl, discBtn),
     banner,

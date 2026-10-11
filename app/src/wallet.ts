@@ -174,6 +174,12 @@ export function chainFor(baseRpc: string, override?: string): IdentifierString {
   return "solana:mainnet";
 }
 
+/** Network name shown in the UI ("Devnet", "Testnet", "Localnet"), or null on mainnet. */
+export function networkLabel(baseRpc: string, override?: string): string | null {
+  const c = chainFor(baseRpc, override);
+  return c === "solana:mainnet" ? null : c.slice("solana:".length).replace(/^./, (x) => x.toUpperCase());
+}
+
 /** Connects a Wallet Standard wallet (`silent`: only if already authorized). */
 export async function connectStandard(w: SolWallet, chain: IdentifierString, silent = false): Promise<AppWallet> {
   const { accounts } = await w.features[StandardConnect].connect(silent ? { silent: true } : undefined);
